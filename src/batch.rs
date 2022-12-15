@@ -1,5 +1,8 @@
-use crate::alloc::collections::BinaryHeap;
-use core::{any::TypeId, fmt, mem::MaybeUninit, slice};
+use crate::{
+    alloc::collections::BinaryHeap,
+    gc::{GCHeader, GCPtr, GC},
+};
+use core::{any::TypeId, fmt, mem::MaybeUninit, ptr::NonNull, slice};
 
 use crate::{
     archetype::{TypeIdMap, TypeInfo},
@@ -63,6 +66,7 @@ impl ColumnBatchBuilder {
         let base = archetype.get_base::<T>(state);
         Some(BatchWriter {
             fill: self.fill.entry(TypeId::of::<T>()).or_insert(0),
+            ty: TypeInfo::of::<T>(),
             storage: unsafe {
                 slice::from_raw_parts_mut(base.as_ptr().cast(), self.target_fill as usize)
                     .iter_mut()
@@ -93,9 +97,11 @@ impl Drop for ColumnBatchBuilder {
             for ty in archetype.types() {
                 let fill = self.fill.get(&ty.id()).copied().unwrap_or(0);
                 unsafe {
-                    let base = archetype.get_dynamic(ty.id(), 0, 0).unwrap();
+                    let ptr = archetype.get_dynamic(ty, 0).unwrap();
+                    let base = ptr.header_ptr().as_ptr().cast::<u8>();
                     for i in 0..fill {
-                        base.as_ptr().add(i as usize).drop_in_place()
+                        let header = base.add(i as usize * ty.gc_layout().size());
+                        GCPtr::from_base(ty, NonNull::new_unchecked(header)).drop(ty);
                     }
                 }
             }
@@ -108,8 +114,9 @@ pub struct ColumnBatch(pub(crate) Archetype);
 
 /// Handle for appending components
 pub struct BatchWriter<'a, T> {
+    ty: TypeInfo,
     fill: &'a mut u32,
-    storage: core::slice::IterMut<'a, MaybeUninit<T>>,
+    storage: core::slice::IterMut<'a, MaybeUninit<GC<T>>>,
 }
 
 impl<T> BatchWriter<'_, T> {
@@ -118,7 +125,17 @@ impl<T> BatchWriter<'_, T> {
         match self.storage.next() {
             None => Err(x),
             Some(slot) => {
-                *slot = MaybeUninit::new(x);
+                *slot = MaybeUninit::new(GC {
+                    header_storage: MaybeUninit::uninit(),
+                    value: x,
+                });
+                unsafe {
+                    let ptr = GCPtr::from_base(
+                        &self.ty,
+                        NonNull::new_unchecked(slot.as_mut_ptr().cast()),
+                    );
+                    ptr.header_ptr().as_ptr().write(GCHeader::new_alive());
+                }
                 *self.fill += 1;
                 Ok(())
             }

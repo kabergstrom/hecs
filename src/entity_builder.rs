@@ -331,7 +331,7 @@ impl<M> Common<M> {
         self.cursor = 0;
         unsafe {
             for (ty, offset, _) in self.info.drain(..) {
-                ty.drop(self.storage.as_ptr().add(offset));
+                ty.drop_value(self.storage.as_ptr().add(offset));
             }
         }
     }
@@ -344,16 +344,16 @@ impl<M> Common<M> {
                 let storage = self.storage.as_ptr().add(offset);
 
                 // Drop the existing value
-                ty.drop(storage);
+                ty.drop_value(storage);
 
                 // Overwrite the old value with our new one.
-                ptr::copy_nonoverlapping(ptr, storage, ty.layout().size());
+                ptr::copy_nonoverlapping(ptr, storage, ty.value_layout().size());
             }
             Entry::Vacant(vacant) => {
-                let offset = align(self.cursor, ty.layout().align());
-                let end = offset + ty.layout().size();
-                if end > self.layout.size() || ty.layout().align() > self.layout.align() {
-                    let new_align = self.layout.align().max(ty.layout().align());
+                let offset = align(self.cursor, ty.value_layout().align());
+                let end = offset + ty.value_layout().size();
+                if end > self.layout.size() || ty.value_layout().align() > self.layout.align() {
+                    let new_align = self.layout.align().max(ty.value_layout().align());
                     let (new_storage, new_layout) =
                         Self::grow(end, self.cursor, new_align, self.storage);
                     if self.layout.size() != 0 {
@@ -364,7 +364,7 @@ impl<M> Common<M> {
                 }
 
                 let addr = self.storage.as_ptr().add(offset);
-                ptr::copy_nonoverlapping(ptr, addr, ty.layout().size());
+                ptr::copy_nonoverlapping(ptr, addr, ty.value_layout().size());
 
                 vacant.insert(self.info.len());
                 self.info.push((ty, offset, meta));
@@ -420,7 +420,7 @@ impl Clone for Common<DynamicClone> {
                         .storage
                         .as_ptr()
                         .add(offset)
-                        .copy_from_nonoverlapping(src, ty.layout().size())
+                        .copy_from_nonoverlapping(src, ty.value_layout().size())
                 });
             }
             result

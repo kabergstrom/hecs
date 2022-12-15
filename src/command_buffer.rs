@@ -58,11 +58,11 @@ impl CommandBuffer {
     }
 
     unsafe fn add_inner(&mut self, ptr: *mut u8, ty: TypeInfo) {
-        let offset = align(self.cursor, ty.layout().align());
-        let end = offset + ty.layout().size();
+        let offset = align(self.cursor, ty.value_layout().align());
+        let end = offset + ty.value_layout().size();
 
-        if end > self.layout.size() || ty.layout().align() > self.layout.align() {
-            let new_align = self.layout.align().max(ty.layout().align());
+        if end > self.layout.size() || ty.value_layout().align() > self.layout.align() {
+            let new_align = self.layout.align().max(ty.value_layout().align());
             let (new_storage, new_layout) = Self::grow(end, self.cursor, new_align, self.storage);
             if self.layout.size() != 0 {
                 dealloc(self.storage.as_ptr(), self.layout);
@@ -72,7 +72,7 @@ impl CommandBuffer {
         }
 
         let addr = self.storage.as_ptr().add(offset);
-        ptr::copy_nonoverlapping(ptr, addr, ty.layout().size());
+        ptr::copy_nonoverlapping(ptr, addr, ty.value_layout().size());
         self.components.push(ComponentInfo { ty, offset });
         self.cursor = end;
     }
@@ -190,7 +190,7 @@ impl CommandBuffer {
         self.cursor = 0;
         unsafe {
             for info in self.components.drain(..) {
-                info.ty.drop(self.storage.as_ptr().add(info.offset));
+                info.ty.drop_value(self.storage.as_ptr().add(info.offset));
             }
         }
         self.remove_comps.clear();

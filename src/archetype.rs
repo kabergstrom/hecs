@@ -8,6 +8,7 @@
 use crate::alloc::alloc::{alloc, dealloc, Layout};
 use crate::alloc::boxed::Box;
 use crate::alloc::{vec, vec::Vec};
+use crate::gc::{GCHeader, GCPtr, GC};
 use core::any::{type_name, TypeId};
 use core::fmt;
 use core::hash::{BuildHasher, BuildHasherDefault, Hasher};
@@ -54,7 +55,7 @@ impl Archetype {
     }
 
     pub(crate) fn new(types: Vec<TypeInfo>) -> Self {
-        let max_align = types.first().map_or(1, |ty| ty.layout.align());
+        let max_align = types.first().map_or(1, |ty| ty.gc_layout.align());
         Self::assert_type_info(&types);
         let component_count = types.len();
         Self {
@@ -76,8 +77,11 @@ impl Archetype {
         for (ty, data) in self.types.iter().zip(&*self.data) {
             for index in 0..self.len {
                 unsafe {
-                    let removed = data.storage.as_ptr().add(index as usize * ty.layout.size());
-                    (ty.drop)(removed);
+                    let removed = data
+                        .storage
+                        .as_ptr()
+                        .add(index as usize * ty.gc_layout.size());
+                    GCPtr::from_base(ty, NonNull::new_unchecked(removed)).drop(ty);
                 }
             }
         }
@@ -100,12 +104,16 @@ impl Archetype {
     }
 
     /// Get the address of the first `T` component using an index from `get_state::<T>`
-    pub(crate) fn get_base<T: Component>(&self, state: usize) -> NonNull<T> {
+    pub(crate) fn get_base<T: Component>(&self, state: usize) -> NonNull<GC<T>> {
         assert_eq!(self.types[state].id, TypeId::of::<T>());
 
         unsafe {
             NonNull::new_unchecked(
-                self.data.get_unchecked(state).storage.as_ptr().cast::<T>() as *mut T
+                self.data
+                    .get_unchecked(state)
+                    .storage
+                    .as_ptr()
+                    .cast::<GC<T>>() as *mut GC<T>,
             )
         }
     }
@@ -198,21 +206,17 @@ impl Archetype {
     }
 
     /// `index` must be in-bounds or just past the end
-    pub(crate) unsafe fn get_dynamic(
-        &self,
-        ty: TypeId,
-        size: usize,
-        index: u32,
-    ) -> Option<NonNull<u8>> {
+    pub(crate) unsafe fn get_dynamic(&self, ty: &TypeInfo, index: u32) -> Option<GCPtr> {
         debug_assert!(index <= self.len);
-        Some(NonNull::new_unchecked(
+        let base = NonNull::new_unchecked(
             self.data
-                .get_unchecked(*self.index.get(&ty)?)
+                .get_unchecked(*self.index.get(&ty.id())?)
                 .storage
                 .as_ptr()
-                .add(size * index as usize)
-                .cast::<u8>(),
-        ))
+                .add(ty.gc_layout().size() * index as usize),
+        );
+
+        Some(GCPtr::from_base(ty, base))
     }
 
     /// Every type must be written immediately after this call
@@ -262,28 +266,28 @@ impl Archetype {
             .iter()
             .zip(&*self.data)
             .map(|(info, old)| {
-                let storage = if info.layout.size() == 0 {
-                    NonNull::new(info.layout.align() as *mut u8).unwrap()
+                let storage = if info.value_layout.size() == 0 {
+                    NonNull::new(info.value_layout.align() as *mut u8).unwrap()
                 } else {
                     unsafe {
                         let mem = alloc(
                             Layout::from_size_align(
-                                info.layout.size() * new_cap,
-                                info.layout.align(),
+                                info.gc_layout.size() * new_cap,
+                                info.gc_layout.align(),
                             )
                             .unwrap(),
                         );
                         ptr::copy_nonoverlapping(
                             old.storage.as_ptr(),
                             mem,
-                            info.layout.size() * old_count,
+                            info.gc_layout.size() * old_count,
                         );
                         if old_cap > 0 {
                             dealloc(
                                 old.storage.as_ptr(),
                                 Layout::from_size_align(
-                                    info.layout.size() * old_cap,
-                                    info.layout.align(),
+                                    info.gc_layout.size() * old_cap,
+                                    info.gc_layout.align(),
                                 )
                                 .unwrap(),
                             );
@@ -305,13 +309,19 @@ impl Archetype {
     pub(crate) unsafe fn remove(&mut self, index: u32, drop: bool) -> Option<u32> {
         let last = self.len - 1;
         for (ty, data) in self.types.iter().zip(&*self.data) {
-            let removed = data.storage.as_ptr().add(index as usize * ty.layout.size());
+            let removed = data
+                .storage
+                .as_ptr()
+                .add(index as usize * ty.gc_layout.size());
             if drop {
-                (ty.drop)(removed);
+                GCPtr::from_base(ty, NonNull::new_unchecked(removed)).drop(ty);
             }
             if index != last {
-                let moved = data.storage.as_ptr().add(last as usize * ty.layout.size());
-                ptr::copy_nonoverlapping(moved, removed, ty.layout.size());
+                let moved = data
+                    .storage
+                    .as_ptr()
+                    .add(last as usize * ty.gc_layout.size());
+                ptr::copy_nonoverlapping(moved, removed, ty.gc_layout.size());
             }
         }
         self.len = last;
@@ -327,15 +337,21 @@ impl Archetype {
     pub(crate) unsafe fn move_to(
         &mut self,
         index: u32,
-        mut f: impl FnMut(*mut u8, TypeId, usize),
+        mut f: impl FnMut(GCPtr, &TypeInfo),
     ) -> Option<u32> {
         let last = self.len - 1;
         for (ty, data) in self.types.iter().zip(&*self.data) {
-            let moved_out = data.storage.as_ptr().add(index as usize * ty.layout.size());
-            f(moved_out, ty.id(), ty.layout().size());
+            let moved_out = data
+                .storage
+                .as_ptr()
+                .add(index as usize * ty.gc_layout.size());
+            f(GCPtr::from_base(ty, NonNull::new_unchecked(moved_out)), ty);
             if index != last {
-                let moved = data.storage.as_ptr().add(last as usize * ty.layout.size());
-                ptr::copy_nonoverlapping(moved, moved_out, ty.layout.size());
+                let moved = data
+                    .storage
+                    .as_ptr()
+                    .add(last as usize * ty.gc_layout.size());
+                ptr::copy_nonoverlapping(moved, moved_out, ty.gc_layout.size());
             }
         }
         self.len -= 1;
@@ -347,19 +363,35 @@ impl Archetype {
         }
     }
 
-    pub(crate) unsafe fn put_dynamic(
+    pub(crate) unsafe fn put_new_dynamic(
         &mut self,
-        component: *mut u8,
-        ty: TypeId,
-        size: usize,
+        component_data: *mut u8,
+        ty: &TypeInfo,
         index: u32,
     ) {
-        let ptr = self
-            .get_dynamic(ty, size, index)
-            .unwrap()
-            .as_ptr()
-            .cast::<u8>();
-        ptr::copy_nonoverlapping(component, ptr, size);
+        let ptr = self.get_dynamic(ty, index).unwrap();
+        ptr.header_ptr().as_ptr().write(GCHeader::new_alive());
+        ptr::copy_nonoverlapping(
+            component_data,
+            ptr.value_ptr().as_ptr(),
+            ty.value_layout().size(),
+        );
+    }
+
+    pub(crate) unsafe fn put_dynamic(
+        &mut self,
+        gc_header: *mut GCHeader,
+        component_data: *mut u8,
+        ty: &TypeInfo,
+        index: u32,
+    ) {
+        let ptr = self.get_dynamic(ty, index).unwrap();
+        ptr.header_ptr().as_ptr().write(gc_header.read());
+        ptr::copy_nonoverlapping(
+            component_data,
+            ptr.value_ptr().as_ptr(),
+            ty.value_layout().size(),
+        );
     }
 
     /// How, if at all, `Q` will access entities in this archetype
@@ -377,10 +409,10 @@ impl Archetype {
         for ((info, dst), src) in self.types.iter().zip(&*self.data).zip(&*other.data) {
             dst.storage
                 .as_ptr()
-                .add(self.len as usize * info.layout.size())
+                .add(self.len as usize * info.gc_layout.size())
                 .copy_from_nonoverlapping(
                     src.storage.as_ptr(),
-                    other.len as usize * info.layout.size(),
+                    other.len as usize * info.gc_layout.size(),
                 )
         }
         self.len += other.len;
@@ -405,13 +437,13 @@ impl Drop for Archetype {
             return;
         }
         for (info, data) in self.types.iter().zip(&*self.data) {
-            if info.layout.size() != 0 {
+            if info.value_layout.size() != 0 {
                 unsafe {
                     dealloc(
                         data.storage.as_ptr(),
                         Layout::from_size_align_unchecked(
-                            info.layout.size() * self.entities.len(),
-                            info.layout.align(),
+                            info.gc_layout.size() * self.entities.len(),
+                            info.gc_layout.align(),
                         ),
                     );
                 }
@@ -499,8 +531,10 @@ impl<V> OrderedTypeIdMap<V> {
 #[derive(Debug, Copy, Clone)]
 pub struct TypeInfo {
     id: TypeId,
-    layout: Layout,
+    value_layout: Layout,
+    gc_layout: Layout,
     drop: unsafe fn(*mut u8),
+    data_start: usize,
     #[cfg(debug_assertions)]
     type_name: &'static str,
 }
@@ -512,9 +546,16 @@ impl TypeInfo {
             x.cast::<T>().drop_in_place()
         }
 
+        let type_layout = Layout::new::<T>();
+        let (gc_layout, data_start) = Layout::new::<GCHeader>().extend(type_layout).unwrap();
+        let gc_layout = gc_layout.pad_to_align();
+        assert!(gc_layout.size() == Layout::new::<GC<T>>().size());
+
         Self {
             id: TypeId::of::<T>(),
-            layout: Layout::new::<T>(),
+            gc_layout,
+            value_layout: type_layout,
+            data_start,
             drop: drop_ptr::<T>,
             #[cfg(debug_assertions)]
             type_name: core::any::type_name::<T>(),
@@ -526,9 +567,14 @@ impl TypeInfo {
     /// source unrelated to hecs, and you want to treat it as an insertable component by
     /// implementing the `DynamicBundle` API.
     pub fn from_parts(id: TypeId, layout: Layout, drop: unsafe fn(*mut u8)) -> Self {
+        let (gc_layout, data_start) = Layout::new::<GCHeader>().extend(layout).unwrap();
+        let gc_layout = gc_layout.pad_to_align();
+
         Self {
             id,
-            layout,
+            gc_layout,
+            value_layout: layout,
+            data_start,
             drop,
             #[cfg(debug_assertions)]
             type_name: "<unknown> (TypeInfo constructed from parts)",
@@ -540,9 +586,19 @@ impl TypeInfo {
         self.id
     }
 
+    /// Access the `Layout` of this component type as if it were wrapped with a GC<T>.
+    pub fn gc_layout(&self) -> Layout {
+        self.gc_layout
+    }
+
     /// Access the `Layout` of this component type.
-    pub fn layout(&self) -> Layout {
-        self.layout
+    pub fn value_layout(&self) -> Layout {
+        self.value_layout
+    }
+
+    /// The byte offset of the gc_layout where value_layout starts.
+    pub fn data_start(&self) -> usize {
+        self.data_start
     }
 
     /// Directly call the destructor on a pointer to data of this component type.
@@ -551,8 +607,8 @@ impl TypeInfo {
     ///
     /// All of the caveats of [`core::ptr::drop_in_place`] apply, with the additional requirement
     /// that this method is being called on a pointer to an object of the correct component type.
-    pub unsafe fn drop(&self, data: *mut u8) {
-        (self.drop)(data)
+    pub unsafe fn drop_value(&self, data: *mut u8) {
+        (self.drop)(data);
     }
 
     /// Get the function pointer encoding the destructor for the component type this `TypeInfo`
@@ -571,9 +627,9 @@ impl PartialOrd for TypeInfo {
 impl Ord for TypeInfo {
     /// Order by alignment, descending. Ties broken with TypeId.
     fn cmp(&self, other: &Self) -> core::cmp::Ordering {
-        self.layout
+        self.gc_layout
             .align()
-            .cmp(&other.layout.align())
+            .cmp(&other.gc_layout.align())
             .reverse()
             .then_with(|| self.id.cmp(&other.id))
     }
@@ -590,7 +646,7 @@ impl Eq for TypeInfo {}
 /// Shared reference to a single column of component data in an [`Archetype`]
 pub struct ArchetypeColumn<'a, T: Component> {
     archetype: &'a Archetype,
-    column: &'a [T],
+    column: &'a [GC<T>],
 }
 
 impl<'a, T: Component> ArchetypeColumn<'a, T> {
@@ -604,8 +660,8 @@ impl<'a, T: Component> ArchetypeColumn<'a, T> {
 }
 
 impl<T: Component> Deref for ArchetypeColumn<'_, T> {
-    type Target = [T];
-    fn deref(&self) -> &[T] {
+    type Target = [GC<T>];
+    fn deref(&self) -> &[GC<T>] {
         self.column
     }
 }
@@ -637,7 +693,7 @@ impl<T: Component + fmt::Debug> fmt::Debug for ArchetypeColumn<'_, T> {
 /// Unique reference to a single column of component data in an [`Archetype`]
 pub struct ArchetypeColumnMut<'a, T: Component> {
     archetype: &'a Archetype,
-    column: &'a mut [T],
+    column: &'a mut [GC<T>],
 }
 
 impl<'a, T: Component> ArchetypeColumnMut<'a, T> {
@@ -652,14 +708,14 @@ impl<'a, T: Component> ArchetypeColumnMut<'a, T> {
 }
 
 impl<T: Component> Deref for ArchetypeColumnMut<'_, T> {
-    type Target = [T];
-    fn deref(&self) -> &[T] {
+    type Target = [GC<T>];
+    fn deref(&self) -> &[GC<T>] {
         self.column
     }
 }
 
 impl<T: Component> DerefMut for ArchetypeColumnMut<'_, T> {
-    fn deref_mut(&mut self) -> &mut [T] {
+    fn deref_mut(&mut self) -> &mut [GC<T>] {
         self.column
     }
 }

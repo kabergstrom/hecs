@@ -14,6 +14,7 @@ use core::slice::Iter as SliceIter;
 use crate::alloc::{boxed::Box, vec::Vec};
 use crate::archetype::Archetype;
 use crate::entities::EntityMeta;
+use crate::gc::GC;
 use crate::{Component, Entity, World};
 
 /// A collection of component types to fetch from a [`World`](crate::World)
@@ -89,7 +90,7 @@ impl<'a, T: Component> Query for &'a T {
 unsafe impl<'a, T> QueryShared for &'a T {}
 
 #[doc(hidden)]
-pub struct FetchRead<T>(NonNull<T>);
+pub struct FetchRead<T>(NonNull<GC<T>>);
 
 unsafe impl<'a, T: Component> Fetch<'a> for FetchRead<T> {
     type Item = &'a T;
@@ -126,7 +127,7 @@ unsafe impl<'a, T: Component> Fetch<'a> for FetchRead<T> {
     }
 
     unsafe fn get(&self, n: usize) -> Self::Item {
-        &*self.0.as_ptr().add(n)
+        &(*self.0.as_ptr().add(n)).value
     }
 }
 
@@ -135,7 +136,7 @@ impl<'a, T: Component> Query for &'a mut T {
 }
 
 #[doc(hidden)]
-pub struct FetchWrite<T>(NonNull<T>);
+pub struct FetchWrite<T>(NonNull<GC<T>>);
 
 unsafe impl<'a, T: Component> Fetch<'a> for FetchWrite<T> {
     type Item = &'a mut T;
@@ -173,7 +174,7 @@ unsafe impl<'a, T: Component> Fetch<'a> for FetchWrite<T> {
     }
 
     unsafe fn get(&self, n: usize) -> Self::Item {
-        &mut *self.0.as_ptr().add(n)
+        &mut (*self.0.as_ptr().add(n)).value
     }
 }
 

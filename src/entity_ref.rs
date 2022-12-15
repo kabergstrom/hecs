@@ -3,6 +3,7 @@ use core::ops::{Deref, DerefMut};
 use core::ptr::NonNull;
 
 use crate::archetype::Archetype;
+use crate::gc::GC;
 use crate::{
     ArchetypeColumn, ArchetypeColumnMut, Component, Entity, Fetch, MissingComponent, Query,
     QueryOne,
@@ -113,7 +114,7 @@ pub struct Ref<'a, T: Component> {
     archetype: &'a Archetype,
     /// State index for `T` in `archetype`
     state: usize,
-    target: NonNull<T>,
+    target: NonNull<GC<T>>,
 }
 
 impl<'a, T: Component> Ref<'a, T> {
@@ -147,7 +148,7 @@ impl<'a, T: Component> Drop for Ref<'a, T> {
 impl<'a, T: Component> Deref for Ref<'a, T> {
     type Target = T;
     fn deref(&self) -> &T {
-        unsafe { self.target.as_ref() }
+        unsafe { &self.target.as_ref().value }
     }
 }
 
@@ -156,7 +157,7 @@ pub struct RefMut<'a, T: Component> {
     archetype: &'a Archetype,
     /// State index for `T` in `archetype`
     state: usize,
-    target: NonNull<T>,
+    target: NonNull<GC<T>>,
 }
 
 impl<'a, T: Component> RefMut<'a, T> {
@@ -190,13 +191,13 @@ impl<'a, T: Component> Drop for RefMut<'a, T> {
 impl<'a, T: Component> Deref for RefMut<'a, T> {
     type Target = T;
     fn deref(&self) -> &T {
-        unsafe { self.target.as_ref() }
+        unsafe { &self.target.as_ref().value }
     }
 }
 
 impl<'a, T: Component> DerefMut for RefMut<'a, T> {
     fn deref_mut(&mut self) -> &mut T {
-        unsafe { self.target.as_mut() }
+        unsafe { &mut self.target.as_mut().value }
     }
 }
 
@@ -228,6 +229,14 @@ pub trait ComponentRef<'a> {
     #[doc(hidden)]
     unsafe fn from_raw(raw: *mut Self::Component) -> Self;
 
+    /// Construct from a raw pointer to GC<T>
+    ///
+    /// # Safety
+    ///
+    /// Dereferencing `raw` for lifetime `'a` must be sound
+    #[doc(hidden)]
+    unsafe fn from_raw_gc(raw: *mut GC<Self::Component>) -> Self;
+
     /// Borrow a column from an archetype
     #[doc(hidden)]
     fn get_column(archetype: &'a Archetype) -> Option<Self::Column>;
@@ -242,6 +251,10 @@ impl<'a, T: Component> ComponentRef<'a> for &'a T {
 
     fn get_component(entity: EntityRef<'a>) -> Option<Self::Ref> {
         Some(unsafe { Ref::new(entity.archetype, entity.index).ok()? })
+    }
+
+    unsafe fn from_raw_gc(raw: *mut GC<Self::Component>) -> Self {
+        &(*raw).value
     }
 
     unsafe fn from_raw(raw: *mut Self::Component) -> Self {
@@ -262,6 +275,10 @@ impl<'a, T: Component> ComponentRef<'a> for &'a mut T {
 
     fn get_component(entity: EntityRef<'a>) -> Option<Self::Ref> {
         Some(unsafe { RefMut::new(entity.archetype, entity.index).ok()? })
+    }
+
+    unsafe fn from_raw_gc(raw: *mut GC<Self::Component>) -> Self {
+        &mut (*raw).value
     }
 
     unsafe fn from_raw(raw: *mut Self::Component) -> Self {

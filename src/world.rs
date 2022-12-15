@@ -165,7 +165,7 @@ impl World {
         unsafe {
             let index = archetype.allocate(entity.id);
             components.put(|ptr, ty| {
-                archetype.put_dynamic(ptr, ty.id(), ty.layout().size(), index);
+                archetype.put_new_dynamic(ptr, &ty, index);
             });
             self.entities.meta[entity.id as usize].location = Location {
                 archetype: archetype_id,
@@ -586,17 +586,15 @@ impl World {
         unsafe {
             // Drop the components we're overwriting
             for &ty in &target.replaced {
-                let ptr = source_arch
-                    .get_dynamic(ty.id(), ty.layout().size(), loc.index)
-                    .unwrap();
-                ty.drop(ptr.as_ptr());
+                let ptr = source_arch.get_dynamic(&ty, loc.index).unwrap();
+                ptr.drop(&ty);
             }
 
             if target.index == loc.archetype {
                 // Update components in the current archetype
                 let arch = &mut self.archetypes.archetypes[loc.archetype as usize];
                 components.put(|ptr, ty| {
-                    arch.put_dynamic(ptr, ty.id(), ty.layout().size(), loc.index);
+                    arch.put_new_dynamic(ptr, &ty, loc.index);
                 });
                 return;
             }
@@ -615,15 +613,18 @@ impl World {
 
             // Move the new components
             components.put(|ptr, ty| {
-                target_arch.put_dynamic(ptr, ty.id(), ty.layout().size(), target_index);
+                target_arch.put_new_dynamic(ptr, &ty, target_index);
             });
 
             // Move the components we're keeping
             for &ty in &target.retained {
-                let src = source_arch
-                    .get_dynamic(ty.id(), ty.layout().size(), loc.index)
-                    .unwrap();
-                target_arch.put_dynamic(src.as_ptr(), ty.id(), ty.layout().size(), target_index)
+                let src = source_arch.get_dynamic(&ty, loc.index).unwrap();
+                target_arch.put_dynamic(
+                    src.header_ptr().as_ptr(),
+                    src.value_ptr().as_ptr(),
+                    &ty,
+                    target_index,
+                )
             }
 
             // Free storage in the old archetype
@@ -673,7 +674,11 @@ impl World {
 
         // Move out of the source archetype, or bail out if a component is missing
         let bundle = unsafe {
-            T::get(|ty| source_arch.get_dynamic(ty.id(), ty.layout().size(), old_index))?
+            T::get(|ty| {
+                source_arch
+                    .get_dynamic(&ty, old_index)
+                    .map(|p| p.value_ptr())
+            })?
         };
 
         // Find the target archetype ID
@@ -692,10 +697,17 @@ impl World {
             loc.archetype = target;
             loc.index = target_index;
             if let Some(moved) = unsafe {
-                source_arch.move_to(old_index, |src, ty, size| {
+                source_arch.move_to(old_index, |src, ty| {
                     // Only move the components present in the target archetype, i.e. the non-removed ones.
-                    if let Some(dst) = target_arch.get_dynamic(ty, size, target_index) {
-                        ptr::copy_nonoverlapping(src, dst.as_ptr(), size);
+                    if let Some(dst) = target_arch.get_dynamic(ty, target_index) {
+                        dst.header_ptr()
+                            .as_ptr()
+                            .write(src.header_ptr().as_ptr().read());
+                        ptr::copy_nonoverlapping(
+                            src.value_ptr().as_ptr(),
+                            dst.value_ptr().as_ptr(),
+                            ty.value_layout().size(),
+                        );
                     }
                 })
             } {
@@ -754,7 +766,11 @@ impl World {
         let source_arch = &self.archetypes.archetypes[loc.archetype as usize];
 
         let bundle = unsafe {
-            S::get(|ty| source_arch.get_dynamic(ty.id(), ty.layout().size(), loc.index))?
+            S::get(|ty| {
+                source_arch
+                    .get_dynamic(&ty, loc.index)
+                    .map(|p| p.value_ptr())
+            })?
         };
 
         // Find the intermediate archetype ID
@@ -797,7 +813,7 @@ impl World {
         let state = archetype
             .get_state::<T::Component>()
             .ok_or_else(MissingComponent::new::<T::Component>)?;
-        Ok(T::from_raw(
+        Ok(T::from_raw_gc(
             archetype
                 .get_base::<T::Component>(state)
                 .as_ptr()
@@ -1093,8 +1109,7 @@ where
         let index = unsafe { self.archetype.allocate(entity.id) };
         unsafe {
             components.put(|ptr, ty| {
-                self.archetype
-                    .put_dynamic(ptr, ty.id(), ty.layout().size(), index);
+                self.archetype.put_new_dynamic(ptr, &ty, index);
             });
         }
         self.entities.meta[entity.id as usize].location = Location {

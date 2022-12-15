@@ -1,3 +1,5 @@
+use core::ptr::drop_in_place;
+
 use alloc::vec::Vec;
 
 use crate::{entities::Entities, Archetype, DynamicBundle, Entity, TypeInfo};
@@ -43,11 +45,9 @@ unsafe impl<'a> DynamicBundle for TakenEntity<'a> {
         // Suppress dropping of moved components
         self.drop = false;
         for &ty in self.archetype.types() {
-            let ptr = self
-                .archetype
-                .get_dynamic(ty.id(), ty.layout().size(), self.index)
-                .unwrap();
-            f(ptr.as_ptr(), ty)
+            let ptr = self.archetype.get_dynamic(&ty, self.index).unwrap();
+            f(ptr.value_ptr().as_ptr(), ty);
+            drop_in_place(ptr.header_ptr().as_ptr());
         }
     }
 }

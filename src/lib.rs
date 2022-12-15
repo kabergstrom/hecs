@@ -64,6 +64,7 @@ mod command_buffer;
 mod entities;
 mod entity_builder;
 mod entity_ref;
+mod gc;
 mod query;
 mod query_one;
 #[cfg(any(feature = "row-serialize", feature = "column-serialize"))]
