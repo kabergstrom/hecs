@@ -1,8 +1,9 @@
 use crate::{
     alloc::collections::BinaryHeap,
+    archetype::Data,
     gc::{GCHeader, GCPtr, GC},
 };
-use core::{any::TypeId, fmt, mem::MaybeUninit, ptr::NonNull, slice};
+use core::{any::TypeId, fmt, marker::PhantomData, mem::MaybeUninit, ptr::NonNull, slice};
 
 use crate::{
     archetype::{TypeIdMap, TypeInfo},
@@ -33,7 +34,8 @@ impl ColumnBatchType {
         types.dedup();
         let fill = TypeIdMap::with_capacity_and_hasher(types.len(), Default::default());
         let mut arch = Archetype::new(types);
-        arch.reserve(size);
+        todo!();
+        // arch.reserve(size);
         ColumnBatchBuilder {
             fill,
             target_fill: size,
@@ -63,14 +65,13 @@ impl ColumnBatchBuilder {
     pub fn writer<T: Component>(&mut self) -> Option<BatchWriter<'_, T>> {
         let archetype = self.archetype.as_mut().unwrap();
         let state = archetype.get_state::<T>()?;
-        let base = archetype.get_base::<T>(state);
+        let data = unsafe { archetype.get_data_storage_mut(state) };
         Some(BatchWriter {
             fill: self.fill.entry(TypeId::of::<T>()).or_insert(0),
             ty: TypeInfo::of::<T>(),
-            storage: unsafe {
-                slice::from_raw_parts_mut(base.as_ptr().cast(), self.target_fill as usize)
-                    .iter_mut()
-            },
+            size: archetype.capacity(),
+            storage: data,
+            _marker: PhantomData::default(),
         })
     }
 
@@ -84,28 +85,11 @@ impl ColumnBatchBuilder {
         {
             return Err(BatchIncomplete { _opaque: () });
         }
-        unsafe {
-            archetype.set_len(self.target_fill);
-        }
+        todo!();
+        // unsafe {
+        //     archetype.set_len(self.target_fill);
+        // }
         Ok(ColumnBatch(archetype))
-    }
-}
-
-impl Drop for ColumnBatchBuilder {
-    fn drop(&mut self) {
-        if let Some(archetype) = self.archetype.take() {
-            for ty in archetype.types() {
-                let fill = self.fill.get(&ty.id()).copied().unwrap_or(0);
-                unsafe {
-                    let ptr = archetype.get_dynamic(ty, 0).unwrap();
-                    let base = ptr.header_ptr().as_ptr().cast::<u8>();
-                    for i in 0..fill {
-                        let header = base.add(i as usize * ty.gc_layout().size());
-                        GCPtr::from_base(ty, NonNull::new_unchecked(header)).drop(ty);
-                    }
-                }
-            }
-        }
     }
 }
 
@@ -116,30 +100,22 @@ pub struct ColumnBatch(pub(crate) Archetype);
 pub struct BatchWriter<'a, T> {
     ty: TypeInfo,
     fill: &'a mut u32,
-    storage: core::slice::IterMut<'a, MaybeUninit<GC<T>>>,
+    size: u32,
+    storage: NonNull<Data>,
+    _marker: PhantomData<&'a T>,
 }
 
 impl<T> BatchWriter<'_, T> {
     /// Add a component if there's space remaining
-    pub fn push(&mut self, x: T) -> Result<(), T> {
-        match self.storage.next() {
-            None => Err(x),
-            Some(slot) => {
-                *slot = MaybeUninit::new(GC {
-                    header_storage: MaybeUninit::uninit(),
-                    value: x,
-                });
-                unsafe {
-                    let ptr = GCPtr::from_base(
-                        &self.ty,
-                        NonNull::new_unchecked(slot.as_mut_ptr().cast()),
-                    );
-                    ptr.header_ptr().as_ptr().write(GCHeader::new_alive());
-                }
-                *self.fill += 1;
-                Ok(())
-            }
+    pub fn push(&mut self, mut x: T) -> Result<(), T> {
+        let data = unsafe { self.storage.as_mut() };
+        if *self.fill + 1 >= self.size {
+            return Err(x);
         }
+        let mut slot = data.get_gc_ptr(self.fill());
+        unsafe { slot.move_from_value(&self.ty, &mut x as *mut T as *mut u8) };
+        *self.fill += 1;
+        Ok(())
     }
 
     /// How many components have been added so far

@@ -9,6 +9,9 @@ use core::{fmt, mem};
 #[cfg(feature = "std")]
 use std::error::Error;
 
+use crate::gc::cells::{IsizeCell, U32Cell};
+use crate::gc::kvec::KVec;
+
 /// Lightweight unique ID, or handle, of an entity
 ///
 /// Obtained from `World::spawn`. Can be stored to refer to an entity in the future.
@@ -145,7 +148,7 @@ impl<'a> ExactSizeIterator for ReserveEntitiesIterator<'a> {}
 
 #[derive(Default)]
 pub(crate) struct Entities {
-    pub meta: Vec<EntityMeta>,
+    pub meta: KVec<EntityMeta>,
 
     // The `pending` and `free_cursor` fields describe three sets of Entity IDs
     // that have been freed or are in the process of being allocated:
@@ -182,9 +185,9 @@ pub(crate) struct Entities {
     // and then from the new IDs, using only a single atomic subtract.
     //
     // Once `flush()` is done, `free_cursor` will equal `pending.len()`.
-    pending: Vec<u32>,
-    free_cursor: AtomicIsize,
-    len: u32,
+    pending: KVec<u32>,
+    free_cursor: IsizeCell,
+    len: U32Cell,
 }
 
 impl Entities {
@@ -271,10 +274,11 @@ impl Entities {
     pub fn alloc(&mut self) -> Entity {
         self.verify_flushed();
 
-        self.len += 1;
+        let len = self.len.read();
+        self.len.set(len + 1);
         if let Some(id) = self.pending.pop() {
             let new_free_cursor = self.pending.len() as isize;
-            self.free_cursor.store(new_free_cursor, Ordering::Relaxed); // Not racey due to &mut self
+            self.free_cursor.set(new_free_cursor);
             Entity {
                 generation: self.meta[id as usize].generation,
                 id,
@@ -317,7 +321,8 @@ impl Entities {
             }),
         );
 
-        self.len += n;
+        let len = self.len.read();
+        self.len.set(len + n);
 
         AllocManyState {
             fresh: fresh_start..(fresh_start + fresh),
@@ -341,15 +346,17 @@ impl Entities {
         let loc = if entity.id as usize >= self.meta.len() {
             self.pending.extend((self.meta.len() as u32)..entity.id);
             let new_free_cursor = self.pending.len() as isize;
-            self.free_cursor.store(new_free_cursor, Ordering::Relaxed); // Not racey due to &mut self
+            self.free_cursor.set(new_free_cursor); // Not racey due to &mut self
             self.meta.resize(entity.id as usize + 1, EntityMeta::EMPTY);
-            self.len += 1;
+            let len = self.len();
+            self.len.set(len + 1);
             None
         } else if let Some(index) = self.pending.iter().position(|item| *item == entity.id) {
             self.pending.swap_remove(index);
             let new_free_cursor = self.pending.len() as isize;
-            self.free_cursor.store(new_free_cursor, Ordering::Relaxed); // Not racey due to &mut self
-            self.len += 1;
+            self.free_cursor.set(new_free_cursor);
+            let len = self.len();
+            self.len.set(len + 1);
             None
         } else {
             Some(mem::replace(
@@ -382,8 +389,9 @@ impl Entities {
         self.pending.push(entity.id);
 
         let new_free_cursor = self.pending.len() as isize;
-        self.free_cursor.store(new_free_cursor, Ordering::Relaxed); // Not racey due to &mut self
-        self.len -= 1;
+        self.free_cursor.set(new_free_cursor);
+        let len = self.len();
+        self.len.set(len - 1);
 
         Ok(loc)
     }
@@ -392,7 +400,7 @@ impl Entities {
     pub fn reserve(&mut self, additional: u32) {
         self.verify_flushed();
 
-        let freelist_size = self.free_cursor.load(Ordering::Relaxed);
+        let freelist_size = self.free_cursor.read();
         let shortfall = additional as isize - freelist_size;
         if shortfall > 0 {
             self.meta.reserve(shortfall as usize);
@@ -404,12 +412,13 @@ impl Entities {
             Some(meta) => {
                 meta.generation == entity.generation
                     && (meta.location.index != u32::MAX
-                        || self.pending[self.free_cursor.load(Ordering::Relaxed).max(0) as usize..]
+                        || self.pending
+                            [self.free_cursor.load_atomic(Ordering::Relaxed).max(0) as usize..]
                             .contains(&entity.id))
             }
             None => {
                 // Check if this could have been obtained from `reserve_entity`
-                let free = self.free_cursor.load(Ordering::Relaxed);
+                let free = self.free_cursor.load_atomic(Ordering::Relaxed);
                 entity.generation.get() == 1
                     && free < 0
                     && (entity.id as isize) < (free.abs() + self.meta.len() as isize)
@@ -440,7 +449,7 @@ impl Entities {
     pub fn get(&self, entity: Entity) -> Result<Location, NoSuchEntity> {
         if self.meta.len() <= entity.id as usize {
             // Check if this could have been obtained from `reserve_entity`
-            let free = self.free_cursor.load(Ordering::Relaxed);
+            let free = self.free_cursor.load_atomic(Ordering::Relaxed);
             if entity.generation.get() == 1
                 && free < 0
                 && (entity.id as isize) < (free.abs() + self.meta.len() as isize)
@@ -475,7 +484,7 @@ impl Entities {
             }
         } else {
             // See if it's pending, but not yet flushed.
-            let free_cursor = self.free_cursor.load(Ordering::Relaxed);
+            let free_cursor = self.free_cursor.load_atomic(Ordering::Relaxed);
             let num_pending = cmp::max(-free_cursor, 0) as usize;
 
             if meta_len + num_pending > id as usize {
@@ -491,15 +500,13 @@ impl Entities {
     }
 
     fn needs_flush(&mut self) -> bool {
-        // Not racey due to &mut self
-        self.free_cursor.load(Ordering::Relaxed) != self.pending.len() as isize
+        self.free_cursor.read() != self.pending.len() as isize
     }
 
     /// Allocates space for entities previously reserved with `reserve_entity` or
     /// `reserve_entities`, then initializes each one using the supplied function.
     pub fn flush(&mut self, mut init: impl FnMut(u32, &mut Location)) {
-        // Not racey due because of self is &mut.
-        let free_cursor = self.free_cursor.load(Ordering::Relaxed);
+        let free_cursor = self.free_cursor.read();
 
         let new_free_cursor = if free_cursor >= 0 {
             free_cursor as usize
@@ -508,16 +515,19 @@ impl Entities {
             let new_meta_len = old_meta_len + -free_cursor as usize;
             self.meta.resize(new_meta_len, EntityMeta::EMPTY);
 
-            self.len += -free_cursor as u32;
+            let len = self.len.read();
+            self.len.set(len - free_cursor as u32);
             for (id, meta) in self.meta.iter_mut().enumerate().skip(old_meta_len) {
                 init(id as u32, &mut meta.location);
             }
 
-            self.free_cursor.store(0, Ordering::Relaxed);
+            self.free_cursor.set(0);
             0
         };
 
-        self.len += (self.pending.len() - new_free_cursor) as u32;
+        let len = self.len.read();
+        self.len
+            .set(len + (self.pending.len() - new_free_cursor) as u32);
         for id in self.pending.drain(new_free_cursor..) {
             init(id, &mut self.meta[id as usize].location);
         }
@@ -525,7 +535,7 @@ impl Entities {
 
     #[inline]
     pub fn len(&self) -> u32 {
-        self.len
+        self.len.load_atomic(Ordering::Acquire)
     }
 }
 
@@ -704,7 +714,7 @@ mod tests {
             .is_none());
         e.meta[entity.id as usize].location.index = 0;
         assert_eq!(e.pending.len(), 2);
-        assert_eq!(&e.pending, &[1, 2]);
+        assert_eq!(&*e.pending, &[1, 2]);
         assert_eq!(e.meta.len(), 4);
     }
 
@@ -755,7 +765,7 @@ mod tests {
         for entity in v1.drain(6..) {
             e.free(entity).unwrap();
         }
-        assert_eq!(e.free_cursor.load(Ordering::Relaxed), 4);
+        assert_eq!(e.free_cursor.read(), 4);
 
         // Reserve 10 entities, so 4 will come from the freelist.
         // This means we will have allocated 10 + 10 - 4 total items, so max id is 15.
@@ -774,7 +784,7 @@ mod tests {
         }
 
         // 6 will come from pending.
-        assert_eq!(e.free_cursor.load(Ordering::Relaxed), -6);
+        assert_eq!(e.free_cursor.read(), -6);
 
         let mut flushed = Vec::new();
         e.flush(|id, loc| {

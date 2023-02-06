@@ -6,10 +6,14 @@
 // copied, modified, or distributed except according to those terms.
 
 use crate::alloc::{vec, vec::Vec};
+use crate::gc::{alloc_world_slot, free_world_slot};
+use bevy_reflect::Reflect;
 use core::any::TypeId;
 use core::borrow::Borrow;
+use core::cell::Cell;
 use core::convert::TryFrom;
 use core::hash::{BuildHasherDefault, Hasher};
+use core::num::NonZeroU32;
 use spin::Mutex;
 
 use core::{fmt, ptr};
@@ -23,8 +27,8 @@ use crate::alloc::boxed::Box;
 use crate::archetype::{Archetype, TypeIdMap, TypeInfo};
 use crate::entities::{Entities, EntityMeta, Location, ReserveEntitiesIterator};
 use crate::{
-    Bundle, ColumnBatch, ComponentRef, DynamicBundle, Entity, EntityRef, Fetch, MissingComponent,
-    NoSuchEntity, Query, QueryBorrow, QueryItem, QueryMut, QueryOne, TakenEntity,
+    Bundle, CRef, ColumnBatch, ComponentRef, DynamicBundle, Entity, EntityRef, Fetch,
+    MissingComponent, NoSuchEntity, Query, QueryBorrow, QueryItem, QueryMut, QueryOne, TakenEntity,
 };
 
 /// An unordered collection of entities, each having any number of distinctly typed components
@@ -57,6 +61,12 @@ pub struct World {
     /// after removing the components from that bundle.
     remove_edges: IndexTypeIdMap<u32>,
     id: u64,
+    world_slot: NonZeroU32,
+}
+impl Drop for World {
+    fn drop(&mut self) {
+        unsafe { free_world_slot(self.world_slot) };
+    }
 }
 
 impl World {
@@ -78,6 +88,7 @@ impl World {
             insert_edges: HashMap::default(),
             remove_edges: HashMap::default(),
             id,
+            world_slot: alloc_world_slot(),
         }
     }
 
@@ -140,11 +151,7 @@ impl World {
 
         let loc = self.entities.alloc_at(handle);
         if let Some(loc) = loc {
-            if let Some(moved) = unsafe {
-                self.archetypes.archetypes[loc.archetype as usize].remove(loc.index, true)
-            } {
-                self.entities.meta[moved as usize].location.index = loc.index;
-            }
+            unsafe { self.archetypes.archetypes[loc.archetype as usize].remove(loc.index) }
         }
 
         self.spawn_inner(handle, components);
@@ -162,10 +169,11 @@ impl World {
         };
 
         let archetype = &mut self.archetypes.archetypes[archetype_id as usize];
+        // SAFETY: we have &mut self
         unsafe {
-            let index = archetype.allocate(entity.id);
+            let index = archetype.allocate_nonsync(entity.id, self.world_slot);
             components.put(|ptr, ty| {
-                archetype.put_new_dynamic(ptr, &ty, index);
+                archetype.put_new_dynamic_nonsync(ptr, &ty, index);
             });
             self.entities.meta[entity.id as usize].location = Location {
                 archetype: archetype_id,
@@ -208,6 +216,7 @@ impl World {
             entities: &mut self.entities,
             archetype_id,
             archetype: &mut self.archetypes.archetypes[archetype_id as usize],
+            world_slot: &self.world_slot,
         }
     }
 
@@ -219,7 +228,8 @@ impl World {
         self.flush();
 
         let archetype = batch.0;
-        let entity_count = archetype.len();
+        // SAFETY: We have &mut self
+        let entity_count = unsafe { archetype.len_nonsync() };
         // Store component data
         let (archetype_id, base) = self.archetypes.insert_batch(archetype);
 
@@ -247,21 +257,17 @@ impl World {
         let archetype = batch.0;
         assert_eq!(
             handles.len(),
-            archetype.len() as usize,
+            archetype.len_sync() as usize,
             "number of entity IDs {} must match number of entities {}",
             handles.len(),
-            archetype.len()
+            archetype.len_sync()
         );
 
         // Drop components of entities that will be replaced
         for &handle in handles {
             let loc = self.entities.alloc_at(handle);
             if let Some(loc) = loc {
-                if let Some(moved) = unsafe {
-                    self.archetypes.archetypes[loc.archetype as usize].remove(loc.index, true)
-                } {
-                    self.entities.meta[moved as usize].location.index = loc.index;
-                }
+                unsafe { self.archetypes.archetypes[loc.archetype as usize].remove(loc.index) }
             }
         }
 
@@ -306,11 +312,7 @@ impl World {
     pub fn despawn(&mut self, entity: Entity) -> Result<(), NoSuchEntity> {
         self.flush();
         let loc = self.entities.free(entity)?;
-        if let Some(moved) =
-            unsafe { self.archetypes.archetypes[loc.archetype as usize].remove(loc.index, true) }
-        {
-            self.entities.meta[moved as usize].location.index = loc.index;
-        }
+        unsafe { self.archetypes.archetypes[loc.archetype as usize].remove(loc.index) }
         Ok(())
     }
 
@@ -333,7 +335,7 @@ impl World {
                 })
             });
 
-        self.archetypes.archetypes[archetype_id as usize].reserve(additional);
+        self.archetypes.archetypes[archetype_id as usize].reserve(additional, self.world_slot);
         archetype_id
     }
 
@@ -415,8 +417,16 @@ impl World {
         &self.entities.meta
     }
 
+    pub(crate) fn entities(&self) -> &Entities {
+        &self.entities
+    }
+
     pub(crate) fn archetypes_inner(&self) -> &[Archetype] {
         &self.archetypes.archetypes
+    }
+
+    pub(crate) fn world_slot(&self) -> NonZeroU32 {
+        self.world_slot
     }
 
     /// Prepare a query against a single entity, using dynamic borrow checking
@@ -476,6 +486,25 @@ impl World {
             .entity(entity)?
             .get::<T>()
             .ok_or_else(MissingComponent::new::<T::Component>)?)
+    }
+
+    pub fn new_cref<'a, T: Component + 'static>(
+        &'a self,
+        entity: Entity,
+    ) -> Result<CRef<T>, ComponentError> {
+        let entity = self.entity(entity)?;
+        let ptr = unsafe {
+            entity
+                .archetype()
+                .get_dynamic(&TypeInfo::of::<T>(), entity.index())
+        };
+        let ptr = ptr.ok_or(ComponentError::MissingComponent(
+            MissingComponent::new::<T>(),
+        ))?;
+        Ok(CRef {
+            ptr,
+            _marker: core::marker::PhantomData::default(),
+        })
     }
 
     /// Short-hand for [`entity`](Self::entity) followed by [`EntityRef::satisfies`]
@@ -585,16 +614,17 @@ impl World {
         let source_arch = &mut self.archetypes.archetypes[loc.archetype as usize];
         unsafe {
             // Drop the components we're overwriting
-            for &ty in &target.replaced {
-                let ptr = source_arch.get_dynamic(&ty, loc.index).unwrap();
-                ptr.drop(&ty);
+            for ty in &target.replaced {
+                let mut ptr = source_arch.get_dynamic(ty, loc.index).unwrap();
+                ptr.drop_value_and_tombstone(&ty);
             }
 
             if target.index == loc.archetype {
                 // Update components in the current archetype
                 let arch = &mut self.archetypes.archetypes[loc.archetype as usize];
                 components.put(|ptr, ty| {
-                    arch.put_new_dynamic(ptr, &ty, loc.index);
+                    // SAFETY: we have &mut self
+                    arch.put_new_dynamic_nonsync(ptr, &ty, loc.index);
                 });
                 return;
             }
@@ -606,30 +636,23 @@ impl World {
             );
 
             // Allocate storage in the archetype and update the entity's location to address it
-            let target_index = target_arch.allocate(entity.id);
+            // SAFETY: we have &mut self
+            let target_index = unsafe { target_arch.allocate_nonsync(entity.id, self.world_slot) };
             let meta = &mut self.entities.meta[entity.id as usize];
             meta.location.archetype = target.index;
             meta.location.index = target_index;
 
             // Move the new components
             components.put(|ptr, ty| {
-                target_arch.put_new_dynamic(ptr, &ty, target_index);
+                // SAFETY: we have &mut self
+                target_arch.put_new_dynamic_nonsync(ptr, &ty, target_index);
             });
 
             // Move the components we're keeping
-            for &ty in &target.retained {
-                let src = source_arch.get_dynamic(&ty, loc.index).unwrap();
-                target_arch.put_dynamic(
-                    src.header_ptr().as_ptr(),
-                    src.value_ptr().as_ptr(),
-                    &ty,
-                    target_index,
-                )
-            }
-
-            // Free storage in the old archetype
-            if let Some(moved) = source_arch.remove(loc.index, false) {
-                self.entities.meta[moved as usize].location.index = loc.index;
+            for ty in &target.retained {
+                let src = source_arch.get_dynamic(ty, loc.index).unwrap();
+                // SAFETY: we have &mut self
+                target_arch.move_from_nonsync(src, ty, target_index);
             }
         }
     }
@@ -675,9 +698,12 @@ impl World {
         // Move out of the source archetype, or bail out if a component is missing
         let bundle = unsafe {
             T::get(|ty| {
-                source_arch
-                    .get_dynamic(&ty, old_index)
-                    .map(|p| p.value_ptr())
+                // SAFETY: We have &mut self
+                let gc_ptr = source_arch.get_dynamic(&ty, old_index);
+                if let Some(mut gc_ptr) = gc_ptr {
+                    gc_ptr.mark_tombstone();
+                }
+                gc_ptr.map(|p| p.value_ptr())
             })?
         };
 
@@ -693,21 +719,15 @@ impl World {
                 loc.archetype as usize,
                 target as usize,
             );
-            let target_index = unsafe { target_arch.allocate(entity.id) };
+            // SAFETY: We have &mut self
+            let target_index = unsafe { target_arch.allocate_nonsync(entity.id, self.world_slot) };
             loc.archetype = target;
             loc.index = target_index;
             if let Some(moved) = unsafe {
                 source_arch.move_to(old_index, |src, ty| {
                     // Only move the components present in the target archetype, i.e. the non-removed ones.
-                    if let Some(dst) = target_arch.get_dynamic(ty, target_index) {
-                        dst.header_ptr()
-                            .as_ptr()
-                            .write(src.header_ptr().as_ptr().read());
-                        ptr::copy_nonoverlapping(
-                            src.value_ptr().as_ptr(),
-                            dst.value_ptr().as_ptr(),
-                            ty.value_layout().size(),
-                        );
+                    if let Some(mut dst) = target_arch.get_dynamic(ty, target_index) {
+                        dst.move_from(ty, src);
                     }
                 })
             } {
@@ -752,47 +772,47 @@ impl World {
     ///
     /// This has the same effect as calling [`remove::<S>`](Self::remove) and then [`insert::<T>`](Self::insert),
     /// but is more efficient as the intermediate archetype after removal but before insertion is skipped.
-    pub fn exchange<S: Bundle + 'static, T: DynamicBundle>(
-        &mut self,
-        entity: Entity,
-        components: T,
-    ) -> Result<S, ComponentError> {
-        self.flush();
+    // pub fn exchange<S: Bundle + 'static, T: DynamicBundle>(
+    //     &mut self,
+    //     entity: Entity,
+    //     components: T,
+    // ) -> Result<S, ComponentError> {
+    //     self.flush();
 
-        // Gather current metadata
-        let loc = self.entities.get(entity)?;
+    //     // Gather current metadata
+    //     let loc = self.entities.get(entity)?;
 
-        // Move out of the source archetype, or bail out if a component is missing
-        let source_arch = &self.archetypes.archetypes[loc.archetype as usize];
+    //     // Move out of the source archetype, or bail out if a component is missing
+    //     let source_arch = &self.archetypes.archetypes[loc.archetype as usize];
 
-        let bundle = unsafe {
-            S::get(|ty| {
-                source_arch
-                    .get_dynamic(&ty, loc.index)
-                    .map(|p| p.value_ptr())
-            })?
-        };
+    //     let bundle = unsafe {
+    //         S::get(|ty| {
+    //             source_arch
+    //                 .get_dynamic(&ty, loc.index)
+    //                 .map(|p| p.value_ptr())
+    //         })?
+    //     };
 
-        // Find the intermediate archetype ID
-        let intermediate =
-            Self::remove_target::<S>(&mut self.archetypes, &mut self.remove_edges, loc.archetype);
+    //     // Find the intermediate archetype ID
+    //     let intermediate =
+    //         Self::remove_target::<S>(&mut self.archetypes, &mut self.remove_edges, loc.archetype);
 
-        self.insert_inner(entity, components, intermediate, loc);
+    //     self.insert_inner(entity, components, intermediate, loc);
 
-        Ok(bundle)
-    }
+    //     Ok(bundle)
+    // }
 
-    /// Remove the `S` component from `entity` and then add `component`
-    ///
-    /// See [`exchange`](Self::exchange).
-    pub fn exchange_one<S: Component, T: Component>(
-        &mut self,
-        entity: Entity,
-        component: T,
-    ) -> Result<S, ComponentError> {
-        self.exchange::<(S,), (T,)>(entity, (component,))
-            .map(|(x,)| x)
-    }
+    // /// Remove the `S` component from `entity` and then add `component`
+    // ///
+    // /// See [`exchange`](Self::exchange).
+    // pub fn exchange_one<S: Component, T: Component>(
+    //     &mut self,
+    //     entity: Entity,
+    //     component: T,
+    // ) -> Result<S, ComponentError> {
+    //     self.exchange::<(S,), (T,)>(entity, (component,))
+    //         .map(|(x,)| x)
+    // }
 
     /// Borrow a single component of `entity` without safety checks
     ///
@@ -813,11 +833,12 @@ impl World {
         let state = archetype
             .get_state::<T::Component>()
             .ok_or_else(MissingComponent::new::<T::Component>)?;
-        Ok(T::from_raw_gc(
+        Ok(T::from_raw(
             archetype
-                .get_base::<T::Component>(state)
-                .as_ptr()
-                .add(loc.index as usize),
+                .get_data_storage(state)
+                .get_value(loc.index)
+                .cast()
+                .as_ptr(),
         ))
     }
 
@@ -827,8 +848,12 @@ impl World {
     /// variations of `spawn`, `despawn`, `insert`, and `remove`.
     pub fn flush(&mut self) {
         let arch = &mut self.archetypes.archetypes[0];
-        self.entities
-            .flush(|id, location| location.index = unsafe { arch.allocate(id) });
+        let world_slot = self.world_slot;
+
+        self.entities.flush(|id, location| {
+            //SAFETY: we have &mut self
+            location.index = unsafe { arch.allocate_nonsync(id, world_slot) }
+        });
     }
 
     /// Inspect the archetypes that entities are organized into
@@ -891,8 +916,8 @@ impl World {
     }
 }
 
-unsafe impl Send for World {}
-unsafe impl Sync for World {}
+// unsafe impl Send for World {}
+// unsafe impl Sync for World {}
 
 impl Default for World {
     fn default() -> Self {
@@ -982,8 +1007,8 @@ impl From<NoSuchEntity> for QueryOneError {
 ///
 /// This is just a convenient shorthand for `Send + Sync + 'static`, and never needs to be
 /// implemented manually.
-pub trait Component: Send + Sync + 'static {}
-impl<T: Send + Sync + 'static> Component for T {}
+pub trait Component: Reflect + Send + Sync + 'static {}
+impl<T: Reflect + Send + Sync + 'static> Component for T {}
 
 /// Iterator over all of a world's entities
 pub struct Iter<'a> {
@@ -1017,13 +1042,16 @@ impl<'a> Iterator for Iter<'a> {
                     self.index = 0;
                 }
                 Some(current) => {
-                    if self.index == current.len() {
+                    if self.index == current.len_sync() {
                         self.current = None;
                         continue;
                     }
                     let index = self.index;
                     self.index += 1;
                     let id = current.entity_id(index);
+                    if id == u32::MAX {
+                        continue;
+                    }
                     return Some(unsafe {
                         EntityRef::new(
                             current,
@@ -1037,17 +1065,6 @@ impl<'a> Iterator for Iter<'a> {
                 }
             }
         }
-    }
-
-    fn size_hint(&self) -> (usize, Option<usize>) {
-        (self.len(), Some(self.len()))
-    }
-}
-
-impl ExactSizeIterator for Iter<'_> {
-    #[inline]
-    fn len(&self) -> usize {
-        self.entities.len() as usize
     }
 }
 
@@ -1084,6 +1101,7 @@ where
     entities: &'a mut Entities,
     archetype_id: u32,
     archetype: &'a mut Archetype,
+    world_slot: &'a NonZeroU32,
 }
 
 impl<I> Drop for SpawnBatchIter<'_, I>
@@ -1106,10 +1124,14 @@ where
     fn next(&mut self) -> Option<Entity> {
         let components = self.inner.next()?;
         let entity = self.entities.alloc();
-        let index = unsafe { self.archetype.allocate(entity.id) };
+        // SAFETY: we have &mut Archetype
+        let index = unsafe { self.archetype.allocate_nonsync(entity.id, *self.world_slot) };
         unsafe {
             components.put(|ptr, ty| {
-                self.archetype.put_new_dynamic(ptr, &ty, index);
+                // SAFETY: we have &mut Archetype
+                unsafe {
+                    self.archetype.put_new_dynamic_nonsync(ptr, &ty, index);
+                }
             });
         }
         self.entities.meta[entity.id as usize].location = Location {
@@ -1214,9 +1236,11 @@ impl ArchetypeSet {
             Entry::Occupied(x) => {
                 // Duplicate of existing archetype
                 let existing = &mut self.archetypes[*x.get() as usize];
-                let base = existing.len();
+                // SAFETY: we have &mut self
+                let base = unsafe { existing.len_nonsync() };
                 unsafe {
-                    existing.merge(archetype);
+                    todo!();
+                    // existing.merge(archetype, self.world_slot);
                 }
                 (*x.get(), base)
             }
@@ -1248,7 +1272,7 @@ impl ArchetypeSet {
         for ty in components.type_info() {
             while src_ty < arch.types().len() && arch.types()[src_ty] <= ty {
                 if arch.types()[src_ty] != ty {
-                    retained.push(arch.types()[src_ty]);
+                    retained.push(arch.types()[src_ty].clone());
                 }
                 src_ty += 1;
             }
@@ -1307,6 +1331,8 @@ impl Hasher for IndexTypeIdHasher {
 
 #[cfg(test)]
 mod tests {
+    use alloc::string::ToString;
+
     use super::*;
 
     #[test]
@@ -1360,7 +1386,7 @@ mod tests {
     #[test]
     fn remove_nothing() {
         let mut world = World::new();
-        let a = world.spawn(("abc", 123));
+        let a = world.spawn(("abc".to_string(), 123));
         world.remove::<()>(a).unwrap();
     }
 

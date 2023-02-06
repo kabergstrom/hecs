@@ -6,11 +6,12 @@
 // copied, modified, or distributed except according to those terms.
 
 use bencher::{benchmark_group, benchmark_main, Bencher};
+use bevy_reflect::Reflect;
 use hecs::*;
 
-#[derive(Clone)]
+#[derive(Clone, Reflect)]
 struct Position(f32);
-#[derive(Clone)]
+#[derive(Clone, Reflect)]
 struct Velocity(f32);
 
 fn spawn_tuple(b: &mut Bencher) {
@@ -100,18 +101,18 @@ fn insert_remove(b: &mut Bencher) {
     });
 }
 
-fn exchange(b: &mut Bencher) {
-    let mut world = World::new();
-    let entities = world
-        .spawn_batch((0..1_000).map(|_| (Position(0.0), Velocity(0.0))))
-        .collect::<Vec<_>>();
-    let mut entities = entities.iter().cycle();
-    b.iter(|| {
-        let e = *entities.next().unwrap();
-        world.exchange_one::<Velocity, _>(e, true).unwrap();
-        world.exchange_one::<bool, _>(e, Velocity(0.0)).unwrap();
-    });
-}
+// fn exchange(b: &mut Bencher) {
+//     let mut world = World::new();
+//     let entities = world
+//         .spawn_batch((0..1_000).map(|_| (Position(0.0), Velocity(0.0))))
+//         .collect::<Vec<_>>();
+//     let mut entities = entities.iter().cycle();
+//     b.iter(|| {
+//         let e = *entities.next().unwrap();
+//         world.exchange_one::<Velocity, _>(e, true).unwrap();
+//         world.exchange_one::<bool, _>(e, Velocity(0.0)).unwrap();
+//     });
+// }
 
 fn iterate_100k(b: &mut Bencher) {
     let mut world = World::new();
@@ -267,7 +268,7 @@ benchmark_group!(
     remove,
     insert,
     insert_remove,
-    exchange,
+    // exchange,
     iterate_100k,
     iterate_mut_100k,
     iterate_uncached_100_by_50,

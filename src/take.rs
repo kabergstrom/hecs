@@ -44,19 +44,26 @@ unsafe impl<'a> DynamicBundle for TakenEntity<'a> {
     unsafe fn put(mut self, mut f: impl FnMut(*mut u8, TypeInfo)) {
         // Suppress dropping of moved components
         self.drop = false;
-        for &ty in self.archetype.types() {
-            let ptr = self.archetype.get_dynamic(&ty, self.index).unwrap();
-            f(ptr.value_ptr().as_ptr(), ty);
-            drop_in_place(ptr.header_ptr().as_ptr());
+        self.entities.free(self.entity).unwrap();
+        for ty in self.archetype.types() {
+            let mut ptr = self.archetype.get_dynamic(ty, self.index).unwrap();
+            ptr.move_value_and_tombstone(ty, &mut f);
         }
+        self.archetype.set_entity_id(self.index as usize, u32::MAX);
     }
 }
 
 impl Drop for TakenEntity<'_> {
     fn drop(&mut self) {
-        if let Some(moved) = unsafe { self.archetype.remove(self.index, self.drop) } {
-            self.entities.meta[moved as usize].location.index = self.index;
+        if self.drop {
+            self.entities.free(self.entity).unwrap();
+            for ty in self.archetype.types() {
+                unsafe {
+                    let mut ptr = self.archetype.get_dynamic(ty, self.index).unwrap();
+                    ptr.drop_value_and_tombstone(ty);
+                }
+            }
+            self.archetype.set_entity_id(self.index as usize, u32::MAX);
         }
-        self.entities.free(self.entity).unwrap();
     }
 }

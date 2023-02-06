@@ -8,18 +8,26 @@
 use crate::alloc::alloc::{alloc, dealloc, Layout};
 use crate::alloc::boxed::Box;
 use crate::alloc::{vec, vec::Vec};
-use crate::gc::{GCHeader, GCPtr, GC};
+use crate::gc::cells::U32Cell;
+use crate::gc::kvec::KVec;
+use crate::gc::{GCHeader, GCPtr, TraversalCommand, GC};
 use core::any::{type_name, TypeId};
-use core::fmt;
+use core::cell::{Cell, RefCell, UnsafeCell};
 use core::hash::{BuildHasher, BuildHasherDefault, Hasher};
+use core::num::{NonZeroU128, NonZeroU32};
 use core::ops::{Deref, DerefMut};
-use core::ptr::{self, NonNull};
+use core::ptr::{self, null, null_mut, NonNull};
+use core::sync::atomic::{AtomicU32, Ordering};
+use core::{arch, fmt};
+use std::thread::current;
 
+use alloc::alloc::alloc_zeroed;
+use bevy_reflect::{Reflect, ReflectFromPtr};
 use hashbrown::{hash_map::DefaultHashBuilder, HashMap};
 
 use crate::borrow::AtomicBorrow;
 use crate::query::Fetch;
-use crate::{Access, Component, ComponentRef, Query};
+use crate::{world, Access, Component, ComponentRef, Query};
 
 /// A collection of entities having the same component types
 ///
@@ -27,10 +35,11 @@ use crate::{Access, Component, ComponentRef, Query};
 /// [`World`](crate::World).
 pub struct Archetype {
     types: Vec<TypeInfo>,
+    pub(crate) gc_traversal: RefCell<Vec<Vec<TraversalCommand>>>,
     type_ids: Box<[TypeId]>,
     index: OrderedTypeIdMap<usize>,
-    len: u32,
-    entities: Box<[u32]>,
+    len: U32Cell,
+    entities: KVec<U32Cell>,
     /// One allocation per type, in the same order as `types`
     data: Box<[Data]>,
 }
@@ -55,37 +64,70 @@ impl Archetype {
     }
 
     pub(crate) fn new(types: Vec<TypeInfo>) -> Self {
-        let max_align = types.first().map_or(1, |ty| ty.gc_layout.align());
         Self::assert_type_info(&types);
-        let component_count = types.len();
         Self {
             index: OrderedTypeIdMap::new(types.iter().enumerate().map(|(i, ty)| (ty.id, i))),
             type_ids: types.iter().map(|ty| ty.id()).collect(),
-            types,
-            entities: Box::new([]),
-            len: 0,
-            data: (0..component_count)
-                .map(|_| Data {
-                    state: AtomicBorrow::new(),
-                    storage: NonNull::new(max_align as *mut u8).unwrap(),
+            gc_traversal: RefCell::new(Vec::new()),
+            entities: KVec::new(),
+            len: U32Cell::new(0),
+            data: types
+                .iter()
+                .map(|ty| {
+                    let header_layout = Layout::new::<StorageHeader>();
+                    let len = header_layout.size();
+                    // calculate padding needed to align the type.
+                    // code taken from Layout::padding_needed_for
+                    let len_rounded_up = len.wrapping_add(ty.gc_layout.align()).wrapping_sub(1)
+                        & !ty.gc_layout.align().wrapping_sub(1);
+                    let padding_to_align = len_rounded_up.wrapping_sub(len);
+                    let header_layout = Layout::from_size_align(
+                        header_layout.size() + padding_to_align,
+                        DATA_CHUNK_SIZE_BYTES,
+                    )
+                    .unwrap();
+                    Data {
+                        state: AtomicBorrow::new(),
+                        stride: ty.gc_layout().size(),
+                        value_start: ty.data_start(),
+                        storage: KVec::new(),
+                        header_layout,
+                        data_start: header_layout.size(),
+                        storage_layout: Layout::from_size_align(
+                            DATA_CHUNK_SIZE_BYTES,
+                            DATA_CHUNK_SIZE_BYTES,
+                        )
+                        .unwrap(),
+                    }
                 })
                 .collect(),
+            types,
         }
     }
 
     pub(crate) fn clear(&mut self) {
+        // clear component values, mark tombstones and
         for (ty, data) in self.types.iter().zip(&*self.data) {
-            for index in 0..self.len {
+            // SAFETY: we have &mut self
+            for index in 0..unsafe { self.len.read_nonsync() } {
                 unsafe {
-                    let removed = data
-                        .storage
-                        .as_ptr()
-                        .add(index as usize * ty.gc_layout.size());
-                    GCPtr::from_base(ty, NonNull::new_unchecked(removed)).drop(ty);
+                    let mut removed = data.get_gc_ptr(index);
+                    if matches!(
+                        removed.header_ptr().as_ref().state,
+                        crate::gc::State::Alive { .. }
+                    ) {
+                        debug_assert!(
+                            removed.header_ptr().as_ref().state
+                                == crate::gc::State::Alive {
+                                    borrow: core::cell::Cell::new(0)
+                                }
+                        );
+                        removed.drop_value_and_tombstone(ty);
+                    }
                 }
             }
         }
-        self.len = 0;
+        self.entities.fill(u32::MAX.into());
     }
 
     /// Whether this archetype contains `T` components
@@ -103,29 +145,14 @@ impl Archetype {
         self.index.get(&TypeId::of::<T>()).copied()
     }
 
-    /// Get the address of the first `T` component using an index from `get_state::<T>`
-    pub(crate) fn get_base<T: Component>(&self, state: usize) -> NonNull<GC<T>> {
-        assert_eq!(self.types[state].id, TypeId::of::<T>());
-
-        unsafe {
-            NonNull::new_unchecked(
-                self.data
-                    .get_unchecked(state)
-                    .storage
-                    .as_ptr()
-                    .cast::<GC<T>>() as *mut GC<T>,
-            )
-        }
-    }
-
-    /// Borrow all components of a single type from these entities, if present
-    ///
-    /// `T` must be a shared or unique reference to a component type.
-    ///
-    /// Useful for efficient serialization.
-    pub fn get<'a, T: ComponentRef<'a>>(&'a self) -> Option<T::Column> {
-        T::get_column(self)
-    }
+    // /// Borrow all components of a single type from these entities, if present
+    // ///
+    // /// `T` must be a shared or unique reference to a component type.
+    // ///
+    // /// Useful for efficient serialization.
+    // pub fn get<'a, T: ComponentRef<'a>>(&'a self) -> Option<T::Column> {
+    //     T::get_column(self)
+    // }
 
     pub(crate) fn borrow<T: Component>(&self, state: usize) {
         assert_eq!(self.types[state].id, TypeId::of::<T>());
@@ -155,28 +182,37 @@ impl Archetype {
 
     /// Number of entities in this archetype
     #[inline]
-    pub fn len(&self) -> u32 {
-        self.len
+    pub unsafe fn len_nonsync(&self) -> u32 {
+        unsafe { self.len.read_nonsync() }
+    }
+
+    pub fn len_sync(&self) -> u32 {
+        self.len.load_atomic(Ordering::Relaxed)
     }
 
     /// Whether this archetype contains no entities
     #[inline]
-    pub fn is_empty(&self) -> bool {
-        self.len == 0
+    pub unsafe fn is_empty_nonsync(&self) -> bool {
+        self.len_nonsync() == 0
+    }
+
+    #[inline]
+    pub fn is_empty_sync(&self) -> bool {
+        self.len_sync() == 0
     }
 
     #[inline]
     pub(crate) fn entities(&self) -> NonNull<u32> {
-        unsafe { NonNull::new_unchecked(self.entities.as_ptr() as *mut _) }
+        unsafe { NonNull::new_unchecked(self.entities.as_ptr() as *mut u32) }
     }
 
     pub(crate) fn entity_id(&self, index: u32) -> u32 {
-        self.entities[index as usize]
+        (&self.entities[index as usize]).into()
     }
 
     #[inline]
     pub(crate) fn set_entity_id(&mut self, index: usize, id: u32) {
-        self.entities[index] = id;
+        self.entities[index].set(id);
     }
 
     pub(crate) fn types(&self) -> &[TypeInfo] {
@@ -206,39 +242,47 @@ impl Archetype {
     }
 
     /// `index` must be in-bounds or just past the end
-    pub(crate) unsafe fn get_dynamic(&self, ty: &TypeInfo, index: u32) -> Option<GCPtr> {
-        debug_assert!(index <= self.len);
-        let base = NonNull::new_unchecked(
-            self.data
-                .get_unchecked(*self.index.get(&ty.id())?)
-                .storage
-                .as_ptr()
-                .add(ty.gc_layout().size() * index as usize),
-        );
+    pub(crate) unsafe fn get_data_storage(&self, state: usize) -> &Data {
+        debug_assert!(state < self.types.len());
+        self.data.get_unchecked(state)
+    }
+    pub(crate) unsafe fn get_data_storage_mut(&mut self, state: usize) -> NonNull<Data> {
+        debug_assert!(state < self.types.len());
+        NonNull::new_unchecked(self.data.as_mut_ptr().add(state))
+    }
 
-        Some(GCPtr::from_base(ty, base))
+    pub(crate) unsafe fn get_dynamic(&self, ty: &TypeInfo, index: u32) -> Option<GCPtr> {
+        debug_assert!(index < self.len_nonsync());
+        debug_assert!(self.entities[index as usize].load_atomic(Ordering::Acquire) != u32::MAX);
+        let ptr = self
+            .data
+            .get_unchecked(*self.index.get(&ty.id())?)
+            .get_gc_ptr(index);
+
+        Some(ptr)
     }
 
     /// Every type must be written immediately after this call
-    pub(crate) unsafe fn allocate(&mut self, id: u32) -> u32 {
-        if self.len as usize == self.entities.len() {
-            self.grow(64);
+    /// This cannot be called from multiple threads concurrently
+    pub(crate) unsafe fn allocate_nonsync(&self, id: u32, world_slot: NonZeroU32) -> u32 {
+        let new_slot = self.len.read_nonsync();
+        self.len.write_nonsync(new_slot + 1);
+        if new_slot as usize >= self.entities.len_nonsync() {
+            self.grow_nonsync(64, world_slot);
         }
-
-        self.entities[self.len as usize] = id;
-        self.len += 1;
-        self.len - 1
+        self.entities[new_slot as usize].write_nonsync(id);
+        new_slot
     }
 
-    pub(crate) unsafe fn set_len(&mut self, len: u32) {
-        debug_assert!(len <= self.capacity());
-        self.len = len;
-    }
+    // pub(crate) unsafe fn set_len(&mut self, len: u32) {
+    //     debug_assert!(len <= self.capacity());
+    //     self.len.store(len);
+    // }
 
-    pub(crate) fn reserve(&mut self, additional: u32) {
-        if additional > (self.capacity() - self.len()) {
-            let increment = additional - (self.capacity() - self.len());
-            self.grow(increment.max(64));
+    pub(crate) fn reserve(&mut self, additional: u32, world_slot: NonZeroU32) {
+        if additional > (self.capacity() - self.len.read()) {
+            let increment = additional - (self.capacity() - self.len.read());
+            self.grow(increment.max(64), world_slot);
         }
     }
 
@@ -247,90 +291,90 @@ impl Archetype {
     }
 
     /// Increase capacity by at least `min_increment`
-    fn grow(&mut self, min_increment: u32) {
+    fn grow_sync(&self, min_increment: u32, world_slot: NonZeroU32) {
         // Double capacity or increase it by `min_increment`, whichever is larger.
-        self.grow_exact(self.capacity().max(min_increment))
-    }
+        let additional = self.capacity().max(min_increment) as usize;
+        let new_cap = self.entities.len() + additional;
+        self.entities.extend_with_sync(additional, u32::MAX.into());
 
-    /// Increase capacity by exactly `increment`
-    fn grow_exact(&mut self, increment: u32) {
-        let old_count = self.len as usize;
-        let old_cap = self.entities.len();
-        let new_cap = self.entities.len() + increment as usize;
-        let mut new_entities = vec![!0; new_cap].into_boxed_slice();
-        new_entities[0..old_count].copy_from_slice(&self.entities[0..old_count]);
-        self.entities = new_entities;
-
-        let new_data = self
-            .types
-            .iter()
-            .zip(&*self.data)
-            .map(|(info, old)| {
-                let storage = if info.value_layout.size() == 0 {
-                    NonNull::new(info.value_layout.align() as *mut u8).unwrap()
-                } else {
+        for (info, data) in self.types.iter().zip(&*self.data) {
+            if info.value_layout.size() != 0 {
+                let entities_per_chunk =
+                    (DATA_CHUNK_SIZE_BYTES - data.data_start) / info.gc_layout.size();
+                let num_chunks_required = new_cap / entities_per_chunk + 1;
+                let new_chunks = num_chunks_required.saturating_sub(data.storage.len());
+                for _ in 0..new_chunks {
                     unsafe {
-                        let mem = alloc(
-                            Layout::from_size_align(
-                                info.gc_layout.size() * new_cap,
-                                info.gc_layout.align(),
-                            )
-                            .unwrap(),
-                        );
-                        ptr::copy_nonoverlapping(
-                            old.storage.as_ptr(),
-                            mem,
-                            info.gc_layout.size() * old_count,
-                        );
-                        if old_cap > 0 {
-                            dealloc(
-                                old.storage.as_ptr(),
-                                Layout::from_size_align(
-                                    info.gc_layout.size() * old_cap,
-                                    info.gc_layout.align(),
-                                )
-                                .unwrap(),
-                            );
-                        }
-                        NonNull::new(mem).unwrap()
+                        let mem = alloc_zeroed(data.storage_layout);
+                        assert!(!mem.is_null(), "allocation failed");
+                        mem.cast::<StorageHeader>()
+                            .write(StorageHeader { world_slot });
+                        data.storage.push_sync(mem);
                     }
-                };
-                Data {
-                    state: AtomicBorrow::new(), // &mut self guarantees no outstanding borrows
-                    storage,
                 }
-            })
-            .collect::<Box<[_]>>();
-
-        self.data = new_data;
+            }
+        }
     }
 
-    /// Returns the ID of the entity moved into `index`, if any
-    pub(crate) unsafe fn remove(&mut self, index: u32, drop: bool) -> Option<u32> {
-        let last = self.len - 1;
+    /// Increase capacity by at least `min_increment`
+    unsafe fn grow_nonsync(&self, min_increment: u32, world_slot: NonZeroU32) {
+        // Double capacity or increase it by `min_increment`, whichever is larger.
+        let additional = self.capacity().max(min_increment) as usize;
+        let new_cap = self.entities.len() + additional;
+        self.entities
+            .extend_with_nonsync(additional, u32::MAX.into());
+
+        for (info, data) in self.types.iter().zip(&*self.data) {
+            if info.value_layout.size() != 0 {
+                let entities_per_chunk =
+                    (DATA_CHUNK_SIZE_BYTES - data.data_start) / info.gc_layout.size();
+                let num_chunks_required = new_cap / entities_per_chunk + 1;
+                let new_chunks = num_chunks_required.saturating_sub(data.storage.len());
+                for _ in 0..new_chunks {
+                    unsafe {
+                        let mem = alloc_zeroed(data.storage_layout);
+                        assert!(!mem.is_null(), "allocation failed");
+                        mem.cast::<StorageHeader>()
+                            .write(StorageHeader { world_slot });
+                        data.storage.push_nonsync(mem);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Increase capacity by at least `min_increment`
+    fn grow(&mut self, min_increment: u32, world_slot: NonZeroU32) {
+        // Double capacity or increase it by `min_increment`, whichever is larger.
+        let additional = self.capacity().max(min_increment) as usize;
+        let new_cap = self.entities.len() + additional;
+        self.entities.extend_with(additional, u32::MAX.into());
+
+        for (info, data) in self.types.iter().zip(self.data.iter_mut()) {
+            if info.value_layout.size() != 0 {
+                let entities_per_chunk =
+                    (DATA_CHUNK_SIZE_BYTES - data.data_start) / info.gc_layout.size();
+                let num_chunks_required = new_cap / entities_per_chunk + 1;
+                let new_chunks = num_chunks_required.saturating_sub(data.storage.len());
+                for _ in 0..new_chunks {
+                    unsafe {
+                        let mem = alloc_zeroed(data.storage_layout);
+                        assert!(!mem.is_null(), "allocation failed");
+                        mem.cast::<StorageHeader>()
+                            .write(StorageHeader { world_slot });
+                        data.storage.push(mem);
+                    }
+                }
+            }
+        }
+    }
+
+    pub(crate) unsafe fn remove(&mut self, index: u32) {
         for (ty, data) in self.types.iter().zip(&*self.data) {
-            let removed = data
-                .storage
-                .as_ptr()
-                .add(index as usize * ty.gc_layout.size());
-            if drop {
-                GCPtr::from_base(ty, NonNull::new_unchecked(removed)).drop(ty);
-            }
-            if index != last {
-                let moved = data
-                    .storage
-                    .as_ptr()
-                    .add(last as usize * ty.gc_layout.size());
-                ptr::copy_nonoverlapping(moved, removed, ty.gc_layout.size());
-            }
+            let mut to_remove = data.get_gc_ptr(index);
+            to_remove.drop_value_and_tombstone(ty);
         }
-        self.len = last;
-        if index != last {
-            self.entities[index as usize] = self.entities[last as usize];
-            Some(self.entities[last as usize])
-        } else {
-            None
-        }
+        self.entities[index as usize].set(u32::MAX);
     }
 
     /// Returns the ID of the entity moved into `index`, if any
@@ -339,59 +383,27 @@ impl Archetype {
         index: u32,
         mut f: impl FnMut(GCPtr, &TypeInfo),
     ) -> Option<u32> {
-        let last = self.len - 1;
         for (ty, data) in self.types.iter().zip(&*self.data) {
-            let moved_out = data
-                .storage
-                .as_ptr()
-                .add(index as usize * ty.gc_layout.size());
-            f(GCPtr::from_base(ty, NonNull::new_unchecked(moved_out)), ty);
-            if index != last {
-                let moved = data
-                    .storage
-                    .as_ptr()
-                    .add(last as usize * ty.gc_layout.size());
-                ptr::copy_nonoverlapping(moved, moved_out, ty.gc_layout.size());
-            }
+            let gc_ptr = data.get_gc_ptr(index);
+            f(gc_ptr, ty);
+            self.entities[index as usize].set(u32::MAX);
         }
-        self.len -= 1;
-        if index != last {
-            self.entities[index as usize] = self.entities[last as usize];
-            Some(self.entities[last as usize])
-        } else {
-            None
-        }
+        None
     }
 
-    pub(crate) unsafe fn put_new_dynamic(
-        &mut self,
+    pub(crate) unsafe fn put_new_dynamic_nonsync(
+        &self,
         component_data: *mut u8,
         ty: &TypeInfo,
         index: u32,
     ) {
-        let ptr = self.get_dynamic(ty, index).unwrap();
-        ptr.header_ptr().as_ptr().write(GCHeader::new_alive());
-        ptr::copy_nonoverlapping(
-            component_data,
-            ptr.value_ptr().as_ptr(),
-            ty.value_layout().size(),
-        );
+        let mut ptr = self.get_dynamic(ty, index).unwrap();
+        ptr.move_from_value(ty, component_data);
     }
 
-    pub(crate) unsafe fn put_dynamic(
-        &mut self,
-        gc_header: *mut GCHeader,
-        component_data: *mut u8,
-        ty: &TypeInfo,
-        index: u32,
-    ) {
-        let ptr = self.get_dynamic(ty, index).unwrap();
-        ptr.header_ptr().as_ptr().write(gc_header.read());
-        ptr::copy_nonoverlapping(
-            component_data,
-            ptr.value_ptr().as_ptr(),
-            ty.value_layout().size(),
-        );
+    pub(crate) unsafe fn move_from_nonsync(&self, gc_ptr: GCPtr, ty: &TypeInfo, index: u32) {
+        let mut ptr = self.get_dynamic(ty, index).unwrap();
+        ptr.move_from(ty, gc_ptr);
     }
 
     /// How, if at all, `Q` will access entities in this archetype
@@ -404,30 +416,32 @@ impl Archetype {
     /// # Safety
     ///
     /// Component types must match exactly.
-    pub(crate) unsafe fn merge(&mut self, mut other: Archetype) {
-        self.reserve(other.len);
+    pub(crate) unsafe fn merge(&mut self, mut other: Archetype, world_slot: NonZeroU32) {
+        self.reserve(other.len.read(), world_slot);
         for ((info, dst), src) in self.types.iter().zip(&*self.data).zip(&*other.data) {
-            dst.storage
-                .as_ptr()
-                .add(self.len as usize * info.gc_layout.size())
-                .copy_from_nonoverlapping(
-                    src.storage.as_ptr(),
-                    other.len as usize * info.gc_layout.size(),
-                )
+            todo!();
+            // dst.storage
+            //     .as_ptr()
+            //     .add(self.len as usize * info.gc_layout.size())
+            //     .copy_from_nonoverlapping(
+            //         src.storage.as_ptr(),
+            //         other.len as usize * info.gc_layout.size(),
+            //     )
         }
-        self.len += other.len;
-        other.len = 0;
+        let len = self.len.read();
+        self.len.set(len + other.len.read());
+        other.len.set(0);
     }
 
-    /// Raw IDs of the entities in this archetype
-    ///
-    /// Convertible into [`Entity`](crate::Entity)s with
-    /// [`World::find_entity_from_id()`](crate::World::find_entity_from_id). Useful for efficient
-    /// serialization.
-    #[inline]
-    pub fn ids(&self) -> &[u32] {
-        &self.entities[0..self.len as usize]
-    }
+    // /// Raw IDs of the entities in this archetype
+    // ///
+    // /// Convertible into [`Entity`](crate::Entity)s with
+    // /// [`World::find_entity_from_id()`](crate::World::find_entity_from_id). Useful for efficient
+    // /// serialization.
+    // #[inline]
+    // pub unsafe fn ids(&self) -> &[u32] {
+    //     &self.entities[0..self.len() as usize]
+    // }
 }
 
 impl Drop for Archetype {
@@ -437,24 +451,98 @@ impl Drop for Archetype {
             return;
         }
         for (info, data) in self.types.iter().zip(&*self.data) {
-            if info.value_layout.size() != 0 {
+            let mut needs_leak = false;
+            for index in 0..self.len.read() {
                 unsafe {
-                    dealloc(
-                        data.storage.as_ptr(),
-                        Layout::from_size_align_unchecked(
-                            info.gc_layout.size() * self.entities.len(),
-                            info.gc_layout.align(),
-                        ),
-                    );
+                    let ptr = data.get_gc_ptr(index);
+                    if ptr.header_ptr().as_ref().state != crate::gc::State::Free {
+                        if !std::thread::panicking() {
+                            std::eprintln!(
+                                "Archetype storage dropped without freeing dead values: {:?} at id {} was state {:?}",
+                                info, index, ptr.header_ptr().as_ref().state
+                            );
+                        }
+                    }
+                    needs_leak |= ptr.header_ptr().as_ref().state != crate::gc::State::Free;
+                }
+            }
+            if info.value_layout.size() != 0 && !needs_leak {
+                for chunk in unsafe { data.chunks() } {
+                    assert!(!chunk.is_null());
+                    unsafe {
+                        dealloc(
+                            *chunk,
+                            Layout::from_size_align_unchecked(
+                                DATA_CHUNK_SIZE_BYTES,
+                                DATA_CHUNK_SIZE_BYTES,
+                            ),
+                        );
+                    }
                 }
             }
         }
+        self.data = Box::default();
     }
 }
 
-struct Data {
+pub(crate) const DATA_CHUNK_SIZE_BYTES: usize = 0x10000;
+pub(crate) struct StorageHeader {
+    pub(crate) world_slot: NonZeroU32,
+}
+pub(crate) struct Data {
+    storage: KVec<*mut u8>,
+    storage_layout: Layout,
+    header_layout: Layout,
     state: AtomicBorrow,
-    storage: NonNull<u8>,
+    stride: usize,
+    value_start: usize,
+    data_start: usize,
+}
+
+impl Data {
+    pub(crate) unsafe fn chunks(&self) -> &[*mut u8] {
+        &self.storage
+    }
+    pub(crate) fn stride(&self) -> usize {
+        self.stride
+    }
+    pub(crate) fn entities_per_chunk(&self) -> usize {
+        (DATA_CHUNK_SIZE_BYTES - self.data_start) / self.stride
+    }
+    pub(crate) fn value_start(&self) -> usize {
+        self.value_start
+    }
+    pub(crate) fn data_start(&self) -> usize {
+        self.data_start
+    }
+
+    pub(crate) fn get_gc_ptr(&self, idx: u32) -> GCPtr {
+        let idx = idx as usize;
+        let entities_per_chunk = (DATA_CHUNK_SIZE_BYTES - self.data_start) / self.stride;
+        let chunk_idx = idx / entities_per_chunk;
+        let value_idx = idx % entities_per_chunk;
+        unsafe {
+            GCPtr::from_base_with_offset(
+                self.value_start,
+                NonNull::new_unchecked(
+                    self.storage[chunk_idx].add(self.data_start + value_idx * self.stride),
+                ),
+            )
+        }
+    }
+
+    pub(crate) fn get_value(&self, idx: u32) -> NonNull<u8> {
+        let idx = idx as usize;
+        let entities_per_chunk = (DATA_CHUNK_SIZE_BYTES - self.data_start) / self.stride;
+        let chunk_idx = idx / entities_per_chunk;
+        let value_idx = idx % entities_per_chunk;
+        unsafe {
+            NonNull::new_unchecked(
+                self.storage[chunk_idx]
+                    .add(self.data_start + value_idx * self.stride + self.value_start),
+            )
+        }
+    }
 }
 
 /// A hasher optimized for hashing a single TypeId.
@@ -528,12 +616,13 @@ impl<V> OrderedTypeIdMap<V> {
 /// All told, this means a [`TypeId`], to be able to dynamically name/check the component type; a
 /// [`Layout`], so that we know how to allocate memory for this component type; and a drop function
 /// which internally calls [`core::ptr::drop_in_place`] with the correct type parameter.
-#[derive(Debug, Copy, Clone)]
+#[derive(Debug, Clone)]
 pub struct TypeInfo {
     id: TypeId,
     value_layout: Layout,
     gc_layout: Layout,
     drop: unsafe fn(*mut u8),
+    reflect_from_ptr: unsafe fn(*mut u8) -> *mut dyn Reflect,
     data_start: usize,
     #[cfg(debug_assertions)]
     type_name: &'static str,
@@ -541,7 +630,7 @@ pub struct TypeInfo {
 
 impl TypeInfo {
     /// Construct a `TypeInfo` directly from the static type.
-    pub fn of<T: 'static>() -> Self {
+    pub fn of<T: Reflect + 'static>() -> Self {
         unsafe fn drop_ptr<T>(x: *mut u8) {
             x.cast::<T>().drop_in_place()
         }
@@ -557,6 +646,7 @@ impl TypeInfo {
             value_layout: type_layout,
             data_start,
             drop: drop_ptr::<T>,
+            reflect_from_ptr: |ptr| unsafe { &mut *ptr.cast::<T>() as &mut dyn Reflect },
             #[cfg(debug_assertions)]
             type_name: core::any::type_name::<T>(),
         }
@@ -566,7 +656,12 @@ impl TypeInfo {
     /// some kind of pointer to raw bytes/erased memory holding a component type, coming from a
     /// source unrelated to hecs, and you want to treat it as an insertable component by
     /// implementing the `DynamicBundle` API.
-    pub fn from_parts(id: TypeId, layout: Layout, drop: unsafe fn(*mut u8)) -> Self {
+    pub fn from_parts(
+        id: TypeId,
+        layout: Layout,
+        drop: unsafe fn(*mut u8),
+        reflect_from_ptr: unsafe fn(*mut u8) -> *mut dyn Reflect,
+    ) -> Self {
         let (gc_layout, data_start) = Layout::new::<GCHeader>().extend(layout).unwrap();
         let gc_layout = gc_layout.pad_to_align();
 
@@ -575,6 +670,7 @@ impl TypeInfo {
             gc_layout,
             value_layout: layout,
             data_start,
+            reflect_from_ptr,
             drop,
             #[cfg(debug_assertions)]
             type_name: "<unknown> (TypeInfo constructed from parts)",
@@ -611,6 +707,10 @@ impl TypeInfo {
         (self.drop)(data);
     }
 
+    pub fn reflect_from_ptr(&self) -> unsafe fn(*mut u8) -> *mut dyn Reflect {
+        self.reflect_from_ptr
+    }
+
     /// Get the function pointer encoding the destructor for the component type this `TypeInfo`
     /// represents.
     pub fn drop_shim(&self) -> unsafe fn(*mut u8) {
@@ -643,92 +743,92 @@ impl PartialEq for TypeInfo {
 
 impl Eq for TypeInfo {}
 
-/// Shared reference to a single column of component data in an [`Archetype`]
-pub struct ArchetypeColumn<'a, T: Component> {
-    archetype: &'a Archetype,
-    column: &'a [GC<T>],
-}
+// / Shared reference to a single column of component data in an [`Archetype`]
+// pub struct ArchetypeColumn<'a, T: Component> {
+//     archetype: &'a Archetype,
+//     column: &'a [GC<T>],
+// }
 
-impl<'a, T: Component> ArchetypeColumn<'a, T> {
-    pub(crate) fn new(archetype: &'a Archetype) -> Option<Self> {
-        let state = archetype.get_state::<T>()?;
-        let ptr = archetype.get_base::<T>(state);
-        let column = unsafe { core::slice::from_raw_parts(ptr.as_ptr(), archetype.len() as usize) };
-        archetype.borrow::<T>(state);
-        Some(Self { archetype, column })
-    }
-}
+// impl<'a, T: Component> ArchetypeColumn<'a, T> {
+//     pub(crate) fn new(archetype: &'a Archetype) -> Option<Self> {
+//         let state = archetype.get_state::<T>()?;
+//         let ptr = archetype.get_base::<T>(state);
+//         let column = unsafe { core::slice::from_raw_parts(ptr.as_ptr(), archetype.len() as usize) };
+//         archetype.borrow::<T>(state);
+//         Some(Self { archetype, column })
+//     }
+// }
 
-impl<T: Component> Deref for ArchetypeColumn<'_, T> {
-    type Target = [GC<T>];
-    fn deref(&self) -> &[GC<T>] {
-        self.column
-    }
-}
+// impl<T: Component> Deref for ArchetypeColumn<'_, T> {
+//     type Target = [GC<T>];
+//     fn deref(&self) -> &[GC<T>] {
+//         self.column
+//     }
+// }
 
-impl<T: Component> Drop for ArchetypeColumn<'_, T> {
-    fn drop(&mut self) {
-        let state = self.archetype.get_state::<T>().unwrap();
-        self.archetype.release::<T>(state);
-    }
-}
+// impl<T: Component> Drop for ArchetypeColumn<'_, T> {
+//     fn drop(&mut self) {
+//         let state = self.archetype.get_state::<T>().unwrap();
+//         self.archetype.release::<T>(state);
+//     }
+// }
 
-impl<T: Component> Clone for ArchetypeColumn<'_, T> {
-    fn clone(&self) -> Self {
-        let state = self.archetype.get_state::<T>().unwrap();
-        self.archetype.borrow::<T>(state);
-        Self {
-            archetype: self.archetype,
-            column: self.column,
-        }
-    }
-}
+// impl<T: Component> Clone for ArchetypeColumn<'_, T> {
+//     fn clone(&self) -> Self {
+//         let state = self.archetype.get_state::<T>().unwrap();
+//         self.archetype.borrow::<T>(state);
+//         Self {
+//             archetype: self.archetype,
+//             column: self.column,
+//         }
+//     }
+// }
 
-impl<T: Component + fmt::Debug> fmt::Debug for ArchetypeColumn<'_, T> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        self.column.fmt(f)
-    }
-}
+// impl<T: Component + fmt::Debug> fmt::Debug for ArchetypeColumn<'_, T> {
+//     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+//         self.column.fmt(f)
+//     }
+// }
 
-/// Unique reference to a single column of component data in an [`Archetype`]
-pub struct ArchetypeColumnMut<'a, T: Component> {
-    archetype: &'a Archetype,
-    column: &'a mut [GC<T>],
-}
+// /// Unique reference to a single column of component data in an [`Archetype`]
+// pub struct ArchetypeColumnMut<'a, T: Component> {
+//     archetype: &'a Archetype,
+//     column: &'a mut [GC<T>],
+// }
 
-impl<'a, T: Component> ArchetypeColumnMut<'a, T> {
-    pub(crate) fn new(archetype: &'a Archetype) -> Option<Self> {
-        let state = archetype.get_state::<T>()?;
-        let ptr = archetype.get_base::<T>(state);
-        let column =
-            unsafe { core::slice::from_raw_parts_mut(ptr.as_ptr(), archetype.len() as usize) };
-        archetype.borrow_mut::<T>(state);
-        Some(Self { archetype, column })
-    }
-}
+// impl<'a, T: Component> ArchetypeColumnMut<'a, T> {
+//     pub(crate) fn new(archetype: &'a Archetype) -> Option<Self> {
+//         let state = archetype.get_state::<T>()?;
+//         let ptr = archetype.get_base::<T>(state);
+//         let column =
+//             unsafe { core::slice::from_raw_parts_mut(ptr.as_ptr(), archetype.len() as usize) };
+//         archetype.borrow_mut::<T>(state);
+//         Some(Self { archetype, column })
+//     }
+// }
 
-impl<T: Component> Deref for ArchetypeColumnMut<'_, T> {
-    type Target = [GC<T>];
-    fn deref(&self) -> &[GC<T>] {
-        self.column
-    }
-}
+// impl<T: Component> Deref for ArchetypeColumnMut<'_, T> {
+//     type Target = [GC<T>];
+//     fn deref(&self) -> &[GC<T>] {
+//         self.column
+//     }
+// }
 
-impl<T: Component> DerefMut for ArchetypeColumnMut<'_, T> {
-    fn deref_mut(&mut self) -> &mut [GC<T>] {
-        self.column
-    }
-}
+// impl<T: Component> DerefMut for ArchetypeColumnMut<'_, T> {
+//     fn deref_mut(&mut self) -> &mut [GC<T>] {
+//         self.column
+//     }
+// }
 
-impl<T: Component> Drop for ArchetypeColumnMut<'_, T> {
-    fn drop(&mut self) {
-        let state = self.archetype.get_state::<T>().unwrap();
-        self.archetype.release_mut::<T>(state);
-    }
-}
+// impl<T: Component> Drop for ArchetypeColumnMut<'_, T> {
+//     fn drop(&mut self) {
+//         let state = self.archetype.get_state::<T>().unwrap();
+//         self.archetype.release_mut::<T>(state);
+//     }
+// }
 
-impl<T: Component + fmt::Debug> fmt::Debug for ArchetypeColumnMut<'_, T> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        self.column.fmt(f)
-    }
-}
+// impl<T: Component + fmt::Debug> fmt::Debug for ArchetypeColumnMut<'_, T> {
+//     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+//         self.column.fmt(f)
+//     }
+// }

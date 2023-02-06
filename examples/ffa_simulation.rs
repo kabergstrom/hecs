@@ -1,3 +1,4 @@
+use bevy_reflect::{Reflect, TypeRegistry};
 use hecs::*;
 use rand::{thread_rng, Rng};
 use std::io;
@@ -14,23 +15,28 @@ use std::io;
 State of the simulation is displayed in the sconsole through println! functions.
 */
 
-#[derive(Debug)]
+#[derive(Clone, Debug, Reflect)]
 struct Position {
     x: i32,
     y: i32,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Reflect)]
 struct Health(i32);
 
-#[derive(Debug)]
+#[derive(Debug, Reflect)]
 struct Speed(i32);
 
-#[derive(Debug)]
+#[derive(Debug, Reflect)]
 struct Damage(i32);
 
-#[derive(Debug)]
+#[derive(Debug, Reflect)]
 struct KillCount(i32);
+
+#[derive(Default, Debug, Reflect)]
+struct TargetTrack {
+    target: Option<CRef<Position>>,
+}
 
 fn manhattan_dist(x0: i32, x1: i32, y0: i32, y1: i32) -> i32 {
     let dx = (x0 - x1).abs();
@@ -50,8 +56,9 @@ fn batch_spawn_entities(world: &mut World, n: usize) {
         let hp = Health(rng.gen_range(30..50));
         let dmg = Damage(rng.gen_range(1..10));
         let kc = KillCount(0);
+        let tt = TargetTrack::default();
 
-        (pos, s, hp, dmg, kc)
+        (pos, s, hp, dmg, kc, tt)
     });
 
     world.spawn_batch(to_spawn);
@@ -71,9 +78,10 @@ fn system_integrate_motion(world: &mut World, query: &mut PreparedQuery<(&mut Po
 }
 
 // In this system entities find the closest entity and fire at them
-fn system_fire_at_closest(world: &mut World) {
-    for (id0, (pos0, dmg0, kc0)) in
-        &mut world.query::<With<(&Position, &Damage, &mut KillCount), &Health>>()
+fn system_fire_at_closest(mut world: &mut World) {
+    let mut ptr = None;
+    for (id0, (pos0, dmg0, kc0, tt0)) in
+        &mut world.query::<With<(&Position, &Damage, &mut KillCount, &mut TargetTrack), &Health>>()
     {
         // Find closest:
         // Nested queries are O(n^2) and you usually want to avoid that by using some sort of
@@ -93,6 +101,15 @@ fn system_fire_at_closest(world: &mut World) {
                 return;
             }
         };
+
+        let new_ref = world.new_cref::<Position>(closest).unwrap();
+        if let Some(ptr) = &tt0.target {
+            if !new_ref.ptr_eq(&ptr) {
+                println!("new closest");
+            }
+        }
+        ptr = Some(new_ref.clone());
+        tt0.target = Some(new_ref);
 
         // Deal damage:
         /*
@@ -118,6 +135,12 @@ fn system_fire_at_closest(world: &mut World) {
                 println!("Unit {:?} was killed by unit {:?}!", closest, id0);
             }
         }
+    }
+    if let Some(ptr) = ptr {
+        let gc_world = GCWorld::new(&mut world);
+
+        println!("new {:?}", &*ptr.read());
+        drop(gc_world);
     }
 }
 
@@ -171,4 +194,20 @@ fn main() {
             _ => {}
         }
     }
+    cleanup(world);
+}
+
+fn registry() -> TypeRegistry {
+    let mut registry = TypeRegistry::new();
+    registry.register::<Position>();
+    registry.register::<Health>();
+    registry.register::<Speed>();
+    registry.register::<Damage>();
+    registry.register::<KillCount>();
+    registry
+}
+
+fn cleanup(mut world: World) {
+    world.clear();
+    unsafe { hecs::gc_trace(&registry(), &mut world, &[]) };
 }

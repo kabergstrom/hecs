@@ -62,7 +62,7 @@ impl EntityBuilder {
 
     /// Construct a `Bundle` suitable for spawning
     pub fn build(&mut self) -> BuiltEntity<'_> {
-        self.inner.info.sort_unstable_by_key(|x| x.0);
+        self.inner.info.sort_unstable_by_key(|x| x.0.id());
         self.inner
             .ids
             .extend(self.inner.info.iter().map(|x| x.0.id()));
@@ -117,7 +117,7 @@ unsafe impl DynamicBundle for BuiltEntity<'_> {
 
     #[doc(hidden)]
     fn type_info(&self) -> Vec<TypeInfo> {
-        self.builder.info.iter().map(|x| x.0).collect()
+        self.builder.info.iter().map(|x| x.0.clone()).collect()
     }
 
     unsafe fn put(self, mut f: impl FnMut(*mut u8, TypeInfo)) {
@@ -242,7 +242,7 @@ unsafe impl DynamicBundle for &'_ BuiltEntityClone {
     }
 
     fn type_info(&self) -> Vec<TypeInfo> {
-        self.0.info.iter().map(|x| x.0).collect()
+        self.0.info.iter().map(|x| x.0.clone()).collect()
     }
 
     unsafe fn put(self, mut f: impl FnMut(*mut u8, TypeInfo)) {
@@ -264,7 +264,7 @@ unsafe impl DynamicBundleClone for &'_ BuiltEntityClone {
 
 impl From<EntityBuilderClone> for BuiltEntityClone {
     fn from(mut x: EntityBuilderClone) -> Self {
-        x.inner.info.sort_unstable_by_key(|y| y.0);
+        x.inner.info.sort_unstable_by_key(|y| y.0.id());
         x.inner.ids.extend(x.inner.info.iter().map(|y| y.0.id()));
         Self(x.inner)
     }
@@ -340,8 +340,8 @@ impl<M> Common<M> {
         match self.indices.entry(ty.id()) {
             Entry::Occupied(occupied) => {
                 let index = *occupied.get();
-                let (ty, offset, _) = self.info[index];
-                let storage = self.storage.as_ptr().add(offset);
+                let (ty, offset, _) = &self.info[index];
+                let storage = self.storage.as_ptr().add(*offset);
 
                 // Drop the existing value
                 ty.drop_value(storage);

@@ -4,10 +4,7 @@ use core::ptr::NonNull;
 
 use crate::archetype::Archetype;
 use crate::gc::GC;
-use crate::{
-    ArchetypeColumn, ArchetypeColumnMut, Component, Entity, Fetch, MissingComponent, Query,
-    QueryOne,
-};
+use crate::{Component, Entity, Fetch, MissingComponent, Query, QueryOne};
 
 /// Handle to an entity with any component types
 #[derive(Copy, Clone)]
@@ -42,6 +39,13 @@ impl<'a> EntityRef<'a> {
     /// Equivalent to [`satisfies::<&T>`](Self::satisfies)
     pub fn has<T: Component>(&self) -> bool {
         self.archetype.has::<T>()
+    }
+
+    pub(crate) fn archetype(&self) -> &Archetype {
+        &self.archetype
+    }
+    pub(crate) fn index(&self) -> u32 {
+        self.index
     }
 
     /// Borrow a single component, if it exists
@@ -114,7 +118,7 @@ pub struct Ref<'a, T: Component> {
     archetype: &'a Archetype,
     /// State index for `T` in `archetype`
     state: usize,
-    target: NonNull<GC<T>>,
+    target: NonNull<T>,
 }
 
 impl<'a, T: Component> Ref<'a, T> {
@@ -125,8 +129,7 @@ impl<'a, T: Component> Ref<'a, T> {
         let state = archetype
             .get_state::<T>()
             .ok_or_else(MissingComponent::new::<T>)?;
-        let target =
-            NonNull::new_unchecked(archetype.get_base::<T>(state).as_ptr().add(index as usize));
+        let target = archetype.get_data_storage(state).get_value(index).cast();
         archetype.borrow::<T>(state);
         Ok(Self {
             archetype,
@@ -148,7 +151,7 @@ impl<'a, T: Component> Drop for Ref<'a, T> {
 impl<'a, T: Component> Deref for Ref<'a, T> {
     type Target = T;
     fn deref(&self) -> &T {
-        unsafe { &self.target.as_ref().value }
+        unsafe { &self.target.as_ref() }
     }
 }
 
@@ -157,7 +160,7 @@ pub struct RefMut<'a, T: Component> {
     archetype: &'a Archetype,
     /// State index for `T` in `archetype`
     state: usize,
-    target: NonNull<GC<T>>,
+    target: NonNull<T>,
 }
 
 impl<'a, T: Component> RefMut<'a, T> {
@@ -168,8 +171,7 @@ impl<'a, T: Component> RefMut<'a, T> {
         let state = archetype
             .get_state::<T>()
             .ok_or_else(MissingComponent::new::<T>)?;
-        let target =
-            NonNull::new_unchecked(archetype.get_base::<T>(state).as_ptr().add(index as usize));
+        let target = archetype.get_data_storage(state).get_value(index).cast();
         archetype.borrow_mut::<T>(state);
         Ok(Self {
             archetype,
@@ -191,13 +193,13 @@ impl<'a, T: Component> Drop for RefMut<'a, T> {
 impl<'a, T: Component> Deref for RefMut<'a, T> {
     type Target = T;
     fn deref(&self) -> &T {
-        unsafe { &self.target.as_ref().value }
+        unsafe { &self.target.as_ref() }
     }
 }
 
 impl<'a, T: Component> DerefMut for RefMut<'a, T> {
     fn deref_mut(&mut self) -> &mut T {
-        unsafe { &mut self.target.as_mut().value }
+        unsafe { &mut *self.target.as_ptr() }
     }
 }
 
@@ -210,8 +212,8 @@ pub trait ComponentRef<'a> {
     type Ref;
 
     /// Smart pointer to a column of the referenced type in an [`Archetype`](crate::Archetype)
-    #[doc(hidden)]
-    type Column;
+    // #[doc(hidden)]
+    // type Column;
 
     /// Component type referenced by `Ref`
     #[doc(hidden)]
@@ -237,15 +239,15 @@ pub trait ComponentRef<'a> {
     #[doc(hidden)]
     unsafe fn from_raw_gc(raw: *mut GC<Self::Component>) -> Self;
 
-    /// Borrow a column from an archetype
-    #[doc(hidden)]
-    fn get_column(archetype: &'a Archetype) -> Option<Self::Column>;
+    // /// Borrow a column from an archetype
+    // #[doc(hidden)]
+    // fn get_column(archetype: &'a Archetype) -> Option<Self::Column>;
 }
 
 impl<'a, T: Component> ComponentRef<'a> for &'a T {
     type Ref = Ref<'a, T>;
 
-    type Column = ArchetypeColumn<'a, T>;
+    // type Column = ArchetypeColumn<'a, T>;
 
     type Component = T;
 
@@ -261,15 +263,15 @@ impl<'a, T: Component> ComponentRef<'a> for &'a T {
         &*raw
     }
 
-    fn get_column(archetype: &'a Archetype) -> Option<Self::Column> {
-        ArchetypeColumn::new(archetype)
-    }
+    // fn get_column(archetype: &'a Archetype) -> Option<Self::Column> {
+    //     ArchetypeColumn::new(archetype)
+    // }
 }
 
 impl<'a, T: Component> ComponentRef<'a> for &'a mut T {
     type Ref = RefMut<'a, T>;
 
-    type Column = ArchetypeColumnMut<'a, T>;
+    // type Column = ArchetypeColumnMut<'a, T>;
 
     type Component = T;
 
@@ -285,9 +287,9 @@ impl<'a, T: Component> ComponentRef<'a> for &'a mut T {
         &mut *raw
     }
 
-    fn get_column(archetype: &'a Archetype) -> Option<Self::Column> {
-        ArchetypeColumnMut::new(archetype)
-    }
+    // fn get_column(archetype: &'a Archetype) -> Option<Self::Column> {
+    //     ArchetypeColumnMut::new(archetype)
+    // }
 }
 
 /// `&T` where `T` is some component type

@@ -144,7 +144,7 @@ impl CommandBuffer {
     pub fn run_on(&mut self, world: &mut World) {
         let mut end = self.components.len();
         for entity in self.entities.iter().rev() {
-            self.components[entity.first_component..end].sort_unstable_by_key(|z| z.ty);
+            self.components[entity.first_component..end].sort_unstable_by_key(|z| z.ty.id());
             end = entity.first_component;
         }
 
@@ -243,7 +243,7 @@ unsafe impl DynamicBundle for RecordedEntity<'_> {
     fn type_info(&self) -> Vec<TypeInfo> {
         self.cmd.components[self.cmd.entities[self.index].first_component..]
             .iter()
-            .map(|x| x.ty)
+            .map(|x| x.ty.clone())
             .collect()
     }
 
@@ -281,6 +281,8 @@ struct RemovedComps {
 
 #[cfg(test)]
 mod tests {
+    use alloc::string::ToString;
+
     use super::*;
 
     #[test]
@@ -291,10 +293,10 @@ mod tests {
         let enta = world.reserve_entity();
         let entb = world.reserve_entity();
         let entc = world.reserve_entity();
-        buffer.insert(ent, (true, "a"));
-        buffer.insert(entc, (true, "a"));
+        buffer.insert(ent, (true, "a".to_string()));
+        buffer.insert(entc, (true, "a".to_string()));
         buffer.insert(enta, (1, 1.0));
-        buffer.insert(entb, (1.0, "a"));
+        buffer.insert(entb, (1.0, "a".to_string()));
         buffer.run_on(&mut world);
         assert_eq!(world.archetypes().len(), 4);
     }

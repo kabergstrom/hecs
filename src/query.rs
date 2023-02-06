@@ -12,7 +12,7 @@ use core::ptr::NonNull;
 use core::slice::Iter as SliceIter;
 
 use crate::alloc::{boxed::Box, vec::Vec};
-use crate::archetype::Archetype;
+use crate::archetype::{Archetype, Data};
 use crate::entities::EntityMeta;
 use crate::gc::GC;
 use crate::{Component, Entity, World};
@@ -90,7 +90,7 @@ impl<'a, T: Component> Query for &'a T {
 unsafe impl<'a, T> QueryShared for &'a T {}
 
 #[doc(hidden)]
-pub struct FetchRead<T>(NonNull<GC<T>>);
+pub struct FetchRead<T>(NonNull<Data>, PhantomData<T>);
 
 unsafe impl<'a, T: Component> Fetch<'a> for FetchRead<T> {
     type Item = &'a T;
@@ -98,7 +98,7 @@ unsafe impl<'a, T: Component> Fetch<'a> for FetchRead<T> {
     type State = usize;
 
     fn dangling() -> Self {
-        Self(NonNull::dangling())
+        Self(NonNull::<Data>::dangling(), PhantomData::default())
     }
 
     fn access(archetype: &Archetype) -> Option<Access> {
@@ -116,7 +116,12 @@ unsafe impl<'a, T: Component> Fetch<'a> for FetchRead<T> {
         archetype.get_state::<T>()
     }
     fn execute(archetype: &'a Archetype, state: Self::State) -> Self {
-        Self(archetype.get_base(state))
+        Self(
+            unsafe {
+                NonNull::new_unchecked(archetype.get_data_storage(state) as *const Data as *mut Data)
+            },
+            PhantomData::default(),
+        )
     }
     fn release(archetype: &Archetype, state: Self::State) {
         archetype.release::<T>(state);
@@ -127,7 +132,27 @@ unsafe impl<'a, T: Component> Fetch<'a> for FetchRead<T> {
     }
 
     unsafe fn get(&self, n: usize) -> Self::Item {
-        &(*self.0.as_ptr().add(n)).value
+        assert!(
+            matches!(
+                self.0
+                    .as_ref()
+                    .get_gc_ptr(n as u32)
+                    .header_ptr()
+                    .as_ref()
+                    .state,
+                crate::gc::State::Alive { .. }
+            ),
+            "index {} state was {:?} ptr {:?}",
+            n,
+            self.0
+                .as_ref()
+                .get_gc_ptr(n as u32)
+                .header_ptr()
+                .as_ref()
+                .state,
+            self.0.as_ref().get_value(n as u32)
+        );
+        self.0.as_ref().get_value(n as u32).cast().as_ref()
     }
 }
 
@@ -136,7 +161,7 @@ impl<'a, T: Component> Query for &'a mut T {
 }
 
 #[doc(hidden)]
-pub struct FetchWrite<T>(NonNull<GC<T>>);
+pub struct FetchWrite<T>(NonNull<Data>, PhantomData<T>);
 
 unsafe impl<'a, T: Component> Fetch<'a> for FetchWrite<T> {
     type Item = &'a mut T;
@@ -144,7 +169,7 @@ unsafe impl<'a, T: Component> Fetch<'a> for FetchWrite<T> {
     type State = usize;
 
     fn dangling() -> Self {
-        Self(NonNull::dangling())
+        Self(NonNull::<Data>::dangling(), PhantomData::default())
     }
 
     fn access(archetype: &Archetype) -> Option<Access> {
@@ -163,7 +188,12 @@ unsafe impl<'a, T: Component> Fetch<'a> for FetchWrite<T> {
         Some(archetype.get_state::<T>()?)
     }
     fn execute(archetype: &'a Archetype, state: Self::State) -> Self {
-        Self(archetype.get_base::<T>(state))
+        Self(
+            unsafe {
+                NonNull::new_unchecked(archetype.get_data_storage(state) as *const Data as *mut Data)
+            },
+            PhantomData::default(),
+        )
     }
     fn release(archetype: &Archetype, state: Self::State) {
         archetype.release_mut::<T>(state);
@@ -174,7 +204,7 @@ unsafe impl<'a, T: Component> Fetch<'a> for FetchWrite<T> {
     }
 
     unsafe fn get(&self, n: usize) -> Self::Item {
-        &mut (*self.0.as_ptr().add(n)).value
+        self.0.as_ref().get_value(n as u32).cast().as_mut()
     }
 }
 
@@ -613,7 +643,7 @@ impl<'w, Q: Query> QueryBorrow<'w, Q> {
             return;
         }
         for x in self.archetypes {
-            if x.is_empty() {
+            if x.is_empty_sync() {
                 continue;
             }
             // TODO: Release prior borrows on failure?
@@ -693,7 +723,7 @@ impl<'w, Q: Query> Drop for QueryBorrow<'w, Q> {
     fn drop(&mut self) {
         if self.borrowed {
             for x in self.archetypes {
-                if x.is_empty() {
+                if x.is_empty_sync() {
                     continue;
                 }
                 if let Some(state) = Q::Fetch::prepare(x) {
@@ -752,11 +782,14 @@ impl<'q, Q: Query> Iterator for QueryIter<'q, Q> {
                         entities: archetype.entities(),
                         fetch,
                         position: 0,
-                        len: archetype.len() as usize,
+                        len: archetype.len_sync() as usize,
                     });
                     continue;
                 }
                 Some((id, components)) => {
+                    if id == u32::MAX {
+                        continue;
+                    }
                     return Some((
                         Entity {
                             id,
@@ -780,7 +813,7 @@ impl<'q, Q: Query> ExactSizeIterator for QueryIter<'q, Q> {
         self.archetypes
             .clone()
             .filter(|&x| Q::Fetch::access(x).is_some())
-            .map(|x| x.len() as usize)
+            .map(|x| x.len_sync() as usize)
             .sum::<usize>()
             + self.iter.remaining()
     }
@@ -881,13 +914,17 @@ impl<Q: Query> ChunkIter<Q> {
 
     #[inline]
     unsafe fn next<'a>(&mut self) -> Option<(u32, <Q::Fetch as Fetch<'a>>::Item)> {
-        if self.position == self.len {
-            return None;
+        while self.position < self.len {
+            let entity = self.entities.as_ptr().add(self.position);
+            let pos = self.position;
+            self.position += 1;
+            if *entity == u32::MAX {
+                continue;
+            }
+            let item = self.fetch.get(pos);
+            return Some((*entity, item));
         }
-        let entity = self.entities.as_ptr().add(self.position);
-        let item = self.fetch.get(self.position);
-        self.position += 1;
-        Some((*entity, item))
+        None
     }
 
     fn remaining(&self) -> usize {
@@ -935,7 +972,7 @@ impl<'q, Q: Query> Iterator for BatchedIter<'q, Q> {
             let mut archetypes = self.archetypes.clone();
             let archetype = archetypes.next()?;
             let offset = self.batch_size * self.batch;
-            if offset >= archetype.len() {
+            if offset >= archetype.len_sync() {
                 self.archetypes = archetypes;
                 self.batch = 0;
                 continue;
@@ -949,7 +986,7 @@ impl<'q, Q: Query> Iterator for BatchedIter<'q, Q> {
                     state: ChunkIter {
                         entities: archetype.entities(),
                         fetch,
-                        len: (offset + self.batch_size.min(archetype.len() - offset)) as usize,
+                        len: (offset + self.batch_size.min(archetype.len_sync() - offset)) as usize,
                         position: offset as usize,
                     },
                 });
@@ -1161,7 +1198,7 @@ impl<'q, Q: Query> PreparedQueryBorrow<'q, Q> {
         fetch: &'q mut [Option<Q::Fetch>],
     ) -> Self {
         for (idx, state) in state {
-            if archetypes[*idx].is_empty() {
+            if archetypes[*idx].is_empty_sync() {
                 continue;
             }
             Q::Fetch::borrow(&archetypes[*idx], *state);
@@ -1196,7 +1233,7 @@ impl<'q, Q: Query> PreparedQueryBorrow<'q, Q> {
 impl<Q: Query> Drop for PreparedQueryBorrow<'_, Q> {
     fn drop(&mut self) {
         for (idx, state) in self.state {
-            if self.archetypes[*idx].is_empty() {
+            if self.archetypes[*idx].is_empty_sync() {
                 continue;
             }
             Q::Fetch::release(&self.archetypes[*idx], *state);
@@ -1250,11 +1287,14 @@ impl<'q, Q: Query> Iterator for PreparedQueryIter<'q, Q> {
                         entities: archetype.entities(),
                         fetch: Q::Fetch::execute(archetype, *state),
                         position: 0,
-                        len: archetype.len() as usize,
+                        len: archetype.len_sync() as usize,
                     };
                     continue;
                 }
                 Some((id, components)) => {
+                    if id == u32::MAX {
+                        continue;
+                    }
                     return Some((
                         Entity {
                             id,
@@ -1277,7 +1317,7 @@ impl<Q: Query> ExactSizeIterator for PreparedQueryIter<'_, Q> {
     fn len(&self) -> usize {
         self.state
             .clone()
-            .map(|(idx, _)| self.archetypes[*idx].len() as usize)
+            .map(|(idx, _)| self.archetypes[*idx].len_sync() as usize)
             .sum::<usize>()
             + self.iter.remaining()
     }
