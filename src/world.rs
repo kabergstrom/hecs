@@ -1353,7 +1353,7 @@ pub(crate) mod tests {
 
     pub(crate) fn cleanup(mut world: World) {
         world.clear();
-        unsafe { crate::gc_trace(&registry(), &mut world, &[]) };
+        unsafe { crate::gc_trace(&registry(), &mut world, []) };
     }
     #[test]
     fn reuse_empty() {

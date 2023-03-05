@@ -341,11 +341,15 @@ pub(crate) fn gc_type_traversal(
     }
 }
 
-pub unsafe fn trace(type_registry: &TypeRegistry, world: &mut World, entity_roots: &[Entity]) {
+pub unsafe fn trace(
+    type_registry: &TypeRegistry,
+    world: &mut World,
+    entity_roots: impl IntoIterator<Item = Entity>,
+) {
     let mut to_process: Vec<(GCPtr, unsafe fn(*mut u8) -> *mut dyn Reflect)> = Vec::new();
     let mut processed = HashSet::<GCPtr>::new();
     for ent in entity_roots {
-        if let Ok(entity) = world.entity(*ent) {
+        if let Ok(entity) = world.entity(ent) {
             unsafe {
                 let archetype = entity.archetype();
                 for (storage_idx, ty) in archetype.types().iter().enumerate() {
