@@ -21,7 +21,7 @@
 //! # use hecs::*;
 //! let mut world = World::new();
 //! // Nearly any type can be used as a component with zero boilerplate
-//! let a = world.spawn((123, true, "abc"));
+//! let a = world.spawn((123, true, "abc".to_string()));
 //! let b = world.spawn((42, false));
 //! // Systems can be simple for loops
 //! for (id, (number, &flag)) in world.query_mut::<(&mut i32, &bool)>() {
@@ -64,7 +64,7 @@ mod command_buffer;
 mod entities;
 mod entity_builder;
 mod entity_ref;
-mod gc;
+pub mod gc;
 mod query;
 mod query_one;
 #[cfg(any(feature = "row-serialize", feature = "column-serialize"))]
@@ -79,8 +79,7 @@ pub use command_buffer::CommandBuffer;
 pub use entities::{Entity, NoSuchEntity};
 pub use entity_builder::{BuiltEntity, BuiltEntityClone, EntityBuilder, EntityBuilderClone};
 pub use entity_ref::{ComponentRef, ComponentRefShared, EntityRef, Ref, RefMut};
-pub use gc::GCWorld;
-pub use gc::{trace as gc_trace, CRef};
+pub use gc::{trace as gc_trace, CRef, GCWorld};
 pub use query::{
     Access, Batch, BatchedIter, Or, PreparedQuery, PreparedQueryBorrow, PreparedQueryIter,
     PreparedView, Query, QueryBorrow, QueryItem, QueryIter, QueryMut, QueryShared, Satisfies, View,

@@ -56,7 +56,7 @@ impl<'a> EntityRef<'a> {
     /// ```
     /// # use hecs::*;
     /// let mut world = World::new();
-    /// let a = world.spawn((42, "abc"));
+    /// let a = world.spawn((42, "abc".to_string()));
     /// let e = world.entity(a).unwrap();
     /// *e.get::<&mut i32>().unwrap() = 17;
     /// assert_eq!(*e.get::<&i32>().unwrap(), 17);
@@ -77,7 +77,7 @@ impl<'a> EntityRef<'a> {
     /// ```
     /// # use hecs::*;
     /// let mut world = World::new();
-    /// let a = world.spawn((123, true, "abc"));
+    /// let a = world.spawn((123, true, "abc".to_string()));
     /// // The returned query must outlive the borrow made by `get`
     /// let mut query = world.entity(a).unwrap().query::<(&mut i32, &bool)>();
     /// let (number, flag) = query.get().unwrap();

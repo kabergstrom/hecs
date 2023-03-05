@@ -35,13 +35,14 @@ use crate::{world, Access, Component, ComponentRef, Query};
 /// [`World`](crate::World).
 pub struct Archetype {
     types: Vec<TypeInfo>,
-    pub(crate) gc_traversal: RefCell<Vec<Vec<TraversalCommand>>>,
     type_ids: Box<[TypeId]>,
     index: OrderedTypeIdMap<usize>,
     len: U32Cell,
+    num_free: U32Cell,
     entities: KVec<U32Cell>,
     /// One allocation per type, in the same order as `types`
     data: Box<[Data]>,
+    first_free: Cell<Option<GCPtr>>,
 }
 
 impl Archetype {
@@ -68,9 +69,9 @@ impl Archetype {
         Self {
             index: OrderedTypeIdMap::new(types.iter().enumerate().map(|(i, ty)| (ty.id, i))),
             type_ids: types.iter().map(|ty| ty.id()).collect(),
-            gc_traversal: RefCell::new(Vec::new()),
             entities: KVec::new(),
             len: U32Cell::new(0),
+            num_free: U32Cell::new(0),
             data: types
                 .iter()
                 .map(|ty| {
@@ -102,6 +103,7 @@ impl Archetype {
                 })
                 .collect(),
             types,
+            first_free: Cell::new(None),
         }
     }
 
@@ -180,25 +182,24 @@ impl Archetype {
         self.data[state].state.release_mut();
     }
 
-    /// Number of entities in this archetype
     #[inline]
-    pub unsafe fn len_nonsync(&self) -> u32 {
-        unsafe { self.len.read_nonsync() }
+    pub(crate) unsafe fn allocated_values_nonsync(&self) -> u32 {
+        self.len.read_nonsync()
     }
 
-    pub fn len_sync(&self) -> u32 {
+    #[inline]
+    pub(crate) fn allocated_values_sync(&self) -> u32 {
         self.len.load_atomic(Ordering::Relaxed)
     }
 
     /// Whether this archetype contains no entities
     #[inline]
     pub unsafe fn is_empty_nonsync(&self) -> bool {
-        self.len_nonsync() == 0
+        self.len.read_nonsync() - self.num_free.read_nonsync() == 0
     }
-
     #[inline]
     pub fn is_empty_sync(&self) -> bool {
-        self.len_sync() == 0
+        self.len.load_atomic(Ordering::Relaxed) - self.num_free.load_atomic(Ordering::Relaxed) == 0
     }
 
     #[inline]
@@ -252,7 +253,7 @@ impl Archetype {
     }
 
     pub(crate) unsafe fn get_dynamic(&self, ty: &TypeInfo, index: u32) -> Option<GCPtr> {
-        debug_assert!(index < self.len_nonsync());
+        debug_assert!(index < self.len.read_nonsync());
         debug_assert!(self.entities[index as usize].load_atomic(Ordering::Acquire) != u32::MAX);
         let ptr = self
             .data
@@ -265,11 +266,25 @@ impl Archetype {
     /// Every type must be written immediately after this call
     /// This cannot be called from multiple threads concurrently
     pub(crate) unsafe fn allocate_nonsync(&self, id: u32, world_slot: NonZeroU32) -> u32 {
-        let new_slot = self.len.read_nonsync();
-        self.len.write_nonsync(new_slot + 1);
-        if new_slot as usize >= self.entities.len_nonsync() {
-            self.grow_nonsync(64, world_slot);
-        }
+        let new_slot = if let Some(free_value) = self.first_free.get() {
+            let gc_header = unsafe { &mut *free_value.header_ptr().as_ptr() };
+            let crate::gc::State::Free { next_free } = gc_header.state else {
+                panic!("value in free list but state is not free")
+            };
+            gc_header.state = crate::gc::State::Free { next_free: None };
+            self.first_free.set(next_free);
+            let current_num_free = self.num_free.read_nonsync();
+            self.num_free.write_nonsync(current_num_free - 1);
+            let new_slot = free_value.archetype_slot();
+            new_slot
+        } else {
+            let new_slot = self.len.read_nonsync();
+            self.len.write_nonsync(new_slot + 1);
+            if new_slot as usize >= self.entities.len_nonsync() {
+                self.grow_nonsync(64, world_slot);
+            }
+            new_slot
+        };
         self.entities[new_slot as usize].write_nonsync(id);
         new_slot
     }
@@ -299,8 +314,7 @@ impl Archetype {
 
         for (info, data) in self.types.iter().zip(&*self.data) {
             if info.value_layout.size() != 0 {
-                let entities_per_chunk =
-                    (DATA_CHUNK_SIZE_BYTES - data.data_start) / info.gc_layout.size();
+                let entities_per_chunk = data.entities_per_chunk();
                 let num_chunks_required = new_cap / entities_per_chunk + 1;
                 let new_chunks = num_chunks_required.saturating_sub(data.storage.len());
                 for _ in 0..new_chunks {
@@ -308,7 +322,7 @@ impl Archetype {
                         let mem = alloc_zeroed(data.storage_layout);
                         assert!(!mem.is_null(), "allocation failed");
                         mem.cast::<StorageHeader>()
-                            .write(StorageHeader { world_slot });
+                            .write(data.new_storage_header(world_slot, data.storage.len()));
                         data.storage.push_sync(mem);
                     }
                 }
@@ -335,7 +349,7 @@ impl Archetype {
                         let mem = alloc_zeroed(data.storage_layout);
                         assert!(!mem.is_null(), "allocation failed");
                         mem.cast::<StorageHeader>()
-                            .write(StorageHeader { world_slot });
+                            .write(data.new_storage_header(world_slot, data.storage.len()));
                         data.storage.push_nonsync(mem);
                     }
                 }
@@ -361,7 +375,7 @@ impl Archetype {
                         let mem = alloc_zeroed(data.storage_layout);
                         assert!(!mem.is_null(), "allocation failed");
                         mem.cast::<StorageHeader>()
-                            .write(StorageHeader { world_slot });
+                            .write(data.new_storage_header(world_slot, data.storage.len()));
                         data.storage.push(mem);
                     }
                 }
@@ -433,6 +447,32 @@ impl Archetype {
         other.len.set(0);
     }
 
+    pub(crate) unsafe fn free_slot(&self, slot: u32) {
+        let current_num_free = self.num_free.read_nonsync();
+        self.num_free.write_nonsync(current_num_free + 1);
+        debug_assert!(
+            self.len.read_nonsync() >= current_num_free + 1,
+            "allocated len is {} and num free is {}",
+            self.len.read_nonsync(),
+            current_num_free + 1
+        );
+
+        let current_free_head = self.first_free.get();
+        let mut new_free_head = None;
+        for (idx, storage) in self.data.iter().enumerate() {
+            let slot_ptr = storage.get_gc_ptr(slot);
+            if idx == 0 {
+                slot_ptr.header_ptr().as_mut().state = crate::gc::State::Free {
+                    next_free: current_free_head,
+                };
+                new_free_head = Some(slot_ptr);
+            } else {
+                slot_ptr.header_ptr().as_mut().state = crate::gc::State::Free { next_free: None };
+            }
+        }
+        self.first_free.set(new_free_head);
+    }
+
     // /// Raw IDs of the entities in this archetype
     // ///
     // /// Convertible into [`Entity`](crate::Entity)s with
@@ -446,7 +486,6 @@ impl Archetype {
 
 impl Drop for Archetype {
     fn drop(&mut self) {
-        self.clear();
         if self.entities.len() == 0 {
             return;
         }
@@ -455,7 +494,11 @@ impl Drop for Archetype {
             for index in 0..self.len.read() {
                 unsafe {
                     let ptr = data.get_gc_ptr(index);
-                    if ptr.header_ptr().as_ref().state != crate::gc::State::Free {
+                    let is_free = matches!(
+                        ptr.header_ptr().as_ref().state,
+                        crate::gc::State::Free { .. }
+                    );
+                    if !is_free {
                         if !std::thread::panicking() {
                             std::eprintln!(
                                 "Archetype storage dropped without freeing dead values: {:?} at id {} was state {:?}",
@@ -463,11 +506,11 @@ impl Drop for Archetype {
                             );
                         }
                     }
-                    needs_leak |= ptr.header_ptr().as_ref().state != crate::gc::State::Free;
+                    needs_leak |= !is_free;
                 }
             }
             if info.value_layout.size() != 0 && !needs_leak {
-                for chunk in unsafe { data.chunks() } {
+                for chunk in data.chunks() {
                     assert!(!chunk.is_null());
                     unsafe {
                         dealloc(
@@ -488,6 +531,9 @@ impl Drop for Archetype {
 pub(crate) const DATA_CHUNK_SIZE_BYTES: usize = 0x10000;
 pub(crate) struct StorageHeader {
     pub(crate) world_slot: NonZeroU32,
+    pub(crate) chunk_idx: usize,
+    pub(crate) data_start: usize,
+    pub(crate) stride: usize,
 }
 pub(crate) struct Data {
     storage: KVec<*mut u8>,
@@ -500,7 +546,19 @@ pub(crate) struct Data {
 }
 
 impl Data {
-    pub(crate) unsafe fn chunks(&self) -> &[*mut u8] {
+    pub(crate) fn new_storage_header(
+        &self,
+        world_slot: NonZeroU32,
+        chunk_idx: usize,
+    ) -> StorageHeader {
+        StorageHeader {
+            world_slot,
+            chunk_idx,
+            data_start: self.data_start,
+            stride: self.stride,
+        }
+    }
+    pub(crate) fn chunks(&self) -> &[*mut u8] {
         &self.storage
     }
     pub(crate) fn stride(&self) -> usize {
@@ -518,7 +576,7 @@ impl Data {
 
     pub(crate) fn get_gc_ptr(&self, idx: u32) -> GCPtr {
         let idx = idx as usize;
-        let entities_per_chunk = (DATA_CHUNK_SIZE_BYTES - self.data_start) / self.stride;
+        let entities_per_chunk = self.entities_per_chunk();
         let chunk_idx = idx / entities_per_chunk;
         let value_idx = idx % entities_per_chunk;
         unsafe {
@@ -533,7 +591,7 @@ impl Data {
 
     pub(crate) fn get_value(&self, idx: u32) -> NonNull<u8> {
         let idx = idx as usize;
-        let entities_per_chunk = (DATA_CHUNK_SIZE_BYTES - self.data_start) / self.stride;
+        let entities_per_chunk = self.entities_per_chunk();
         let chunk_idx = idx / entities_per_chunk;
         let value_idx = idx % entities_per_chunk;
         unsafe {
@@ -542,6 +600,65 @@ impl Data {
                     .add(self.data_start + value_idx * self.stride + self.value_start),
             )
         }
+    }
+
+    pub(crate) unsafe fn iter_gc_ptr<'a>(
+        &'a self,
+        num_allocated_slots: u32,
+    ) -> impl IntoIterator<Item = GCPtr> + 'a {
+        DataGCPtrIterator {
+            storage: self,
+            entities_per_chunk: self.entities_per_chunk(),
+            data_start: self.data_start,
+            value_start: self.value_start,
+            stride: self.stride,
+            num_allocated_slots,
+            chunk_idx: 0,
+            slot_idx: 0,
+            value_idx: 0,
+            curr_chunk: self.chunks().get(0).copied().unwrap_or(null_mut()),
+        }
+    }
+}
+
+struct DataGCPtrIterator<'a> {
+    storage: &'a Data,
+    entities_per_chunk: usize,
+    data_start: usize,
+    value_start: usize,
+    stride: usize,
+    num_allocated_slots: u32,
+    // stateful variables
+    chunk_idx: usize,
+    slot_idx: u32,
+    value_idx: usize,
+    curr_chunk: *mut u8,
+}
+impl<'a> Iterator for DataGCPtrIterator<'a> {
+    type Item = GCPtr;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.slot_idx >= self.num_allocated_slots {
+            return None;
+        }
+        assert!(!self.curr_chunk.is_null());
+        if self.value_idx >= self.entities_per_chunk {
+            self.chunk_idx += 1;
+            self.curr_chunk = self.storage.chunks()[self.chunk_idx];
+            self.value_idx = 0;
+        }
+        let ptr = unsafe {
+            GCPtr::from_base_with_offset(
+                self.value_start,
+                NonNull::new_unchecked(
+                    self.curr_chunk
+                        .add(self.data_start + self.stride * self.value_idx),
+                ),
+            )
+        };
+        self.value_idx += 1;
+        self.slot_idx += 1;
+        Some(ptr)
     }
 }
 

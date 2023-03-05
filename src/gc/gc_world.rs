@@ -26,7 +26,7 @@ impl<'a> GCWorld<'a> {
         }
     }
 
-    /// Returns a `ComponentRef` to the `T` component of `entity`
+    /// Returns a `CRef` to the `T` component of `entity`
     pub fn get<T: Component>(&self, entity: Entity) -> Result<CRef<T>, ComponentError> {
         let entity_ref = self.world.entity(entity)?;
         let gc_ptr = unsafe {
@@ -45,24 +45,24 @@ impl<'a> GCWorld<'a> {
     /// Add `component` to `entity`
     ///
     /// See [`insert`](Self::insert).
-    // pub fn insert_one(
-    //     &self,
-    //     entity: Entity,
-    //     component: impl Component,
-    // ) -> Result<(), NoSuchEntity> {
-    //     self.insert(entity, (component,))
-    // }
+    pub fn insert_one(
+        &self,
+        entity: Entity,
+        component: impl Component,
+    ) -> Result<(), NoSuchEntity> {
+        self.insert(entity, (component,))
+    }
 
     /// Add `components` to `entity`
     ///
     /// When inserting a single component, see [`insert_one`](Self::insert_one) for convenience.
-    // pub fn insert(
-    //     &self,
-    //     entity: Entity,
-    //     components: impl DynamicBundle,
-    // ) -> Result<(), NoSuchEntity> {
-    //     self.world.insert(entity, components)
-    // }
+    pub fn insert(
+        &self,
+        entity: Entity,
+        components: impl DynamicBundle,
+    ) -> Result<(), NoSuchEntity> {
+        todo!()
+    }
 
     /// Create an entity with certain components
     ///
@@ -78,25 +78,15 @@ impl<'a> GCWorld<'a> {
     ///
     /// # Example
     /// ```
-    /// # use hecs::ergo::*;
-    /// let mut world = World::new();
-    /// let ergo = ErgoScope::new(&mut world);
-    /// let a = ergo.spawn((123, "abc"));
+    /// # use hecs::gc::*;
+    /// let mut world = hecs::World::new();
+    /// let ergo = GCWorld::new(&mut world);
+    /// let a = ergo.spawn((123, "abc".to_string()));
     /// let b = ergo.spawn((456, true));
     /// ```
-    // pub fn spawn(&self, components: impl DynamicBundle) -> Entity {
-    //     let handle = self.world.reserve_entity();
-    //     // Ensure all entity allocations are accounted for so `self.entities` can realloc if
-    //     // necessary
-    //     self.world.flush();
-
-    //     let loc = self.world.entities().alloc_at(handle);
-    //     if let Some(loc) = loc {
-    //         unsafe { self.world.archetypes.archetypes[loc.archetype as usize].remove(loc.index) }
-    //     }
-
-    //     self.spawn_inner(handle, components);
-    // }
+    pub fn spawn(&self, components: impl DynamicBundle) -> Entity {
+        todo!();
+    }
 
     // fn spawn_inner(&mut self, entity: Entity, components: impl DynamicBundle) {
     //     let archetype_id = match components.key() {
@@ -130,20 +120,20 @@ impl<'a> GCWorld<'a> {
     ///
     /// # Example
     /// ```
-    /// # use hecs::ergo::*;
-    /// let mut world = World::new();
-    /// let ergo = ErgoScope::new(&mut world);
-    /// let a = ergo.spawn((123, "abc"));
+    /// # use hecs::gc::*;
+    /// let mut world = hecs::World::new();
+    /// let ergo = GCWorld::new(&mut world);
+    /// let a = ergo.spawn((123, "abc".to_string()));
     /// let b = ergo.spawn((456, true));
     /// ergo.despawn(a);
     /// assert!(!ergo.contains(a));
     /// // all previous Entity values pointing to 'a' will be live again, instead pointing to the new entity.
-    /// ergo.spawn_at(a, (789, "ABC"));
+    /// ergo.spawn_at(a, (789, "ABC".to_string()));
     /// assert!(ergo.contains(a));
     /// ```
-    // pub fn spawn_at(&self, entity: Entity, components: impl DynamicBundle) {
-    //     self.world.spawn_at(entity, components)
-    // }
+    pub fn spawn_at(&self, entity: Entity, components: impl DynamicBundle) {
+        todo!();
+    }
 
     /// Allocate an entity ID
     pub fn reserve_entity(&self) -> Entity {
@@ -153,28 +143,28 @@ impl<'a> GCWorld<'a> {
     /// Remove the `T` component from `entity`
     ///
     /// See [`remove`](Self::remove).
-    // pub fn remove_one<T: Component>(&self, entity: Entity) -> Result<T, ComponentError> {
-    //     self.remove::<(T,)>(entity).map(|(x,)| x)
-    // }
+    pub fn remove_one<T: Component>(&self, entity: Entity) -> Result<T, ComponentError> {
+        todo!()
+    }
 
     /// Remove components from `entity`
     ///
     /// When removing a single component, see [`remove_one`](Self::remove_one) for convenience.
-    // pub fn remove<T: Bundle + 'static>(&self, entity: Entity) -> Result<T, ComponentError> {
-    //     self.world.remove(entity)
-    // }
+    pub fn remove<T: Bundle + 'static>(&self, entity: Entity) -> Result<T, ComponentError> {
+        todo!()
+    }
 
     // /// Destroy an entity and all its components
-    // pub fn despawn(&self, entity: Entity) -> Result<(), NoSuchEntity> {
-    //     self.world.despawn(entity)
-    // }
+    pub fn despawn(&self, entity: Entity) -> Result<(), NoSuchEntity> {
+        todo!()
+    }
 
     // TODO implement len()
 
     // TODO implement
-    // pub fn satisfies<Q: Query>(&self, entity: Entity) -> Result<bool, NoSuchEntity> {
-    //     Ok(self.entity(entity)?.satisfies::<Q>())
-    // }
+    pub fn satisfies<Q: Query>(&self, entity: Entity) -> Result<bool, NoSuchEntity> {
+        todo!()
+    }
 
     /// Whether `entity` exists
     pub fn contains(&self, entity: Entity) -> bool {
@@ -203,12 +193,12 @@ impl<'a> GCWorld<'a> {
     ///
     /// # Example
     /// ```
-    /// # use hecs::ergo::*;
-    /// let mut world = World::new();
-    /// let a = world.spawn((123, true, "abc"));
+    /// # use hecs::gc::*;
+    /// let mut world = hecs::World::new();
+    /// let a = world.spawn((123, true, "abc".to_string()));
     /// let b = world.spawn((456, false));
-    /// let c = world.spawn((42, "def"));
-    /// let ergo = ErgoScope::new(&mut world);
+    /// let c = world.spawn((42, "def".to_string()));
+    /// let ergo = GCWorld::new(&mut world);
     /// let entities = ergo.query::<(&i32, &bool)>()
     ///     .iter()
     ///     .map(|(e, (i, b))| (e, *i.read(), *b.read())) // Copy out of the world

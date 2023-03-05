@@ -28,7 +28,7 @@ struct AllocHeader {
 
 #[doc(hidden)]
 impl<T> SizedTypeProperties for T {}
-pub struct KVec<T> {
+pub struct KVec<T: Clone> {
     ptr: PtrCell<u8>,
     data_start: usize,
     old_allocs: Mutex<Vec<*mut u8>>,
@@ -38,6 +38,18 @@ pub struct KVec<T> {
 impl<T: Clone> Default for KVec<T> {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+impl<T: Clone> Drop for KVec<T> {
+    fn drop(&mut self) {
+        self.clean_old_allocs();
+        let current_alloc = self.ptr.read();
+        if !current_alloc.is_null() {
+            let header = unsafe { &*current_alloc.cast::<AllocHeader>() };
+            let (layout, _) = Self::get_layout(header.cap);
+            unsafe { alloc::alloc::dealloc(current_alloc, layout) };
+        }
     }
 }
 
@@ -158,10 +170,9 @@ impl<T: Clone> KVec<T> {
             if additional > capacity.wrapping_sub(prev_len) {
                 return None;
             }
-            current
-                .reserved
-                .write_nonsync(prev_len.wrapping_add(additional));
-            Some(prev_len..additional)
+            let new_len = prev_len.wrapping_add(additional);
+            current.reserved.write_nonsync(new_len);
+            Some(prev_len..new_len)
         } else {
             None
         }
@@ -277,7 +288,7 @@ impl<T: Clone> KVec<T> {
         let old_ptr = self.ptr.read();
         if !old_ptr.is_null() {
             let old_header = unsafe { &mut *old_ptr.cast::<AllocHeader>() }; // SAFETY: we have &mut self
-            debug_assert!(old_header.written.read() == old_header.reserved.read());
+            debug_assert_eq!(old_header.written.read(), old_header.reserved.read());
             unsafe {
                 let written_len = old_header.written.read();
                 // copy data from old to new allocation, and update length
@@ -290,6 +301,7 @@ impl<T: Clone> KVec<T> {
                 new_header.reserved.set(written_len);
                 new_header.written.set(written_len);
             }
+            self.old_allocs.lock().expect("lock poisoned").push(old_ptr);
         }
         self.ptr.set(ptr);
         Some(ptr)
@@ -483,17 +495,17 @@ impl<T: Clone> KVec<T> {
     }
 
     pub fn pop(&mut self) -> Option<T> {
-        if let Some((data, header)) = unsafe { self.current_memory_nonsync() } {
+        if let Some((data, mut header)) = unsafe { self.current_memory_nonsync() } {
             unsafe {
-                let header = header.as_ref();
+                let header = header.as_mut();
                 debug_assert!(header.written.read() == header.reserved.read());
                 let len = header.written.read_nonsync();
                 if len == 0 {
                     return None;
                 }
                 let new_len = len - 1;
-                header.written.set(len);
-                header.reserved.set(len);
+                header.written.set(new_len);
+                header.reserved.set(new_len);
                 Some(data.as_ptr().add(new_len).read())
             }
         } else {
@@ -503,17 +515,33 @@ impl<T: Clone> KVec<T> {
 
     pub fn push(&mut self, value: T) {
         let (ptr, reserved_range) = self.reserve_storage(1);
+        debug_assert!(reserved_range.len() == 1);
         unsafe {
-            let data = ptr.add(self.data_start).cast::<T>();
+            let data = ptr
+                .add(self.data_start)
+                .cast::<T>()
+                .add(reserved_range.start);
             core::ptr::write(data, value);
             self.mark_range_written_nonsync(ptr, reserved_range);
+        }
+    }
+
+    pub fn clean_old_allocs(&mut self) {
+        let old_allocs = self.old_allocs.get_mut().expect("lock poisoned");
+        for ptr in old_allocs.drain(0..old_allocs.len()) {
+            let header = unsafe { &*ptr.cast::<AllocHeader>() };
+            let (layout, _) = Self::get_layout(header.cap);
+            unsafe { alloc::alloc::dealloc(ptr, layout) };
         }
     }
 
     pub unsafe fn push_nonsync(&self, value: T) {
         let (ptr, reserved_range) = self.reserve_storage_nonsync(1);
         unsafe {
-            let data = ptr.add(self.data_start).cast::<T>();
+            let data = ptr
+                .add(self.data_start)
+                .cast::<T>()
+                .add(reserved_range.start);
             core::ptr::write(data, value);
             self.mark_range_written_nonsync(ptr, reserved_range);
         }
@@ -543,6 +571,14 @@ impl<T: Clone> KVec<T> {
 
     pub fn iter(&mut self) -> core::slice::Iter<'_, T> {
         (&**self).iter()
+    }
+
+    pub fn capacity(&mut self) -> usize {
+        if let Some((_, header)) = unsafe { self.current_memory_nonsync() } {
+            unsafe { header.as_ref().cap }
+        } else {
+            0
+        }
     }
 
     pub fn len_sync(&self) -> usize {
@@ -591,7 +627,7 @@ impl<T: Clone> KVec<T> {
             for i in range.clone() {
                 ptr::write(data.add(i), value.clone());
             }
-            self.mark_range_written_sync(storage, range);
+            self.mark_range_written_nonsync(storage, range);
         }
     }
 
@@ -609,6 +645,117 @@ impl<T: Clone> KVec<T> {
                 ptr::write(data.add(i), value.clone());
             }
             self.mark_range_written_nonsync(storage, range);
+        }
+    }
+    pub fn swap_remove(&mut self, index: usize) -> T {
+        #[cold]
+        #[inline(never)]
+        fn assert_failed(index: usize, len: usize) -> ! {
+            panic!(
+                "swap_remove index (is {}) should be < len (is {})",
+                index, len
+            );
+        }
+
+        unsafe {
+            if let Some((data, mut header)) = self.current_memory_nonsync() {
+                let header = header.as_mut();
+                let len = header.written.read_nonsync();
+                if index >= len {
+                    assert_failed(index, len);
+                }
+                // We replace self[index] with the last element. Note that if the
+                // bounds check above succeeds there must be a last element (which
+                // can be self[index] itself).
+                let base_ptr = data.as_ptr();
+                let value = ptr::read(base_ptr.add(index));
+                ptr::copy(base_ptr.add(len - 1), base_ptr.add(index), 1);
+                header.written.write_nonsync(len - 1);
+                header.reserved.write_nonsync(len - 1);
+                value
+            } else {
+                assert_failed(index, 0);
+            }
+        }
+    }
+
+    pub fn clear(&mut self) {
+        // SAFETY: we have &mut self
+        if let Some((data, mut header)) = unsafe { self.current_memory_nonsync() } {
+            unsafe {
+                let num_elmts = header.as_ref().written.read_nonsync();
+                header.as_mut().written.write_nonsync(0);
+                header.as_mut().reserved.write_nonsync(0);
+                for i in 0..num_elmts {
+                    core::ptr::drop_in_place(data.as_ptr().add(i));
+                }
+            }
+        }
+    }
+
+    pub fn reserve(&mut self, additional: usize) {
+        unsafe {
+            if let Some((_, header)) = self.current_memory_nonsync() {
+                let header = header.as_ref();
+                let cap = header.cap;
+                let len = header.reserved.read_nonsync();
+                self.grow_amortized(cap, len, additional)
+                    .expect("alloc failed");
+            } else {
+                self.grow_amortized(0, 0, additional).expect("alloc failed");
+            }
+        }
+    }
+    pub fn extend<I: IntoIterator<Item = T>>(&mut self, iter: I) {
+        let mut iterator = iter.into_iter();
+        while let Some(element) = iterator.next() {
+            unsafe {
+                if let Some((_, header)) = self.current_memory_nonsync() {
+                    let header = header.as_ref();
+                    if header.cap == header.reserved.read_nonsync() {
+                        let (lower, _) = iterator.size_hint();
+                        self.reserve(lower.saturating_add(1));
+                    }
+                } else {
+                    let (lower, _) = iterator.size_hint();
+                    self.grow_amortized(0, 0, lower.saturating_add(1))
+                        .expect("alloc failed");
+                }
+                let (data, mut header) = self.current_memory_nonsync().unwrap();
+                let header = header.as_mut();
+                let curr = header.reserved.read_nonsync();
+                ptr::write(data.as_ptr().add(curr), element);
+                header.reserved.write_nonsync(curr + 1);
+                assert!(header.written.read_nonsync() == curr);
+                header.written.write_nonsync(curr + 1);
+            }
+        }
+    }
+
+    pub fn resize(&mut self, new_len: usize, value: T) {
+        let len = unsafe { self.len_nonsync() };
+
+        if new_len > len {
+            self.extend_with_nonsync(new_len - len, value)
+        } else {
+            self.truncate(new_len);
+        }
+    }
+
+    pub fn truncate(&mut self, len: usize) {
+        unsafe {
+            if let Some((data, mut header)) = self.current_memory_nonsync() {
+                let header = header.as_mut();
+                if len > header.cap {
+                    return;
+                }
+                let old_len = header.written.read_nonsync();
+                let remaining_len = old_len - len;
+                let s = ptr::slice_from_raw_parts_mut(data.as_ptr().add(len), remaining_len);
+                header.reserved.write_nonsync(len);
+                header.written.write_nonsync(len);
+                ptr::drop_in_place(s);
+            }
         }
     }
 }

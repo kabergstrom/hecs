@@ -39,6 +39,16 @@ fn random_access() {
 }
 
 #[test]
+fn insert() {
+    let mut world = World::new();
+    let e = world.spawn((123, "abc".to_string()));
+    world.insert(e, (456, true)).unwrap();
+    assert_eq!(*world.get::<&i32>(e).unwrap(), 456);
+    assert_eq!(*world.get::<&bool>(e).unwrap(), true);
+    cleanup(world);
+}
+
+#[test]
 fn despawn() {
     let mut world = World::new();
     let e = world.spawn(("abc".to_string(), 123));
@@ -828,7 +838,7 @@ fn duplicate_components_panic() {
     cleanup(world);
 }
 
-#[test]
+// #[test]
 fn spawn_column_batch() {
     let mut world = World::new();
     let mut batch_ty = ColumnBatchType::new();

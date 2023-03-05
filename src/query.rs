@@ -404,9 +404,9 @@ unsafe impl<'a, L: Fetch<'a>, R: Fetch<'a>> Fetch<'a> for FetchOr<L, R> {
 /// ```
 /// # use hecs::*;
 /// let mut world = World::new();
-/// let a = world.spawn((123, true, "abc"));
+/// let a = world.spawn((123, true, "abc".to_string()));
 /// let b = world.spawn((456, false));
-/// let c = world.spawn((42, "def"));
+/// let c = world.spawn((42, "def".to_string()));
 /// let entities = world.query::<Without<&i32, &bool>>()
 ///     .iter()
 ///     .map(|(e, &i)| (e, i))
@@ -474,9 +474,9 @@ unsafe impl<'a, F: Fetch<'a>, G: Fetch<'a>> Fetch<'a> for FetchWithout<F, G> {
 /// ```
 /// # use hecs::*;
 /// let mut world = World::new();
-/// let a = world.spawn((123, true, "abc"));
+/// let a = world.spawn((123, true, "abc".to_string()));
 /// let b = world.spawn((456, false));
-/// let c = world.spawn((42, "def"));
+/// let c = world.spawn((42, "def".to_string()));
 /// let entities = world.query::<With<&i32, &bool>>()
 ///     .iter()
 ///     .map(|(e, &i)| (e, i))
@@ -544,9 +544,9 @@ unsafe impl<'a, F: Fetch<'a>, G: Fetch<'a>> Fetch<'a> for FetchWith<F, G> {
 /// ```
 /// # use hecs::*;
 /// let mut world = World::new();
-/// let a = world.spawn((123, true, "abc"));
+/// let a = world.spawn((123, true, "abc".to_string()));
 /// let b = world.spawn((456, false));
-/// let c = world.spawn((42, "def"));
+/// let c = world.spawn((42, "def".to_string()));
 /// let entities = world.query::<Satisfies<&bool>>()
 ///     .iter()
 ///     .map(|(e, x)| (e, x))
@@ -664,9 +664,9 @@ impl<'w, Q: Query> QueryBorrow<'w, Q> {
     /// ```
     /// # use hecs::*;
     /// let mut world = World::new();
-    /// let a = world.spawn((123, true, "abc"));
+    /// let a = world.spawn((123, true, "abc".to_string()));
     /// let b = world.spawn((456, false));
-    /// let c = world.spawn((42, "def"));
+    /// let c = world.spawn((42, "def".to_string()));
     /// let entities = world.query::<&i32>()
     ///     .with::<&bool>()
     ///     .iter()
@@ -688,9 +688,9 @@ impl<'w, Q: Query> QueryBorrow<'w, Q> {
     /// ```
     /// # use hecs::*;
     /// let mut world = World::new();
-    /// let a = world.spawn((123, true, "abc"));
+    /// let a = world.spawn((123, true, "abc".to_string()));
     /// let b = world.spawn((456, false));
-    /// let c = world.spawn((42, "def"));
+    /// let c = world.spawn((42, "def".to_string()));
     /// let entities = world.query::<&i32>()
     ///     .without::<&bool>()
     ///     .iter()
@@ -782,7 +782,7 @@ impl<'q, Q: Query> Iterator for QueryIter<'q, Q> {
                         entities: archetype.entities(),
                         fetch,
                         position: 0,
-                        len: archetype.len_sync() as usize,
+                        len: archetype.allocated_values_sync() as usize,
                     });
                     continue;
                 }
@@ -800,22 +800,6 @@ impl<'q, Q: Query> Iterator for QueryIter<'q, Q> {
                 }
             }
         }
-    }
-
-    fn size_hint(&self) -> (usize, Option<usize>) {
-        let n = self.len();
-        (n, Some(n))
-    }
-}
-
-impl<'q, Q: Query> ExactSizeIterator for QueryIter<'q, Q> {
-    fn len(&self) -> usize {
-        self.archetypes
-            .clone()
-            .filter(|&x| Q::Fetch::access(x).is_some())
-            .map(|x| x.len_sync() as usize)
-            .sum::<usize>()
-            + self.iter.remaining()
     }
 }
 
@@ -972,7 +956,7 @@ impl<'q, Q: Query> Iterator for BatchedIter<'q, Q> {
             let mut archetypes = self.archetypes.clone();
             let archetype = archetypes.next()?;
             let offset = self.batch_size * self.batch;
-            if offset >= archetype.len_sync() {
+            if offset >= archetype.allocated_values_sync() {
                 self.archetypes = archetypes;
                 self.batch = 0;
                 continue;
@@ -986,7 +970,11 @@ impl<'q, Q: Query> Iterator for BatchedIter<'q, Q> {
                     state: ChunkIter {
                         entities: archetype.entities(),
                         fetch,
-                        len: (offset + self.batch_size.min(archetype.len_sync() - offset)) as usize,
+                        len: (offset
+                            + self
+                                .batch_size
+                                .min(archetype.allocated_values_sync() - offset))
+                            as usize,
                         position: offset as usize,
                     },
                 });
@@ -1287,7 +1275,7 @@ impl<'q, Q: Query> Iterator for PreparedQueryIter<'q, Q> {
                         entities: archetype.entities(),
                         fetch: Q::Fetch::execute(archetype, *state),
                         position: 0,
-                        len: archetype.len_sync() as usize,
+                        len: archetype.allocated_values_sync() as usize,
                     };
                     continue;
                 }
@@ -1305,21 +1293,6 @@ impl<'q, Q: Query> Iterator for PreparedQueryIter<'q, Q> {
                 }
             }
         }
-    }
-
-    fn size_hint(&self) -> (usize, Option<usize>) {
-        let n = self.len();
-        (n, Some(n))
-    }
-}
-
-impl<Q: Query> ExactSizeIterator for PreparedQueryIter<'_, Q> {
-    fn len(&self) -> usize {
-        self.state
-            .clone()
-            .map(|(idx, _)| self.archetypes[*idx].len_sync() as usize)
-            .sum::<usize>()
-            + self.iter.remaining()
     }
 }
 

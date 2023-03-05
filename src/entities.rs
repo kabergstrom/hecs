@@ -286,6 +286,7 @@ impl Entities {
         } else {
             let id = u32::try_from(self.meta.len()).expect("too many entities");
             self.meta.push(EntityMeta::EMPTY);
+            debug_assert!(self.meta[id as usize].generation == EntityMeta::EMPTY.generation);
             Entity {
                 generation: NonZeroU32::new(1).unwrap(),
                 id,
@@ -348,14 +349,14 @@ impl Entities {
             let new_free_cursor = self.pending.len() as isize;
             self.free_cursor.set(new_free_cursor); // Not racey due to &mut self
             self.meta.resize(entity.id as usize + 1, EntityMeta::EMPTY);
-            let len = self.len();
+            let len = self.len.read();
             self.len.set(len + 1);
             None
         } else if let Some(index) = self.pending.iter().position(|item| *item == entity.id) {
             self.pending.swap_remove(index);
             let new_free_cursor = self.pending.len() as isize;
             self.free_cursor.set(new_free_cursor);
-            let len = self.len();
+            let len = self.len.read();
             self.len.set(len + 1);
             None
         } else {
@@ -429,8 +430,11 @@ impl Entities {
     pub fn clear(&mut self) {
         self.meta.clear();
         self.pending.clear();
-        self.free_cursor.store(0, Ordering::Relaxed); // Not racey due to &mut self
-        self.len = 0;
+        // safe due to &mut self
+        unsafe {
+            self.free_cursor.write_nonsync(0);
+            self.len.write_nonsync(0);
+        }
     }
 
     /// Access the location storage of an entity
@@ -516,7 +520,7 @@ impl Entities {
             self.meta.resize(new_meta_len, EntityMeta::EMPTY);
 
             let len = self.len.read();
-            self.len.set(len - free_cursor as u32);
+            self.len.set(len + (-free_cursor) as u32);
             for (id, meta) in self.meta.iter_mut().enumerate().skip(old_meta_len) {
                 init(id as u32, &mut meta.location);
             }
@@ -528,9 +532,10 @@ impl Entities {
         let len = self.len.read();
         self.len
             .set(len + (self.pending.len() - new_free_cursor) as u32);
-        for id in self.pending.drain(new_free_cursor..) {
-            init(id, &mut self.meta[id as usize].location);
+        for id in &self.pending[new_free_cursor..] {
+            init(*id, &mut self.meta[*id as usize].location);
         }
+        self.pending.truncate(new_free_cursor);
     }
 
     #[inline]
@@ -675,8 +680,13 @@ mod tests {
         for _ in 0..2 {
             let entity = e.alloc();
             e.meta[entity.id as usize].location.index = 0;
+            assert!(!old.contains(&entity));
             old.push(entity);
             e.free(entity).unwrap();
+            assert_eq!(
+                e.pending.iter().filter(|item| **item == entity.id).count(),
+                1
+            );
         }
 
         assert_eq!(e.len(), 0);
@@ -752,6 +762,7 @@ mod tests {
 
         // Allocate 10 items.
         let mut v1: Vec<Entity> = (0..10).map(|_| e.alloc()).collect();
+        assert_eq!(e.len(), v1.len() as u32);
         for &entity in &v1 {
             e.meta[entity.id as usize].location.index = 0;
         }

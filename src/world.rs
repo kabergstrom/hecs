@@ -108,7 +108,7 @@ impl World {
     /// ```
     /// # use hecs::*;
     /// let mut world = World::new();
-    /// let a = world.spawn((123, "abc"));
+    /// let a = world.spawn((123, "abc".to_string()));
     /// let b = world.spawn((456, true));
     /// ```
     pub fn spawn(&mut self, components: impl DynamicBundle) -> Entity {
@@ -136,12 +136,12 @@ impl World {
     /// ```
     /// # use hecs::*;
     /// let mut world = World::new();
-    /// let a = world.spawn((123, "abc"));
+    /// let a = world.spawn((123, "abc".to_string()));
     /// let b = world.spawn((456, true));
     /// world.despawn(a);
     /// assert!(!world.contains(a));
     /// // all previous Entity values pointing to 'a' will be live again, instead pointing to the new entity.
-    /// world.spawn_at(a, (789, "ABC"));
+    /// world.spawn_at(a, (789, "abc".to_string()));
     /// assert!(world.contains(a));
     /// ```
     pub fn spawn_at(&mut self, handle: Entity, components: impl DynamicBundle) {
@@ -191,7 +191,7 @@ impl World {
     /// ```
     /// # use hecs::*;
     /// let mut world = World::new();
-    /// let entities = world.spawn_batch((0..1_000).map(|i| (i, "abc"))).collect::<Vec<_>>();
+    /// let entities = world.spawn_batch((0..1_000).map(|i| (i, "abc".to_string()))).collect::<Vec<_>>();
     /// for i in 0..1_000 {
     ///     assert_eq!(*world.get::<&i32>(entities[i]).unwrap(), i as i32);
     /// }
@@ -229,7 +229,7 @@ impl World {
 
         let archetype = batch.0;
         // SAFETY: We have &mut self
-        let entity_count = unsafe { archetype.len_nonsync() };
+        let entity_count = unsafe { archetype.allocated_values_nonsync() };
         // Store component data
         let (archetype_id, base) = self.archetypes.insert_batch(archetype);
 
@@ -257,10 +257,10 @@ impl World {
         let archetype = batch.0;
         assert_eq!(
             handles.len(),
-            archetype.len_sync() as usize,
+            archetype.allocated_values_sync() as usize,
             "number of entity IDs {} must match number of entities {}",
             handles.len(),
-            archetype.len_sync()
+            archetype.allocated_values_sync()
         );
 
         // Drop components of entities that will be replaced
@@ -385,9 +385,9 @@ impl World {
     /// ```
     /// # use hecs::*;
     /// let mut world = World::new();
-    /// let a = world.spawn((123, true, "abc"));
+    /// let a = world.spawn((123, true, "abc".to_string()));
     /// let b = world.spawn((456, false));
-    /// let c = world.spawn((42, "def"));
+    /// let c = world.spawn((42, "def".to_string()));
     /// let entities = world.query::<(&i32, &bool)>()
     ///     .iter()
     ///     .map(|(e, (&i, &b))| (e, i, b)) // Copy out of the world
@@ -444,7 +444,7 @@ impl World {
     /// ```
     /// # use hecs::*;
     /// let mut world = World::new();
-    /// let a = world.spawn((123, true, "abc"));
+    /// let a = world.spawn((123, true, "abc".to_string()));
     /// // The returned query must outlive the borrow made by `get`
     /// let mut query = world.query_one::<(&mut i32, &bool)>(a).unwrap();
     /// let (number, flag) = query.get().unwrap();
@@ -567,7 +567,7 @@ impl World {
     /// ```
     /// # use hecs::*;
     /// let mut world = World::new();
-    /// let e = world.spawn((123, "abc"));
+    /// let e = world.spawn((123, "abc".to_string()));
     /// world.insert(e, (456, true));
     /// assert_eq!(*world.get::<&i32>(e).unwrap(), 456);
     /// assert_eq!(*world.get::<&bool>(e).unwrap(), true);
@@ -637,7 +637,7 @@ impl World {
 
             // Allocate storage in the archetype and update the entity's location to address it
             // SAFETY: we have &mut self
-            let target_index = unsafe { target_arch.allocate_nonsync(entity.id, self.world_slot) };
+            let target_index = target_arch.allocate_nonsync(entity.id, self.world_slot);
             let meta = &mut self.entities.meta[entity.id as usize];
             meta.location.archetype = target.index;
             meta.location.index = target_index;
@@ -654,6 +654,7 @@ impl World {
                 // SAFETY: we have &mut self
                 target_arch.move_from_nonsync(src, ty, target_index);
             }
+            source_arch.set_entity_id(loc.index as usize, u32::MAX);
         }
     }
 
@@ -681,10 +682,10 @@ impl World {
     /// ```
     /// # use hecs::*;
     /// let mut world = World::new();
-    /// let e = world.spawn((123, "abc", true));
-    /// assert_eq!(world.remove::<(i32, &str)>(e), Ok((123, "abc")));
+    /// let e = world.spawn((123, "abc".to_string(), true));
+    /// assert_eq!(world.remove::<(i32, String)>(e), Ok((123, "abc".to_string())));
     /// assert!(world.get::<&i32>(e).is_err());
-    /// assert!(world.get::<&&str>(e).is_err());
+    /// assert!(world.get::<&String>(e).is_err());
     /// assert_eq!(*world.get::<&bool>(e).unwrap(), true);
     /// ```
     pub fn remove<T: Bundle + 'static>(&mut self, entity: Entity) -> Result<T, ComponentError> {
@@ -864,6 +865,12 @@ impl World {
         self.archetypes_inner().iter()
     }
 
+    pub(crate) fn archetypes_mut(
+        &mut self,
+    ) -> impl ExactSizeIterator<Item = &'_ mut Archetype> + '_ {
+        self.archetypes.archetypes.iter_mut()
+    }
+
     /// Despawn `entity`, yielding a [`DynamicBundle`] of its components
     ///
     /// Useful for moving entities between worlds.
@@ -896,7 +903,7 @@ impl World {
     /// # use hecs::*;
     /// let mut world = World::new();
     /// let initial_gen = world.archetypes_generation();
-    /// world.spawn((123, "abc"));
+    /// world.spawn((123, "abc".to_string()));
     /// assert_ne!(initial_gen, world.archetypes_generation());
     /// ```
     pub fn archetypes_generation(&self) -> ArchetypesGeneration {
@@ -1042,7 +1049,7 @@ impl<'a> Iterator for Iter<'a> {
                     self.index = 0;
                 }
                 Some(current) => {
-                    if self.index == current.len_sync() {
+                    if self.index == current.allocated_values_sync() {
                         self.current = None;
                         continue;
                     }
@@ -1237,7 +1244,7 @@ impl ArchetypeSet {
                 // Duplicate of existing archetype
                 let existing = &mut self.archetypes[*x.get() as usize];
                 // SAFETY: we have &mut self
-                let base = unsafe { existing.len_nonsync() };
+                let base = unsafe { existing.allocated_values_nonsync() };
                 unsafe {
                     todo!();
                     // existing.merge(archetype, self.world_slot);
@@ -1330,11 +1337,24 @@ impl Hasher for IndexTypeIdHasher {
 }
 
 #[cfg(test)]
-mod tests {
-    use alloc::string::ToString;
+pub(crate) mod tests {
+    use alloc::string::{String, ToString};
+    use bevy_reflect::TypeRegistry;
 
     use super::*;
 
+    fn registry() -> TypeRegistry {
+        let mut registry = TypeRegistry::new();
+        registry.register::<i32>();
+        registry.register::<String>();
+        registry.register::<bool>();
+        registry
+    }
+
+    pub(crate) fn cleanup(mut world: World) {
+        world.clear();
+        unsafe { crate::gc_trace(&registry(), &mut world, &[]) };
+    }
     #[test]
     fn reuse_empty() {
         let mut world = World::new();
@@ -1343,6 +1363,7 @@ mod tests {
         let b = world.spawn(());
         assert_eq!(a.id, b.id);
         assert_ne!(a.generation, b.generation);
+        cleanup(world);
     }
 
     #[test]
@@ -1353,6 +1374,7 @@ mod tests {
         let b = world.spawn(());
         assert_eq!(a.id, b.id);
         assert_eq!(a.generation, b.generation);
+        cleanup(world);
     }
 
     #[test]
@@ -1368,6 +1390,7 @@ mod tests {
         assert!(!world.contains(b));
         assert_eq!(b.id, a.id);
         assert_ne!(b.generation, a.generation);
+        cleanup(world);
     }
 
     #[test]
@@ -1381,6 +1404,7 @@ mod tests {
         assert_ne!(a.generation, b.generation);
         assert!(world.get::<&i32>(b).is_err());
         assert!(*world.get::<&bool>(b).unwrap());
+        cleanup(world);
     }
 
     #[test]
@@ -1388,11 +1412,13 @@ mod tests {
         let mut world = World::new();
         let a = world.spawn(("abc".to_string(), 123));
         world.remove::<()>(a).unwrap();
+        cleanup(world);
     }
 
     #[test]
     fn bad_insert() {
         let mut world = World::new();
         assert!(world.insert_one(Entity::DANGLING, ()).is_err());
+        cleanup(world);
     }
 }

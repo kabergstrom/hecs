@@ -264,11 +264,11 @@ unsafe impl<'a, L: Fetch<'a>, R: Fetch<'a>> Fetch<'a> for FetchOr<L, R> {
 ///
 /// # Example
 /// ```
-/// # use hecs::ergo::*;
-/// let mut world = World::new();
-/// let a = world.spawn((123, true, "abc"));
+/// # use hecs::gc::*;
+/// let mut world = hecs::World::new();
+/// let a = world.spawn((123, true, "abc".to_string()));
 /// let b = world.spawn((456, false));
-/// let c = world.spawn((42, "def"));
+/// let c = world.spawn((42, "def".to_string()));
 /// let ergo = GCWorld::new(&mut world);
 /// let entities = ergo.query::<Without<&i32, &bool>>()
 ///     .iter()
@@ -315,11 +315,11 @@ unsafe impl<'a, F: Fetch<'a>, G: Fetch<'a>> Fetch<'a> for FetchWithout<F, G> {
 ///
 /// # Example
 /// ```
-/// # use hecs::ergo::*;
-/// let mut world = World::new();
-/// let a = world.spawn((123, true, "abc"));
+/// # use hecs::gc::*;
+/// let mut world = hecs::World::new();
+/// let a = world.spawn((123, true, "abc".to_string()));
 /// let b = world.spawn((456, false));
-/// let c = world.spawn((42, "def"));
+/// let c = world.spawn((42, "def".to_string()));
 /// let ergo = GCWorld::new(&mut world);
 /// let entities = ergo.query::<With<&i32, &bool>>()
 ///     .iter()
@@ -366,11 +366,11 @@ unsafe impl<'a, F: Fetch<'a>, G: Fetch<'a>> Fetch<'a> for FetchWith<F, G> {
 ///
 /// # Example
 /// ```
-/// # use hecs::ergo::*;
-/// let mut world = World::new();
-/// let a = world.spawn((123, true, "abc"));
+/// # use hecs::gc::*;
+/// let mut world = hecs::World::new();
+/// let a = world.spawn((123, true, "abc".to_string()));
 /// let b = world.spawn((456, false));
-/// let c = world.spawn((42, "def"));
+/// let c = world.spawn((42, "def".to_string()));
 /// let ergo = GCWorld::new(&mut world);
 /// let entities = ergo.query::<Satisfies<&bool>>()
 ///     .iter()
@@ -444,11 +444,11 @@ impl<'w, Q: Query> QueryBorrow<'w, Q> {
     ///
     /// # Example
     /// ```
-    /// # use hecs::ergo::*;
-    /// let mut world = World::new();
-    /// let a = world.spawn((123, true, "abc"));
+    /// # use hecs::gc::*;
+    /// let mut world = hecs::World::new();
+    /// let a = world.spawn((123, true, "abc".to_string()));
     /// let b = world.spawn((456, false));
-    /// let c = world.spawn((42, "def"));
+    /// let c = world.spawn((42, "def".to_string()));
     /// let ergo = GCWorld::new(&mut world);
     /// let entities = ergo.query::<&i32>()
     ///     .with::<&bool>()
@@ -468,11 +468,11 @@ impl<'w, Q: Query> QueryBorrow<'w, Q> {
     ///
     /// # Example
     /// ```
-    /// # use hecs::ergo::*;
-    /// let mut world = World::new();
-    /// let a = world.spawn((123, true, "abc"));
+    /// # use hecs::gc::*;
+    /// let mut world = hecs::World::new();
+    /// let a = world.spawn((123, true, "abc".to_string()));
     /// let b = world.spawn((456, false));
-    /// let c = world.spawn((42, "def"));
+    /// let c = world.spawn((42, "def".to_string()));
     /// let ergo = GCWorld::new(&mut world);
     /// let entities = ergo.query::<&i32>()
     ///     .without::<&bool>()
@@ -549,7 +549,7 @@ impl<'q, Q: Query> Iterator for QueryIter<'q, Q> {
                         entities: archetype.entities(),
                         fetch,
                         position: 0,
-                        len: archetype.len_sync() as usize,
+                        len: archetype.allocated_values_sync() as usize,
                     });
                     continue;
                 }
@@ -652,21 +652,24 @@ mod tests {
         let e1 = world.spawn((5i32, 1.5f32));
         let e2 = world.spawn((6i32, 2.5f32));
         assert!(world.len() == 2);
-        let ergo_scope = GCWorld::new(&mut world);
-        let entities = ergo_scope
-            .query::<(&i32, &f32)>()
-            .iter()
-            .map(|(e, (i, b))| (e, i, b)) // Copy out of the world
-            .collect::<Vec<_>>();
-        assert!(entities.len() == 2);
+        {
+            let ergo_scope = GCWorld::new(&mut world);
+            let entities = ergo_scope
+                .query::<(&i32, &f32)>()
+                .iter()
+                .map(|(e, (i, b))| (e, i, b)) // Copy out of the world
+                .collect::<Vec<_>>();
+            assert!(entities.len() == 2);
 
-        assert_eq!(entities[0].0, e1);
-        assert_eq!(*entities[0].1.read(), 5i32);
-        assert_eq!(*entities[0].2.read(), 1.5f32);
+            assert_eq!(entities[0].0, e1);
+            assert_eq!(*entities[0].1.read(), 5i32);
+            assert_eq!(*entities[0].2.read(), 1.5f32);
 
-        assert_eq!(entities[1].0, e2);
-        assert_eq!(*entities[1].1.read(), 6i32);
-        assert_eq!(*entities[1].2.read(), 2.5f32);
+            assert_eq!(entities[1].0, e2);
+            assert_eq!(*entities[1].1.read(), 6i32);
+            assert_eq!(*entities[1].2.read(), 2.5f32);
+        }
+        crate::world::tests::cleanup(world);
     }
 
     // #[test]

@@ -3,7 +3,7 @@ mod gc_world;
 pub mod kvec;
 
 pub mod cells;
-mod query;
+pub mod query;
 use core::{
     any::{Any, TypeId},
     cell::Cell,
@@ -14,6 +14,7 @@ use core::{
     sync::atomic::{AtomicBool, Ordering},
 };
 pub use gc_world::GCWorld;
+pub use query::*;
 
 use alloc::boxed::Box;
 use alloc::vec::Vec;
@@ -50,15 +51,36 @@ impl GCPtr {
             )
         }
     }
-    pub fn world_slot(&self) -> NonZeroU32 {
+    pub(crate) fn storage_header(&self) -> *const StorageHeader {
         let storage_header_addr = self.value.as_ptr() as usize;
         let diff = storage_header_addr % DATA_CHUNK_SIZE_BYTES;
-        let storage_header = self
-            .value
+        self.value
             .as_ptr()
             .wrapping_sub(diff)
-            .cast::<StorageHeader>();
-        unsafe { (&*storage_header).world_slot }
+            .cast::<StorageHeader>()
+    }
+    pub fn world_slot(&self) -> NonZeroU32 {
+        unsafe { (&*self.storage_header()).world_slot }
+    }
+    pub fn archetype_slot(&self) -> u32 {
+        let storage_header_ptr = self.storage_header();
+        let storage_header = unsafe { &*storage_header_ptr };
+        let entities_per_chunk =
+            (DATA_CHUNK_SIZE_BYTES - storage_header.data_start) / storage_header.stride;
+        let chunk_slot_start = storage_header.chunk_idx * entities_per_chunk;
+        let byte_diff = unsafe {
+            let chunk_data_start = storage_header_ptr
+                .cast::<u8>()
+                .add(storage_header.data_start);
+            self.header_ptr()
+                .as_ptr()
+                .cast::<u8>()
+                .offset_from(chunk_data_start)
+        };
+        debug_assert!(
+            byte_diff >= 0 && byte_diff as usize / storage_header.stride < entities_per_chunk
+        );
+        (chunk_slot_start + (byte_diff as usize / storage_header.stride)) as u32
     }
     pub fn value_ptr(&self) -> NonNull<u8> {
         self.value
@@ -106,7 +128,7 @@ impl GCPtr {
     }
     pub unsafe fn move_from_value(&mut self, ty: &TypeInfo, value: *mut u8) {
         let dst_header = self.header_ptr().as_ptr();
-        assert!(dst_header.read().state == State::Free);
+        assert!(matches!(dst_header.read().state, State::Free { .. }));
         dst_header.write(GCHeader::new_alive());
         core::ptr::copy_nonoverlapping(value, self.value_ptr().as_ptr(), ty.value_layout().size());
     }
@@ -114,7 +136,7 @@ impl GCPtr {
     pub(crate) unsafe fn move_from(&mut self, ty: &TypeInfo, src: GCPtr) {
         assert!(src != *self);
         let dst_header = self.header_ptr().as_mut();
-        assert!(dst_header.state == State::Free);
+        assert!(matches!(dst_header.state, State::Free { .. }));
         let src_header = src.header_ptr().as_mut();
         // Need source to be alive with no active borrows
         assert!(
@@ -141,13 +163,22 @@ impl GCPtr {
         }
         ptr
     }
+
+    fn can_free(&self) -> bool {
+        let header = unsafe { &*self.header_ptr().as_ptr() };
+        match header.state {
+            State::Dead => !header.referenced,
+            State::Moved { .. } => !header.referenced,
+            State::Free { .. } | State::Alive { .. } => false,
+        }
+    }
 }
 
 #[derive(PartialEq, Debug)]
 #[repr(u8)]
 pub(crate) enum State {
     /// Slot is free and available for use
-    Free,
+    Free { next_free: Option<GCPtr> },
     /// Slot has been moved elsewhere.
     Moved { new_ptr: GCPtr },
     /// Slot contains a valid value
@@ -157,7 +188,7 @@ pub(crate) enum State {
 }
 impl Default for State {
     fn default() -> Self {
-        Self::Free
+        Self::Free { next_free: None }
     }
 }
 // GCHeader is stored tightly packed before the value in memory.
@@ -359,48 +390,44 @@ pub unsafe fn trace(type_registry: &TypeRegistry, world: &mut World, entity_root
                     }
                 }
             }
-            State::Free => assert!(false, "Pointer to freed memory"),
+            State::Free { .. } => assert!(false, "Pointer to freed memory"),
             State::Dead => {}
         }
     }
 
-    for archetype in world.archetypes() {
+    let mut archetype_iter_set = Vec::new();
+    for archetype in world.archetypes_mut() {
+        archetype_iter_set.clear();
+        // prepare iterators for each storage
         for (idx, _) in archetype.types().iter().enumerate() {
             let storage = archetype.get_data_storage(idx);
-            let mut chunk_idx = 0;
-            let entities_per_chunk = storage.entities_per_chunk();
-            let data_start = storage.data_start();
-            let value_start = storage.value_start();
-            let stride = storage.stride();
-            if let Some(mut curr_chunk) = storage.chunks().get(chunk_idx) {
-                let mut value_idx = 0;
-                for _ in 0..archetype.len_sync() {
-                    if value_idx >= entities_per_chunk {
-                        chunk_idx += 1;
-                        curr_chunk = &storage.chunks()[chunk_idx];
-                        value_idx = 0;
-                    }
-                    let ptr = GCPtr::from_base_with_offset(
-                        value_start,
-                        NonNull::new_unchecked(curr_chunk.add(data_start + stride * value_idx)),
-                    );
-                    let gc_header = ptr.header_ptr().as_mut();
-                    match gc_header.state {
-                        State::Dead => {
-                            gc_header.state = State::Free;
-                        }
-                        State::Free => {}
-                        State::Moved { .. } => {
-                            if !gc_header.referenced {
-                                gc_header.state = State::Free;
-                            }
-                        }
-                        State::Alive { .. } => {}
-                    }
-                    if gc_header.referenced {
-                        gc_header.referenced = false;
-                    }
-                    value_idx += 1;
+            archetype_iter_set.push(
+                storage
+                    .iter_gc_ptr(archetype.allocated_values_nonsync())
+                    .into_iter(),
+            );
+        }
+        // check each slot for whether it can be freed or not, by checking each component
+        for slot in 0..archetype.allocated_values_nonsync() {
+            let mut can_free = true;
+            for iter in &mut archetype_iter_set {
+                let gc_ptr = iter.next().unwrap();
+                can_free &= gc_ptr.can_free();
+            }
+            if can_free {
+                archetype.free_slot(slot);
+            }
+        }
+        // reset referenced flag
+        for (idx, _) in archetype.types().iter().enumerate() {
+            let storage = archetype.get_data_storage(idx);
+            for ptr in storage
+                .iter_gc_ptr(archetype.allocated_values_nonsync())
+                .into_iter()
+            {
+                let header = unsafe { &mut *ptr.header_ptr().as_ptr() };
+                if header.referenced {
+                    header.referenced = false;
                 }
             }
         }
