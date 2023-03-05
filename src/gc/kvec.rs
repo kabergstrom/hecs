@@ -28,6 +28,8 @@ struct AllocHeader {
 
 #[doc(hidden)]
 impl<T> SizedTypeProperties for T {}
+unsafe impl<T: Clone> Send for KVec<T> {}
+unsafe impl<T: Clone> Sync for KVec<T> {}
 pub struct KVec<T: Clone> {
     ptr: PtrCell<u8>,
     data_start: usize,

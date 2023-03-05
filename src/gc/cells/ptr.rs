@@ -5,6 +5,8 @@ use core::{
 
 #[repr(transparent)]
 pub struct PtrCell<T>(UnsafeCell<*mut T>);
+unsafe impl<T> Sync for PtrCell<T> {}
+unsafe impl<T> Send for PtrCell<T> {}
 
 impl<T> PtrCell<T> {
     pub fn new(val: *mut T) -> Self {

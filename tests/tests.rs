@@ -983,3 +983,29 @@ fn empty_archetype_conflict() {
     }
     cleanup(world);
 }
+
+#[test]
+fn send_world() {
+    let mut world = World::new();
+    std::thread::spawn(move || {
+        world.spawn((42, true));
+    });
+}
+
+#[test]
+fn sync_world() {
+    let mut world = World::new();
+    let a = world.spawn((42, true));
+    let world = std::sync::Arc::new(world);
+    let thread_world = world.clone();
+    std::thread::spawn(move || {
+        assert_eq!(
+            thread_world.query_one::<(&i32, &bool)>(a).unwrap().get(),
+            Some((&42, &true))
+        );
+    });
+    assert_eq!(
+        world.query_one::<(&i32, &bool)>(a).unwrap().get(),
+        Some((&42, &true))
+    );
+}

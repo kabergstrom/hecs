@@ -6,6 +6,8 @@ use core::{
 #[repr(transparent)]
 #[derive(Default)]
 pub struct U32Cell(UnsafeCell<u32>);
+unsafe impl Sync for U32Cell {}
+unsafe impl Send for U32Cell {}
 
 impl U32Cell {
     pub fn new(val: u32) -> Self {

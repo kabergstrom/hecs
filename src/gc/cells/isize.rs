@@ -6,6 +6,8 @@ use core::{
 #[repr(transparent)]
 #[derive(Default)]
 pub struct IsizeCell(UnsafeCell<isize>);
+unsafe impl Sync for IsizeCell {}
+unsafe impl Send for IsizeCell {}
 
 impl IsizeCell {
     pub fn new(val: isize) -> Self {

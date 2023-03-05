@@ -8,7 +8,7 @@
 use crate::alloc::alloc::{alloc, dealloc, Layout};
 use crate::alloc::boxed::Box;
 use crate::alloc::{vec, vec::Vec};
-use crate::gc::cells::U32Cell;
+use crate::gc::cells::{PtrCell, U32Cell};
 use crate::gc::kvec::KVec;
 use crate::gc::{GCHeader, GCPtr, TraversalCommand, GC};
 use core::any::{type_name, TypeId};
@@ -42,7 +42,7 @@ pub struct Archetype {
     entities: KVec<U32Cell>,
     /// One allocation per type, in the same order as `types`
     data: Box<[Data]>,
-    first_free: Cell<Option<GCPtr>>,
+    first_free: PtrCell<u8>,
 }
 
 impl Archetype {
@@ -103,7 +103,7 @@ impl Archetype {
                 })
                 .collect(),
             types,
-            first_free: Cell::new(None),
+            first_free: PtrCell::new(null_mut()),
         }
     }
 
@@ -266,25 +266,31 @@ impl Archetype {
     /// Every type must be written immediately after this call
     /// This cannot be called from multiple threads concurrently
     pub(crate) unsafe fn allocate_nonsync(&self, id: u32, world_slot: NonZeroU32) -> u32 {
-        let new_slot = if let Some(free_value) = self.first_free.get() {
-            let gc_header = unsafe { &mut *free_value.header_ptr().as_ptr() };
-            let crate::gc::State::Free { next_free } = gc_header.state else {
-                panic!("value in free list but state is not free")
+        let free_ptr = self.first_free.read_nonsync();
+        let new_slot =
+            if let Some(free_value) = NonNull::new(free_ptr).map(|ptr| GCPtr { value: ptr }) {
+                let gc_header = unsafe { &mut *free_value.header_ptr().as_ptr() };
+                let crate::gc::State::Free { next_free } = gc_header.state else {
+                    panic!("value in free list but state is not free")
+                };
+                gc_header.state = crate::gc::State::Free { next_free: None };
+                self.first_free.write_nonsync(
+                    next_free
+                        .map(|ptr| ptr.value.as_ptr())
+                        .unwrap_or(null_mut()),
+                );
+                let current_num_free = self.num_free.read_nonsync();
+                self.num_free.write_nonsync(current_num_free - 1);
+                let new_slot = free_value.archetype_slot();
+                new_slot
+            } else {
+                let new_slot = self.len.read_nonsync();
+                self.len.write_nonsync(new_slot + 1);
+                if new_slot as usize >= self.entities.len_nonsync() {
+                    self.grow_nonsync(64, world_slot);
+                }
+                new_slot
             };
-            gc_header.state = crate::gc::State::Free { next_free: None };
-            self.first_free.set(next_free);
-            let current_num_free = self.num_free.read_nonsync();
-            self.num_free.write_nonsync(current_num_free - 1);
-            let new_slot = free_value.archetype_slot();
-            new_slot
-        } else {
-            let new_slot = self.len.read_nonsync();
-            self.len.write_nonsync(new_slot + 1);
-            if new_slot as usize >= self.entities.len_nonsync() {
-                self.grow_nonsync(64, world_slot);
-            }
-            new_slot
-        };
         self.entities[new_slot as usize].write_nonsync(id);
         new_slot
     }
@@ -457,20 +463,24 @@ impl Archetype {
             current_num_free + 1
         );
 
-        let current_free_head = self.first_free.get();
+        let current_free_head = self.first_free.read_nonsync();
         let mut new_free_head = None;
         for (idx, storage) in self.data.iter().enumerate() {
             let slot_ptr = storage.get_gc_ptr(slot);
             if idx == 0 {
                 slot_ptr.header_ptr().as_mut().state = crate::gc::State::Free {
-                    next_free: current_free_head,
+                    next_free: NonNull::new(current_free_head).map(|ptr| GCPtr { value: ptr }),
                 };
                 new_free_head = Some(slot_ptr);
             } else {
                 slot_ptr.header_ptr().as_mut().state = crate::gc::State::Free { next_free: None };
             }
         }
-        self.first_free.set(new_free_head);
+        self.first_free.write_nonsync(
+            new_free_head
+                .map(|ptr| ptr.value.as_ptr())
+                .unwrap_or(null_mut()),
+        );
     }
 
     // /// Raw IDs of the entities in this archetype
