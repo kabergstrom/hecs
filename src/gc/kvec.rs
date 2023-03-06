@@ -48,9 +48,14 @@ impl<T: Clone> Drop for KVec<T> {
         self.clean_old_allocs();
         let current_alloc = self.ptr.read();
         if !current_alloc.is_null() {
-            let header = unsafe { &*current_alloc.cast::<AllocHeader>() };
+            let header = unsafe { &mut *current_alloc.cast::<AllocHeader>() };
+            let len = header.written.read();
+            let data_ptr = unsafe { current_alloc.add(self.data_start) };
             let (layout, _) = Self::get_layout(header.cap);
-            unsafe { alloc::alloc::dealloc(current_alloc, layout) };
+            unsafe {
+                core::ptr::drop_in_place(core::slice::from_raw_parts_mut(data_ptr, len));
+                alloc::alloc::dealloc(current_alloc, layout)
+            };
         }
     }
 }
@@ -531,9 +536,14 @@ impl<T: Clone> KVec<T> {
     pub fn clean_old_allocs(&mut self) {
         let old_allocs = self.old_allocs.get_mut().expect("lock poisoned");
         for ptr in old_allocs.drain(0..old_allocs.len()) {
-            let header = unsafe { &*ptr.cast::<AllocHeader>() };
+            let header = unsafe { &mut *ptr.cast::<AllocHeader>() };
+            let len = header.written.read();
+            let data_ptr = unsafe { ptr.add(self.data_start) };
             let (layout, _) = Self::get_layout(header.cap);
-            unsafe { alloc::alloc::dealloc(ptr, layout) };
+            unsafe {
+                core::ptr::drop_in_place(core::slice::from_raw_parts_mut(data_ptr, len));
+                alloc::alloc::dealloc(ptr, layout)
+            };
         }
     }
 

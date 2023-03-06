@@ -6,6 +6,7 @@
 // copied, modified, or distributed except according to those terms.
 
 use crate::alloc::{vec, vec::Vec};
+use crate::gc::cells::PtrCell;
 use crate::gc::{alloc_world_slot, free_world_slot};
 use bevy_reflect::Reflect;
 use core::any::TypeId;
@@ -1198,7 +1199,7 @@ impl Drop for SpawnColumnBatchIter<'_> {
 
 struct ArchetypeSet {
     /// Maps sorted component type sets to archetypes
-    index: HashMap<Box<[TypeId]>, u32>,
+    index: PtrCell<HashMap<Box<[TypeId]>, u32>>,
     archetypes: Vec<Archetype>,
 }
 
@@ -1206,7 +1207,9 @@ impl ArchetypeSet {
     fn new() -> Self {
         // `flush` assumes archetype 0 always exists, representing entities with no components.
         Self {
-            index: Some((Box::default(), 0)).into_iter().collect(),
+            index: PtrCell::new(Box::into_raw(Box::new(
+                Some((Box::default(), 0)).into_iter().collect(),
+            ))),
             archetypes: vec![Archetype::new(Vec::new())],
         }
     }
@@ -1217,7 +1220,7 @@ impl ArchetypeSet {
         components: T,
         info: impl FnOnce() -> Vec<TypeInfo>,
     ) -> u32 {
-        self.index
+        unsafe { &*self.index.read() }
             .get(components.borrow())
             .copied()
             .unwrap_or_else(|| self.insert(components.into(), info()))
@@ -1226,7 +1229,8 @@ impl ArchetypeSet {
     fn insert(&mut self, components: Box<[TypeId]>, info: Vec<TypeInfo>) -> u32 {
         let x = self.archetypes.len() as u32;
         self.archetypes.push(Archetype::new(info));
-        let old = self.index.insert(components, x);
+        let index = unsafe { &mut *self.index.read() };
+        let old = index.insert(components, x);
         debug_assert!(old.is_none(), "inserted duplicate archetype");
         x
     }
@@ -1239,7 +1243,8 @@ impl ArchetypeSet {
             .map(|info| info.id())
             .collect::<Box<_>>();
 
-        match self.index.entry(ids) {
+        let index = unsafe { &mut *self.index.read() };
+        match index.entry(ids) {
             Entry::Occupied(x) => {
                 // Duplicate of existing archetype
                 let existing = &mut self.archetypes[*x.get() as usize];

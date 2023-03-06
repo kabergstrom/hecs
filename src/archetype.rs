@@ -91,6 +91,8 @@ impl Archetype {
                         state: AtomicBorrow::new(),
                         stride: ty.gc_layout().size(),
                         value_start: ty.data_start(),
+                        entities_per_chunk: (DATA_CHUNK_SIZE_BYTES - header_layout.size())
+                            / ty.gc_layout.size(),
                         storage: KVec::new(),
                         header_layout,
                         data_start: header_layout.size(),
@@ -254,7 +256,7 @@ impl Archetype {
 
     pub(crate) unsafe fn get_dynamic(&self, ty: &TypeInfo, index: u32) -> Option<GCPtr> {
         debug_assert!(index < self.len.read_nonsync());
-        debug_assert!(self.entities[index as usize].load_atomic(Ordering::Acquire) != u32::MAX);
+        debug_assert!(self.entities[index as usize].read_nonsync() != u32::MAX);
         let ptr = self
             .data
             .get_unchecked(*self.index.get(&ty.id())?)
@@ -320,7 +322,7 @@ impl Archetype {
 
         for (info, data) in self.types.iter().zip(&*self.data) {
             if info.value_layout.size() != 0 {
-                let entities_per_chunk = data.entities_per_chunk();
+                let entities_per_chunk = data.entities_per_chunk;
                 let num_chunks_required = new_cap / entities_per_chunk + 1;
                 let new_chunks = num_chunks_required.saturating_sub(data.storage.len());
                 for _ in 0..new_chunks {
@@ -508,6 +510,7 @@ impl Drop for Archetype {
                         ptr.header_ptr().as_ref().state,
                         crate::gc::State::Free { .. }
                     );
+                    #[cfg(debug_assertions)]
                     if !is_free {
                         if !std::thread::panicking() {
                             std::eprintln!(
@@ -553,6 +556,7 @@ pub(crate) struct Data {
     stride: usize,
     value_start: usize,
     data_start: usize,
+    entities_per_chunk: usize,
 }
 
 impl Data {
@@ -568,25 +572,30 @@ impl Data {
             stride: self.stride,
         }
     }
+    #[inline(always)]
     pub(crate) fn chunks(&self) -> &[*mut u8] {
         &self.storage
     }
+    #[inline(always)]
     pub(crate) fn stride(&self) -> usize {
         self.stride
     }
-    pub(crate) fn entities_per_chunk(&self) -> usize {
-        (DATA_CHUNK_SIZE_BYTES - self.data_start) / self.stride
-    }
+    #[inline(always)]
     pub(crate) fn value_start(&self) -> usize {
         self.value_start
     }
+    #[inline(always)]
     pub(crate) fn data_start(&self) -> usize {
         self.data_start
+    }
+    #[inline(always)]
+    pub(crate) fn entities_per_chunk(&self) -> usize {
+        self.entities_per_chunk
     }
 
     pub(crate) fn get_gc_ptr(&self, idx: u32) -> GCPtr {
         let idx = idx as usize;
-        let entities_per_chunk = self.entities_per_chunk();
+        let entities_per_chunk = self.entities_per_chunk;
         let chunk_idx = idx / entities_per_chunk;
         let value_idx = idx % entities_per_chunk;
         unsafe {
@@ -599,14 +608,15 @@ impl Data {
         }
     }
 
-    pub(crate) fn get_value(&self, idx: u32) -> NonNull<u8> {
+    pub(crate) unsafe fn get_value(&self, idx: u32) -> NonNull<u8> {
         let idx = idx as usize;
-        let entities_per_chunk = self.entities_per_chunk();
+        let entities_per_chunk = self.entities_per_chunk;
         let chunk_idx = idx / entities_per_chunk;
         let value_idx = idx % entities_per_chunk;
         unsafe {
             NonNull::new_unchecked(
-                self.storage[chunk_idx]
+                self.storage
+                    .get_unchecked(chunk_idx)
                     .add(self.data_start + value_idx * self.stride + self.value_start),
             )
         }
@@ -618,7 +628,7 @@ impl Data {
     ) -> impl IntoIterator<Item = GCPtr> + 'a {
         DataGCPtrIterator {
             storage: self,
-            entities_per_chunk: self.entities_per_chunk(),
+            entities_per_chunk: self.entities_per_chunk,
             data_start: self.data_start,
             value_start: self.value_start,
             stride: self.stride,

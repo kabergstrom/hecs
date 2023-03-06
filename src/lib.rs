@@ -74,6 +74,7 @@ mod world;
 
 pub use archetype::Archetype;
 pub use batch::{BatchIncomplete, BatchWriter, ColumnBatch, ColumnBatchBuilder, ColumnBatchType};
+pub use bevy_reflect;
 pub use bundle::{Bundle, DynamicBundle, DynamicBundleClone, MissingComponent};
 pub use command_buffer::CommandBuffer;
 pub use entities::{Entity, NoSuchEntity};

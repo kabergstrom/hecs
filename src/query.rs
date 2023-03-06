@@ -6,8 +6,10 @@
 // copied, modified, or distributed except according to those terms.
 
 use core::any::TypeId;
+use core::cell::Cell;
 use core::marker::PhantomData;
 use core::mem;
+use core::ops::Range;
 use core::ptr::NonNull;
 use core::slice::Iter as SliceIter;
 
@@ -89,8 +91,21 @@ impl<'a, T: Component> Query for &'a T {
 
 unsafe impl<'a, T> QueryShared for &'a T {}
 
+#[derive(Copy, Clone)]
+struct CachedChunk {
+    ptr: NonNull<u8>,
+    slot_range_start: usize,
+}
+
 #[doc(hidden)]
-pub struct FetchRead<T>(NonNull<Data>, PhantomData<T>);
+pub struct FetchRead<T> {
+    chunks: *const *mut u8,
+    current_chunk: Cell<CachedChunk>,
+    stride: usize,
+    chunk_start_offset: usize,
+    entities_per_chunk: usize,
+    _marker: PhantomData<T>,
+}
 
 unsafe impl<'a, T: Component> Fetch<'a> for FetchRead<T> {
     type Item = &'a T;
@@ -98,7 +113,17 @@ unsafe impl<'a, T: Component> Fetch<'a> for FetchRead<T> {
     type State = usize;
 
     fn dangling() -> Self {
-        Self(NonNull::<Data>::dangling(), PhantomData::default())
+        Self {
+            chunks: core::ptr::null(),
+            current_chunk: Cell::new(CachedChunk {
+                ptr: NonNull::dangling(),
+                slot_range_start: 0,
+            }),
+            entities_per_chunk: 0,
+            chunk_start_offset: 0,
+            stride: 0,
+            _marker: PhantomData::default(),
+        }
     }
 
     fn access(archetype: &Archetype) -> Option<Access> {
@@ -116,12 +141,28 @@ unsafe impl<'a, T: Component> Fetch<'a> for FetchRead<T> {
         archetype.get_state::<T>()
     }
     fn execute(archetype: &'a Archetype, state: Self::State) -> Self {
-        Self(
-            unsafe {
-                NonNull::new_unchecked(archetype.get_data_storage(state) as *const Data as *mut Data)
-            },
-            PhantomData::default(),
-        )
+        unsafe {
+            let storage = archetype.get_data_storage(state);
+            let chunk = if storage.chunks().is_empty() {
+                NonNull::dangling()
+            } else {
+                NonNull::new_unchecked(
+                    storage.chunks()[0].add(storage.data_start() + storage.value_start()),
+                )
+            };
+            assert!(storage.entities_per_chunk() > 0);
+            Self {
+                chunks: storage.chunks().as_ptr(),
+                current_chunk: Cell::new(CachedChunk {
+                    ptr: chunk,
+                    slot_range_start: 0,
+                }),
+                entities_per_chunk: storage.entities_per_chunk(),
+                chunk_start_offset: storage.data_start() + storage.value_start(),
+                stride: storage.stride(),
+                _marker: PhantomData::default(),
+            }
+        }
     }
     fn release(archetype: &Archetype, state: Self::State) {
         archetype.release::<T>(state);
@@ -132,27 +173,28 @@ unsafe impl<'a, T: Component> Fetch<'a> for FetchRead<T> {
     }
 
     unsafe fn get(&self, n: usize) -> Self::Item {
-        assert!(
-            matches!(
-                self.0
-                    .as_ref()
-                    .get_gc_ptr(n as u32)
-                    .header_ptr()
-                    .as_ref()
-                    .state,
-                crate::gc::State::Alive { .. }
-            ),
-            "index {} state was {:?} ptr {:?}",
-            n,
-            self.0
-                .as_ref()
-                .get_gc_ptr(n as u32)
-                .header_ptr()
-                .as_ref()
-                .state,
-            self.0.as_ref().get_value(n as u32)
-        );
-        self.0.as_ref().get_value(n as u32).cast().as_ref()
+        let mut chunk = self.current_chunk.get();
+        #[cold]
+        unsafe fn change_chunk<T>(
+            this: &FetchRead<T>,
+            mut chunk: CachedChunk,
+            n: usize,
+        ) -> CachedChunk {
+            let chunk_idx = n / this.entities_per_chunk;
+            chunk.ptr =
+                NonNull::new_unchecked((*this.chunks.add(chunk_idx)).add(this.chunk_start_offset));
+            chunk.slot_range_start = chunk_idx * this.entities_per_chunk;
+            this.current_chunk.set(chunk);
+            chunk
+        }
+        if n < chunk.slot_range_start || n >= chunk.slot_range_start + self.entities_per_chunk {
+            chunk = change_chunk(self, chunk, n);
+        }
+        return &*chunk
+            .ptr
+            .as_ptr()
+            .add(self.stride * (n - chunk.slot_range_start))
+            .cast::<T>();
     }
 }
 
@@ -161,7 +203,14 @@ impl<'a, T: Component> Query for &'a mut T {
 }
 
 #[doc(hidden)]
-pub struct FetchWrite<T>(NonNull<Data>, PhantomData<T>);
+pub struct FetchWrite<T> {
+    chunks: *const *mut u8,
+    current_chunk: Cell<CachedChunk>,
+    stride: usize,
+    chunk_start_offset: usize,
+    entities_per_chunk: usize,
+    _marker: PhantomData<T>,
+}
 
 unsafe impl<'a, T: Component> Fetch<'a> for FetchWrite<T> {
     type Item = &'a mut T;
@@ -169,7 +218,17 @@ unsafe impl<'a, T: Component> Fetch<'a> for FetchWrite<T> {
     type State = usize;
 
     fn dangling() -> Self {
-        Self(NonNull::<Data>::dangling(), PhantomData::default())
+        Self {
+            chunks: core::ptr::null(),
+            current_chunk: Cell::new(CachedChunk {
+                ptr: NonNull::dangling(),
+                slot_range_start: 0,
+            }),
+            entities_per_chunk: 0,
+            chunk_start_offset: 0,
+            stride: 0,
+            _marker: PhantomData::default(),
+        }
     }
 
     fn access(archetype: &Archetype) -> Option<Access> {
@@ -188,12 +247,28 @@ unsafe impl<'a, T: Component> Fetch<'a> for FetchWrite<T> {
         Some(archetype.get_state::<T>()?)
     }
     fn execute(archetype: &'a Archetype, state: Self::State) -> Self {
-        Self(
-            unsafe {
-                NonNull::new_unchecked(archetype.get_data_storage(state) as *const Data as *mut Data)
-            },
-            PhantomData::default(),
-        )
+        unsafe {
+            let storage = archetype.get_data_storage(state);
+            let chunk = if storage.chunks().is_empty() {
+                NonNull::dangling()
+            } else {
+                NonNull::new_unchecked(
+                    storage.chunks()[0].add(storage.data_start() + storage.value_start()),
+                )
+            };
+            assert!(storage.entities_per_chunk() > 0);
+            Self {
+                chunks: storage.chunks().as_ptr(),
+                current_chunk: Cell::new(CachedChunk {
+                    ptr: chunk,
+                    slot_range_start: 0,
+                }),
+                entities_per_chunk: storage.entities_per_chunk(),
+                chunk_start_offset: storage.data_start() + storage.value_start(),
+                stride: storage.stride(),
+                _marker: PhantomData::default(),
+            }
+        }
     }
     fn release(archetype: &Archetype, state: Self::State) {
         archetype.release_mut::<T>(state);
@@ -204,7 +279,28 @@ unsafe impl<'a, T: Component> Fetch<'a> for FetchWrite<T> {
     }
 
     unsafe fn get(&self, n: usize) -> Self::Item {
-        self.0.as_ref().get_value(n as u32).cast().as_mut()
+        let mut chunk = self.current_chunk.get();
+        #[cold]
+        unsafe fn change_chunk<T>(
+            this: &FetchWrite<T>,
+            mut chunk: CachedChunk,
+            n: usize,
+        ) -> CachedChunk {
+            let chunk_idx = n / this.entities_per_chunk;
+            chunk.ptr =
+                NonNull::new_unchecked((*this.chunks.add(chunk_idx)).add(this.chunk_start_offset));
+            chunk.slot_range_start = chunk_idx * this.entities_per_chunk;
+            this.current_chunk.set(chunk);
+            chunk
+        }
+        if n < chunk.slot_range_start || n >= chunk.slot_range_start + self.entities_per_chunk {
+            chunk = change_chunk(self, chunk, n);
+        }
+        return &mut *chunk
+            .ptr
+            .as_ptr()
+            .add(self.stride * (n - chunk.slot_range_start))
+            .cast::<T>();
     }
 }
 

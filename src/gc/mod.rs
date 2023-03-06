@@ -26,7 +26,7 @@ use crate::{
     Component, Entity, TypeInfo, World,
 };
 
-use self::borrow::{BorrowFlag, BorrowRef, Ref};
+use self::borrow::{BorrowFlag, BorrowRef, Ref, RefMut};
 
 #[derive(Debug, PartialEq, Eq, Clone, Copy, Hash)]
 #[repr(transparent)]
@@ -112,7 +112,6 @@ impl GCPtr {
         f(self.value_ptr().as_ptr(), ty.clone());
         self.header_ptr().as_mut().set_tombstone();
     }
-    #[inline(always)]
     pub unsafe fn mark_referenced(&mut self) {
         self.header_ptr().as_mut().referenced = true;
     }
@@ -258,6 +257,18 @@ impl<T: Component> CRef<T> {
                 borrow,
                 value: ptr.value_ptr().cast(),
             }
+        } else {
+            panic!("Borrowing a deleted component")
+        }
+    }
+
+    pub fn write(&self) -> RefMut<'_, T> {
+        let slot = self.ptr.world_slot();
+        assert!(is_gc_borrows_enabled(slot), "gc borrows not enabled");
+        let ptr = self.ptr.resolve_moved();
+        if let State::Alive { borrow } = unsafe { &ptr.header_ptr().as_ref().state } {
+            let borrow = BorrowRef::new(&borrow).expect("already mutable borrowed");
+            todo!()
         } else {
             panic!("Borrowing a deleted component")
         }

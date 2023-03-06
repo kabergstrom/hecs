@@ -27,6 +27,7 @@ macros = ["hecs-macros", "lazy_static"]
 column-serialize = ["serde"]
 # Enables the serialize::row module
 row-serialize = ["serde"]
+glam = ["bevy_reflect/glam"]
 
 [dependencies]
 hecs-macros = { path = "macros", version = "0.8.2", optional = true }
