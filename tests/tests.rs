@@ -21,7 +21,7 @@ fn registry() -> TypeRegistry {
 
 fn cleanup(mut world: World) {
     world.clear();
-    unsafe { hecs::gc_trace(&registry(), &mut world, []) };
+    unsafe { hecs::gc_trace(&registry(), &mut world, [], []) };
 }
 
 #[test]
@@ -977,7 +977,7 @@ fn empty_archetype_conflict() {
     let _ = world.spawn((17, "abc".to_string()));
     let e = world.spawn((12, false, "def".to_string()));
     world.despawn(e).unwrap();
-    unsafe { hecs::gc_trace(&registry(), &mut world, []) };
+    unsafe { hecs::gc_trace(&registry(), &mut world, [], []) };
     for _ in world.query::<(&mut i32, &String)>().iter() {
         for _ in world.query::<(&mut i32, &bool)>().iter() {}
     }

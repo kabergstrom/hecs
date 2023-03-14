@@ -593,19 +593,19 @@ impl Data {
         self.entities_per_chunk
     }
 
-    pub(crate) fn get_gc_ptr(&self, idx: u32) -> GCPtr {
+    pub(crate) unsafe fn get_gc_ptr(&self, idx: u32) -> GCPtr {
         let idx = idx as usize;
         let entities_per_chunk = self.entities_per_chunk;
         let chunk_idx = idx / entities_per_chunk;
         let value_idx = idx % entities_per_chunk;
-        unsafe {
-            GCPtr::from_base_with_offset(
-                self.value_start,
-                NonNull::new_unchecked(
-                    self.storage[chunk_idx].add(self.data_start + value_idx * self.stride),
-                ),
-            )
-        }
+        GCPtr::from_base_with_offset(
+            self.value_start,
+            NonNull::new_unchecked(
+                self.storage
+                    .get_unchecked(chunk_idx)
+                    .add(self.data_start + value_idx * self.stride),
+            ),
+        )
     }
 
     pub(crate) unsafe fn get_value(&self, idx: u32) -> NonNull<u8> {

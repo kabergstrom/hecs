@@ -538,6 +538,39 @@ impl Entities {
         self.pending.truncate(new_free_cursor);
     }
 
+    // unsafe fn flush_nonsync(&self, mut init: impl FnMut(u32, &mut Location)) {
+    //     let free_cursor = self.free_cursor.read_nonsync();
+
+    //     let new_free_cursor = if free_cursor >= 0 {
+    //         free_cursor as usize
+    //     } else {
+    //         let old_meta_len = self.meta.len();
+    //         self.meta
+    //             .extend_with_nonsync((-free_cursor) as usize, EntityMeta::EMPTY);
+
+    //         let len = self.len.read_nonsync();
+    //         self.len.write_nonsync(len + (-free_cursor) as u32);
+    //         // there can be no active references to individual locations in a !Sync context
+    //         for (id, meta) in self.meta.iter_mut().enumerate().skip(old_meta_len) {
+    //             init(id as u32, &mut meta.location);
+    //         }
+
+    //         self.free_cursor.write_nonsync(0);
+    //         0
+    //     };
+
+    //     let len = self.len.read_nonsync();
+    //     self.len
+    //         .write_nonsync(len + (self.pending.len_nonsync() - new_free_cursor) as u32);
+    //     // there can be no active references to individual locations in a !Sync context
+    //     for id in &self.pending[new_free_cursor..] {
+    //         init(*id, &mut self.meta[*id as usize].location);
+    //     }
+    //     // there can be no active references to the pending list in a !Sync context
+    //     // (reserve_entities cannot be called)
+    //     self.pending.truncate(new_free_cursor);
+    // }
+
     #[inline]
     pub fn len(&self) -> u32 {
         self.len.load_atomic(Ordering::Acquire)

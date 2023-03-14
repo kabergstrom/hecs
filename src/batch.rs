@@ -112,8 +112,9 @@ impl<T> BatchWriter<'_, T> {
         if *self.fill + 1 >= self.size {
             return Err(x);
         }
-        let mut slot = data.get_gc_ptr(self.fill());
-        unsafe { slot.move_from_value(&self.ty, &mut x as *mut T as *mut u8) };
+        todo!();
+        // let mut slot = data.get_gc_ptr(self.fill());
+        // unsafe { slot.move_from_value(&self.ty, &mut x as *mut T as *mut u8) };
         *self.fill += 1;
         Ok(())
     }

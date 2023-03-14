@@ -2,7 +2,7 @@ mod borrow;
 mod gc_world;
 pub mod kvec;
 
-pub mod cells;
+pub(crate) mod cells;
 pub mod query;
 use core::{
     any::{Any, TypeId},
@@ -356,9 +356,15 @@ pub unsafe fn trace(
     type_registry: &TypeRegistry,
     world: &mut World,
     entity_roots: impl IntoIterator<Item = Entity>,
+    ptr_roots: impl IntoIterator<Item = (GCPtr, TypeInfo)>,
 ) {
     let mut to_process: Vec<(GCPtr, unsafe fn(*mut u8) -> *mut dyn Reflect)> = Vec::new();
     let mut processed = HashSet::<GCPtr>::new();
+    for (ptr, ty) in ptr_roots {
+        if processed.insert(ptr) {
+            to_process.push((ptr, ty.reflect_from_ptr()));
+        }
+    }
     for ent in entity_roots {
         if let Ok(entity) = world.entity(ent) {
             unsafe {
@@ -366,8 +372,9 @@ pub unsafe fn trace(
                 for (storage_idx, ty) in archetype.types().iter().enumerate() {
                     let data = archetype.get_data_storage(storage_idx);
                     let gc_ptr = data.get_gc_ptr(entity.index());
-                    to_process.push((gc_ptr, ty.reflect_from_ptr()));
-                    processed.insert(gc_ptr);
+                    if processed.insert(gc_ptr) {
+                        to_process.push((gc_ptr, ty.reflect_from_ptr()));
+                    }
                 }
             }
         }

@@ -1137,9 +1137,7 @@ where
         unsafe {
             components.put(|ptr, ty| {
                 // SAFETY: we have &mut Archetype
-                unsafe {
-                    self.archetype.put_new_dynamic_nonsync(ptr, &ty, index);
-                }
+                self.archetype.put_new_dynamic_nonsync(ptr, &ty, index);
             });
         }
         self.entities.meta[entity.id as usize].location = Location {
@@ -1358,7 +1356,7 @@ pub(crate) mod tests {
 
     pub(crate) fn cleanup(mut world: World) {
         world.clear();
-        unsafe { crate::gc_trace(&registry(), &mut world, []) };
+        unsafe { crate::gc_trace(&registry(), &mut world, [], []) };
     }
     #[test]
     fn reuse_empty() {

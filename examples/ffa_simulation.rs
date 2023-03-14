@@ -209,5 +209,5 @@ fn registry() -> TypeRegistry {
 
 fn cleanup(mut world: World) {
     world.clear();
-    unsafe { hecs::gc_trace(&registry(), &mut world, []) };
+    unsafe { hecs::gc_trace(&registry(), &mut world, [], []) };
 }
