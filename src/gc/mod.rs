@@ -26,7 +26,7 @@ use crate::{
     Component, Entity, TypeInfo, World,
 };
 
-use self::borrow::{BorrowFlag, BorrowRef, Ref, RefMut};
+use self::borrow::{BorrowFlag, BorrowRef, BorrowRefMut, Ref, RefMut};
 
 #[derive(Debug, PartialEq, Eq, Clone, Copy, Hash)]
 #[repr(transparent)]
@@ -267,8 +267,12 @@ impl<T: Component> CRef<T> {
         assert!(is_gc_borrows_enabled(slot), "gc borrows not enabled");
         let ptr = self.ptr.resolve_moved();
         if let State::Alive { borrow } = unsafe { &ptr.header_ptr().as_ref().state } {
-            let borrow = BorrowRef::new(&borrow).expect("already mutable borrowed");
-            todo!()
+            let borrow = BorrowRefMut::new(&borrow).expect("already mutable borrowed");
+            RefMut {
+                borrow,
+                value: ptr.value_ptr().cast(),
+                marker: Default::default(),
+            }
         } else {
             panic!("Borrowing a deleted component")
         }

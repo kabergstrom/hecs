@@ -359,7 +359,7 @@ impl<'b, T: ?Sized> RefMut<'b, T> {
     }
 }
 
-struct BorrowRefMut<'b> {
+pub(super) struct BorrowRefMut<'b> {
     borrow: &'b Cell<BorrowFlag>,
 }
 
@@ -374,7 +374,7 @@ impl Drop for BorrowRefMut<'_> {
 
 impl<'b> BorrowRefMut<'b> {
     #[inline]
-    fn new(borrow: &'b Cell<BorrowFlag>) -> Option<BorrowRefMut<'b>> {
+    pub(super) fn new(borrow: &'b Cell<BorrowFlag>) -> Option<BorrowRefMut<'b>> {
         // NOTE: Unlike BorrowRefMut::clone, new is called to create the initial
         // mutable reference, and so there must currently be no existing
         // references. Thus, while clone increments the mutable refcount, here
@@ -412,10 +412,10 @@ impl<'b> BorrowRefMut<'b> {
 pub struct RefMut<'b, T: ?Sized + 'b> {
     // NB: we use a pointer instead of `&'b mut T` to avoid `noalias` violations, because a
     // `RefMut` argument doesn't hold exclusivity for its whole scope, only until it drops.
-    value: NonNull<T>,
-    borrow: BorrowRefMut<'b>,
+    pub(super) value: NonNull<T>,
+    pub(super) borrow: BorrowRefMut<'b>,
     // `NonNull` is covariant over `T`, so we need to reintroduce invariance.
-    marker: PhantomData<&'b mut T>,
+    pub(super) marker: PhantomData<&'b mut T>,
 }
 
 impl<T: ?Sized> Deref for RefMut<'_, T> {
