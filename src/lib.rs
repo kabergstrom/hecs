@@ -69,18 +69,22 @@ mod query;
 mod query_one;
 #[cfg(any(feature = "row-serialize", feature = "column-serialize"))]
 pub mod serialize;
+mod sharedvec;
 mod take;
 mod world;
 
 pub use archetype::Archetype;
 pub use batch::{BatchIncomplete, BatchWriter, ColumnBatch, ColumnBatchBuilder, ColumnBatchType};
+#[cfg(feature = "bevy_reflect")]
 pub use bevy_reflect;
 pub use bundle::{Bundle, DynamicBundle, DynamicBundleClone, MissingComponent};
 pub use command_buffer::CommandBuffer;
 pub use entities::{Entity, NoSuchEntity};
 pub use entity_builder::{BuiltEntity, BuiltEntityClone, EntityBuilder, EntityBuilderClone};
 pub use entity_ref::{ComponentRef, ComponentRefShared, EntityRef, Ref, RefMut};
-pub use gc::{trace as gc_trace, CRef, GCWorld};
+pub use gc::{trace as gc_trace, CRef, GcWorld};
+#[cfg(feature = "mirror_mirror")]
+pub use mirror_mirror;
 pub use query::{
     Access, Batch, BatchedIter, Or, PreparedQuery, PreparedQueryBorrow, PreparedQueryIter,
     PreparedView, Query, QueryBorrow, QueryItem, QueryIter, QueryMut, QueryShared, Satisfies, View,

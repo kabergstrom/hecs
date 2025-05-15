@@ -33,7 +33,7 @@ struct Damage(i32);
 #[derive(Debug, Reflect)]
 struct KillCount(i32);
 
-#[derive(Default, Debug, Reflect)]
+#[derive(Default, Debug)]
 struct TargetTrack {
     target: Option<CRef<Position>>,
 }
@@ -56,9 +56,8 @@ fn batch_spawn_entities(world: &mut World, n: usize) {
         let hp = Health(rng.gen_range(30..50));
         let dmg = Damage(rng.gen_range(1..10));
         let kc = KillCount(0);
-        let tt = TargetTrack::default();
 
-        (pos, s, hp, dmg, kc, tt)
+        (pos, s, hp, dmg, kc)
     });
 
     world.spawn_batch(to_spawn);
@@ -79,9 +78,9 @@ fn system_integrate_motion(world: &mut World, query: &mut PreparedQuery<(&mut Po
 
 // In this system entities find the closest entity and fire at them
 fn system_fire_at_closest(mut world: &mut World) {
-    let mut ptr = None;
-    for (id0, (pos0, dmg0, kc0, tt0)) in
-        &mut world.query::<With<(&Position, &Damage, &mut KillCount, &mut TargetTrack), &Health>>()
+    // let mut ptr = None;
+    for (id0, (pos0, dmg0, kc0)) in
+        &mut world.query::<With<(&Position, &Damage, &mut KillCount), &Health>>()
     {
         // Find closest:
         // Nested queries are O(n^2) and you usually want to avoid that by using some sort of
@@ -103,13 +102,13 @@ fn system_fire_at_closest(mut world: &mut World) {
         };
 
         let new_ref = world.new_cref::<Position>(closest).unwrap();
-        if let Some(ptr) = &tt0.target {
-            if !new_ref.ptr_eq(&ptr) {
-                println!("new closest");
-            }
-        }
-        ptr = Some(new_ref.clone());
-        tt0.target = Some(new_ref);
+        // if let Some(ptr) = &tt0.target {
+        //     if !new_ref.ptr_eq(&ptr) {
+        //         println!("new closest");
+        //     }
+        // }
+        // ptr = Some(new_ref.clone());
+        // tt0.target = Some(new_ref);
 
         // Deal damage:
         /*
@@ -136,12 +135,12 @@ fn system_fire_at_closest(mut world: &mut World) {
             }
         }
     }
-    if let Some(ptr) = ptr {
-        let gc_world = GCWorld::new(&mut world);
+    // if let Some(ptr) = ptr {
+    //     let gc_world = GcWorld::new_scope(&mut world);
 
-        println!("new {:?}", &*ptr.read());
-        drop(gc_world);
-    }
+    //     println!("new {:?}", &*ptr.read());
+    //     drop(gc_world);
+    // }
 }
 
 fn system_remove_dead(world: &mut World) {

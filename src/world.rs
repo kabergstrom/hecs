@@ -7,14 +7,18 @@
 
 use crate::alloc::{vec, vec::Vec};
 use crate::gc::cells::PtrCell;
+use crate::gc::kvec::KVec;
 use crate::gc::{alloc_world_slot, free_world_slot};
+#[cfg(feature = "bevy_reflect")]
 use bevy_reflect::Reflect;
 use core::any::TypeId;
 use core::borrow::Borrow;
-use core::cell::Cell;
+use core::cell::{Cell, UnsafeCell};
 use core::convert::TryFrom;
 use core::hash::{BuildHasherDefault, Hasher};
 use core::num::NonZeroU32;
+#[cfg(feature = "mirror_mirror")]
+use mirror_mirror::Reflect;
 use spin::Mutex;
 
 use core::{fmt, ptr};
@@ -28,7 +32,7 @@ use crate::alloc::boxed::Box;
 use crate::archetype::{Archetype, TypeIdMap, TypeInfo};
 use crate::entities::{Entities, EntityMeta, Location, ReserveEntitiesIterator};
 use crate::{
-    Bundle, CRef, ColumnBatch, ComponentRef, DynamicBundle, Entity, EntityRef, Fetch,
+    sharedvec, Bundle, CRef, ColumnBatch, ComponentRef, DynamicBundle, Entity, EntityRef, Fetch,
     MissingComponent, NoSuchEntity, Query, QueryBorrow, QueryItem, QueryMut, QueryOne, TakenEntity,
 };
 
@@ -54,13 +58,13 @@ pub struct World {
     entities: Entities,
     archetypes: ArchetypeSet,
     /// Maps statically-typed bundle types to archetypes
-    bundle_to_archetype: TypeIdMap<u32>,
+    bundle_to_archetype: NonSyncCell<TypeIdMap<sharedvec::DefaultKey>>,
     /// Maps source archetype and static bundle types to the archetype that an entity is moved to
     /// after inserting the components from that bundle.
-    insert_edges: IndexTypeIdMap<InsertTarget>,
+    insert_edges: NonSyncCell<IndexTypeIdMap<InsertTarget>>,
     /// Maps source archetype and static bundle types to the archetype that an entity is moved to
     /// after removing the components from that bundle.
-    remove_edges: IndexTypeIdMap<u32>,
+    remove_edges: NonSyncCell<IndexTypeIdMap<sharedvec::DefaultKey>>,
     id: u64,
     world_slot: NonZeroU32,
 }
@@ -69,6 +73,9 @@ impl Drop for World {
         unsafe { free_world_slot(self.world_slot) };
     }
 }
+
+struct NonSyncCell<T>(UnsafeCell<T>);
+unsafe impl<T> Sync for NonSyncCell<T> {}
 
 impl World {
     /// Create an empty world
@@ -85,9 +92,9 @@ impl World {
         Self {
             entities: Entities::default(),
             archetypes: ArchetypeSet::new(),
-            bundle_to_archetype: HashMap::default(),
-            insert_edges: HashMap::default(),
-            remove_edges: HashMap::default(),
+            bundle_to_archetype: NonSyncCell(UnsafeCell::new(HashMap::default())),
+            insert_edges: NonSyncCell(UnsafeCell::new(HashMap::default())),
+            remove_edges: NonSyncCell(UnsafeCell::new(HashMap::default())),
             id,
             world_slot: alloc_world_slot(),
         }
@@ -124,6 +131,18 @@ impl World {
         entity
     }
 
+    pub unsafe fn spawn_nonsync(&self, components: impl DynamicBundle) -> Entity {
+        // Ensure all entity allocations are accounted for so `self.entities` can realloc if
+        // necessary
+        self.flush_nonsync();
+
+        let entity = self.entities.alloc_nonsync();
+
+        self.spawn_inner_nonsync(entity, components);
+
+        entity
+    }
+
     /// Create an entity with certain components and a specific [`Entity`] handle.
     ///
     /// See [`spawn`](Self::spawn).
@@ -152,7 +171,7 @@ impl World {
 
         let loc = self.entities.alloc_at(handle);
         if let Some(loc) = loc {
-            unsafe { self.archetypes.archetypes[loc.archetype as usize].remove(loc.index) }
+            unsafe { self.archetypes.archetypes[loc.archetype].remove(loc.index) }
         }
 
         self.spawn_inner(handle, components);
@@ -162,14 +181,16 @@ impl World {
         let archetype_id = match components.key() {
             Some(k) => {
                 let archetypes = &mut self.archetypes;
-                *self.bundle_to_archetype.entry(k).or_insert_with(|| {
+                let bundle_to_archetype = self.bundle_to_archetype.0.get_mut();
+
+                *bundle_to_archetype.entry(k).or_insert_with(|| {
                     components.with_ids(|ids| archetypes.get(ids, || components.type_info()))
                 })
             }
             None => components.with_ids(|ids| self.archetypes.get(ids, || components.type_info())),
         };
 
-        let archetype = &mut self.archetypes.archetypes[archetype_id as usize];
+        let archetype = &mut self.archetypes.archetypes[archetype_id];
         // SAFETY: we have &mut self
         unsafe {
             let index = archetype.allocate_nonsync(entity.id, self.world_slot);
@@ -180,6 +201,44 @@ impl World {
                 archetype: archetype_id,
                 index,
             };
+        }
+    }
+    unsafe fn spawn_inner_nonsync(&self, entity: Entity, components: impl DynamicBundle) {
+        let archetype_id = match components.key() {
+            Some(k) => {
+                let archetypes = &self.archetypes;
+
+                // we have &self here, but we never return any references elsewhere so we can grab a &mut of bundle_to_archetype
+                // since we're in a !Sync context
+                let bundle_to_archetype_ptr = self.bundle_to_archetype.0.get();
+                let bundle_to_archetype = bundle_to_archetype_ptr.as_mut().unwrap();
+
+                *bundle_to_archetype.entry(k).or_insert_with(|| {
+                    components
+                        .with_ids(|ids| archetypes.get_nonsync(ids, || components.type_info()))
+                })
+            }
+            None => components
+                .with_ids(|ids| self.archetypes.get_nonsync(ids, || components.type_info())),
+        };
+
+        let archetype = &self.archetypes.archetypes[archetype_id];
+        // SAFETY: we have &mut self
+        unsafe {
+            let index = archetype.allocate_nonsync(entity.id, self.world_slot);
+            components.put(|ptr, ty| {
+                archetype.put_new_dynamic_nonsync(ptr, &ty, index);
+            });
+            self.entities.meta.set_nonsync(
+                entity.id as usize,
+                EntityMeta {
+                    generation: entity.generation,
+                    location: Location {
+                        archetype: archetype_id,
+                        index,
+                    },
+                },
+            );
         }
     }
 
@@ -216,7 +275,7 @@ impl World {
             inner: iter,
             entities: &mut self.entities,
             archetype_id,
-            archetype: &mut self.archetypes.archetypes[archetype_id as usize],
+            archetype: &mut self.archetypes.archetypes[archetype_id],
             world_slot: &self.world_slot,
         }
     }
@@ -234,7 +293,7 @@ impl World {
         // Store component data
         let (archetype_id, base) = self.archetypes.insert_batch(archetype);
 
-        let archetype = &mut self.archetypes.archetypes[archetype_id as usize];
+        let archetype = &mut self.archetypes.archetypes[archetype_id];
         let id_alloc = self.entities.alloc_many(entity_count, archetype_id, base);
 
         // Fix up entity IDs
@@ -268,7 +327,7 @@ impl World {
         for &handle in handles {
             let loc = self.entities.alloc_at(handle);
             if let Some(loc) = loc {
-                unsafe { self.archetypes.archetypes[loc.archetype as usize].remove(loc.index) }
+                unsafe { self.archetypes.archetypes[loc.archetype].remove(loc.index) }
             }
         }
 
@@ -276,7 +335,7 @@ impl World {
         let (archetype_id, base) = self.archetypes.insert_batch(archetype);
 
         // Fix up entity IDs
-        let archetype = &mut self.archetypes.archetypes[archetype_id as usize];
+        let archetype = &mut self.archetypes.archetypes[archetype_id];
         for (&handle, index) in handles.iter().zip(base as usize..) {
             archetype.set_entity_id(index, handle.id());
             self.entities.meta[handle.id() as usize].location = Location {
@@ -313,7 +372,14 @@ impl World {
     pub fn despawn(&mut self, entity: Entity) -> Result<(), NoSuchEntity> {
         self.flush();
         let loc = self.entities.free(entity)?;
-        unsafe { self.archetypes.archetypes[loc.archetype as usize].remove(loc.index) }
+        unsafe { self.archetypes.archetypes[loc.archetype].remove(loc.index) }
+        Ok(())
+    }
+
+    pub unsafe fn despawn_nonsync(&self, entity: Entity) -> Result<(), NoSuchEntity> {
+        self.flush_nonsync();
+        let loc = self.entities.get(entity)?;
+        unsafe { self.archetypes.archetypes[loc.archetype].remove_nonsync(loc.index) }
         Ok(())
     }
 
@@ -322,13 +388,14 @@ impl World {
         self.reserve_inner::<T>(additional);
     }
 
-    fn reserve_inner<T: Bundle + 'static>(&mut self, additional: u32) -> u32 {
+    fn reserve_inner<T: Bundle + 'static>(&mut self, additional: u32) -> sharedvec::DefaultKey {
         self.flush();
         self.entities.reserve(additional);
 
         let archetypes = &mut self.archetypes;
-        let archetype_id = *self
-            .bundle_to_archetype
+        // SAFETY: we have &mut self
+        let bundle_to_archetype = self.bundle_to_archetype.0.get_mut();
+        let archetype_id = *bundle_to_archetype
             .entry(TypeId::of::<T>())
             .or_insert_with(|| {
                 T::with_static_ids(|ids| {
@@ -336,7 +403,7 @@ impl World {
                 })
             });
 
-        self.archetypes.archetypes[archetype_id as usize].reserve(additional, self.world_slot);
+        self.archetypes.archetypes[archetype_id].reserve(additional, self.world_slot);
         archetype_id
     }
 
@@ -344,7 +411,9 @@ impl World {
     ///
     /// Preserves allocated storage for reuse but clears metadata so that [`Entity`] values will repeat (in contrast to [`despawn`][Self::despawn]).
     pub fn clear(&mut self) {
-        for x in &mut self.archetypes.archetypes {
+        for i in 0..self.archetypes.archetypes.len() {
+            let key = self.archetypes.archetypes.key_from_index(i).unwrap();
+            let x = self.archetypes.archetypes.get_mut(key).unwrap();
             x.clear();
         }
         self.entities.clear();
@@ -422,7 +491,7 @@ impl World {
         &self.entities
     }
 
-    pub(crate) fn archetypes_inner(&self) -> &[Archetype] {
+    pub(crate) fn archetypes_inner(&self) -> &sharedvec::SharedVec<Archetype> {
         &self.archetypes.archetypes
     }
 
@@ -454,12 +523,7 @@ impl World {
     /// ```
     pub fn query_one<Q: Query>(&self, entity: Entity) -> Result<QueryOne<'_, Q>, NoSuchEntity> {
         let loc = self.entities.get(entity)?;
-        Ok(unsafe {
-            QueryOne::new(
-                &self.archetypes.archetypes[loc.archetype as usize],
-                loc.index,
-            )
-        })
+        Ok(unsafe { QueryOne::new(&self.archetypes.archetypes[loc.archetype], loc.index) })
     }
 
     /// Query a single entity in a uniquely borrow world
@@ -472,7 +536,7 @@ impl World {
         entity: Entity,
     ) -> Result<QueryItem<'_, Q>, QueryOneError> {
         let loc = self.entities.get(entity)?;
-        let archetype = &self.archetypes.archetypes[loc.archetype as usize];
+        let archetype = &self.archetypes.archetypes[loc.archetype];
         let state = Q::Fetch::prepare(archetype).ok_or(QueryOneError::Unsatisfied)?;
         let fetch = Q::Fetch::execute(archetype, state);
         unsafe { Ok(fetch.get(loc.index as usize)) }
@@ -520,7 +584,7 @@ impl World {
         let loc = self.entities.get(entity)?;
         unsafe {
             Ok(EntityRef::new(
-                &self.archetypes.archetypes[loc.archetype as usize],
+                &self.archetypes.archetypes[loc.archetype],
                 entity,
                 loc.index,
             ))
@@ -581,7 +645,21 @@ impl World {
         self.flush();
 
         let loc = self.entities.get(entity)?;
-        self.insert_inner(entity, components, loc.archetype, loc);
+        // SAFETY: we have &mut self
+        unsafe { self.insert_inner_nonsync(entity, components, loc.archetype, loc) };
+        Ok(())
+    }
+
+    pub unsafe fn insert_nonsync(
+        &self,
+        entity: Entity,
+        components: impl DynamicBundle,
+    ) -> Result<(), NoSuchEntity> {
+        self.flush_nonsync();
+
+        let loc = self.entities.get(entity)?;
+        // SAFETY: we have are in !Sync context
+        unsafe { self.insert_inner_nonsync(entity, components, loc.archetype, loc) };
         Ok(())
     }
 
@@ -590,29 +668,36 @@ impl World {
     /// Note that `graph_origin` is always equal to `loc.archetype` during insertion. Only for exchange, `graph_origin` identifies
     /// the intermediate archetype which would be reached after removal and before insertion even though
     /// the actual component data still resides in `loc.archetype`.
-    fn insert_inner(
-        &mut self,
+    unsafe fn insert_inner_nonsync(
+        &self,
         entity: Entity,
         components: impl DynamicBundle,
-        graph_origin: u32,
+        graph_origin: sharedvec::DefaultKey,
         loc: Location,
     ) {
         let target_storage;
         let target = match components.key() {
             None => {
-                target_storage = self.archetypes.get_insert_target(graph_origin, &components);
+                target_storage = self
+                    .archetypes
+                    .get_insert_target_nonsync(graph_origin, &components);
                 &target_storage
             }
-            Some(key) => match self.insert_edges.entry((graph_origin, key)) {
-                Entry::Occupied(entry) => entry.into_mut(),
-                Entry::Vacant(entry) => {
-                    let target = self.archetypes.get_insert_target(graph_origin, &components);
-                    entry.insert(target)
+            Some(key) => {
+                let insert_edges = self.insert_edges.0.get().as_mut().unwrap();
+                match insert_edges.entry((graph_origin, key)) {
+                    Entry::Occupied(entry) => entry.into_mut(),
+                    Entry::Vacant(entry) => {
+                        let target = self
+                            .archetypes
+                            .get_insert_target_nonsync(graph_origin, &components);
+                        entry.insert(target)
+                    }
                 }
-            },
+            }
         };
 
-        let source_arch = &mut self.archetypes.archetypes[loc.archetype as usize];
+        let source_arch = &self.archetypes.archetypes[loc.archetype];
         unsafe {
             // Drop the components we're overwriting
             for ty in &target.replaced {
@@ -622,7 +707,7 @@ impl World {
 
             if target.index == loc.archetype {
                 // Update components in the current archetype
-                let arch = &mut self.archetypes.archetypes[loc.archetype as usize];
+                let arch = &self.archetypes.archetypes[loc.archetype];
                 components.put(|ptr, ty| {
                     // SAFETY: we have &mut self
                     arch.put_new_dynamic_nonsync(ptr, &ty, loc.index);
@@ -630,32 +715,33 @@ impl World {
                 return;
             }
 
-            let (source_arch, target_arch) = index2(
-                &mut self.archetypes.archetypes,
-                loc.archetype as usize,
-                target.index as usize,
-            );
+            let source_arch = &self.archetypes.archetypes[loc.archetype];
+            let target_arch = &self.archetypes.archetypes[target.index];
 
             // Allocate storage in the archetype and update the entity's location to address it
-            // SAFETY: we have &mut self
             let target_index = target_arch.allocate_nonsync(entity.id, self.world_slot);
-            let meta = &mut self.entities.meta[entity.id as usize];
-            meta.location.archetype = target.index;
-            meta.location.index = target_index;
+            self.entities.meta.set_nonsync(
+                entity.id as usize,
+                EntityMeta {
+                    generation: entity.generation,
+                    location: Location {
+                        archetype: target.index,
+                        index: target_index,
+                    },
+                },
+            );
 
             // Move the new components
             components.put(|ptr, ty| {
-                // SAFETY: we have &mut self
                 target_arch.put_new_dynamic_nonsync(ptr, &ty, target_index);
             });
 
             // Move the components we're keeping
             for ty in &target.retained {
                 let src = source_arch.get_dynamic(ty, loc.index).unwrap();
-                // SAFETY: we have &mut self
                 target_arch.move_from_nonsync(src, ty, target_index);
             }
-            source_arch.set_entity_id(loc.index as usize, u32::MAX);
+            source_arch.set_entity_id_nonsync(loc.index as usize, u32::MAX);
         }
     }
 
@@ -695,7 +781,7 @@ impl World {
         // Gather current metadata
         let loc = self.entities.get_mut(entity)?;
         let old_index = loc.index;
-        let source_arch = &self.archetypes.archetypes[loc.archetype as usize];
+        let source_arch = &self.archetypes.archetypes[loc.archetype];
 
         // Move out of the source archetype, or bail out if a component is missing
         let bundle = unsafe {
@@ -710,17 +796,17 @@ impl World {
         };
 
         // Find the target archetype ID
-        let target =
-            Self::remove_target::<T>(&mut self.archetypes, &mut self.remove_edges, loc.archetype);
+        let target = Self::remove_target::<T>(
+            &mut self.archetypes,
+            self.remove_edges.0.get_mut(),
+            loc.archetype,
+        );
 
         // Store components to the target archetype and update metadata
         if loc.archetype != target {
             // If we actually removed any components, the entity needs to be moved into a new archetype
-            let (source_arch, target_arch) = index2(
-                &mut self.archetypes.archetypes,
-                loc.archetype as usize,
-                target as usize,
-            );
+            let source_arch = &self.archetypes.archetypes[loc.archetype];
+            let target_arch = &self.archetypes.archetypes[target];
             // SAFETY: We have &mut self
             let target_index = unsafe { target_arch.allocate_nonsync(entity.id, self.world_slot) };
             loc.archetype = target;
@@ -740,16 +826,93 @@ impl World {
         Ok(bundle)
     }
 
+    pub unsafe fn remove_nonsync<T: Bundle + 'static>(
+        &self,
+        entity: Entity,
+    ) -> Result<T, ComponentError> {
+        self.flush_nonsync();
+
+        // Gather current metadata
+        let loc = self.entities.get(entity)?;
+        let old_index = loc.index;
+        let source_arch = &self.archetypes.archetypes[loc.archetype];
+
+        // Move out of the source archetype, or bail out if a component is missing
+        let bundle = unsafe {
+            T::get(|ty| {
+                // SAFETY: We have &mut self
+                let gc_ptr = source_arch.get_dynamic(&ty, old_index);
+                if let Some(mut gc_ptr) = gc_ptr {
+                    gc_ptr.mark_tombstone();
+                }
+                gc_ptr.map(|p| p.value_ptr())
+            })?
+        };
+
+        // Find the target archetype ID
+        // SAFETY: we are in a !Sync context
+        let remove_edges = self.remove_edges.0.get().as_mut().unwrap();
+        let target = match remove_edges.entry((loc.archetype, TypeId::of::<T>())) {
+            Entry::Occupied(entry) => *entry.into_mut(),
+            Entry::Vacant(entry) => {
+                let info = T::with_static_type_info(|removed| {
+                    self.archetypes.archetypes[loc.archetype]
+                        .types()
+                        .iter()
+                        .filter(|x| removed.binary_search(x).is_err())
+                        .cloned()
+                        .collect::<Vec<_>>()
+                });
+                let elements = info.iter().map(|x| x.id()).collect::<Box<_>>();
+                let index = self.archetypes.get_nonsync(&*elements, move || info);
+                *entry.insert(index)
+            }
+        };
+
+        // Store components to the target archetype and update metadata
+        if loc.archetype != target {
+            // If we actually removed any components, the entity needs to be moved into a new archetype
+            let source_arch = &self.archetypes.archetypes[loc.archetype];
+            let target_arch = &self.archetypes.archetypes[target];
+            let target_index = target_arch.allocate_nonsync(entity.id, self.world_slot);
+            self.entities.meta.set_nonsync(
+                loc.index as usize,
+                EntityMeta {
+                    location: Location {
+                        archetype: target,
+                        index: target_index,
+                    },
+                    generation: entity.generation,
+                },
+            );
+
+            if let Some(moved) = unsafe {
+                source_arch.move_to(old_index, |src, ty| {
+                    // Only move the components present in the target archetype, i.e. the non-removed ones.
+                    if let Some(mut dst) = target_arch.get_dynamic(ty, target_index) {
+                        dst.move_from(ty, src);
+                    }
+                })
+            } {
+                let mut old_moved = self.entities.meta[moved as usize];
+                old_moved.location.index = old_index;
+                self.entities.meta.set_nonsync(moved as usize, old_moved);
+            }
+        }
+
+        Ok(bundle)
+    }
+
     fn remove_target<T: Bundle + 'static>(
         archetypes: &mut ArchetypeSet,
-        remove_edges: &mut IndexTypeIdMap<u32>,
-        old_archetype: u32,
-    ) -> u32 {
+        remove_edges: &mut IndexTypeIdMap<sharedvec::DefaultKey>,
+        old_archetype: sharedvec::DefaultKey,
+    ) -> sharedvec::DefaultKey {
         match remove_edges.entry((old_archetype, TypeId::of::<T>())) {
             Entry::Occupied(entry) => *entry.into_mut(),
             Entry::Vacant(entry) => {
                 let info = T::with_static_type_info(|removed| {
-                    archetypes.archetypes[old_archetype as usize]
+                    archetypes.archetypes[old_archetype]
                         .types()
                         .iter()
                         .filter(|x| removed.binary_search(x).is_err())
@@ -768,6 +931,9 @@ impl World {
     /// See [`remove`](Self::remove).
     pub fn remove_one<T: Component>(&mut self, entity: Entity) -> Result<T, ComponentError> {
         self.remove::<(T,)>(entity).map(|(x,)| x)
+    }
+    pub fn remove_one_nonsync<T: Component>(&self, entity: Entity) -> Result<T, ComponentError> {
+        unsafe { self.remove_nonsync::<(T,)>(entity).map(|(x,)| x) }
     }
 
     /// Remove `S` components from `entity` and then add `components`
@@ -831,7 +997,7 @@ impl World {
         entity: Entity,
     ) -> Result<T, ComponentError> {
         let loc = self.entities.get(entity)?;
-        let archetype = &self.archetypes.archetypes[loc.archetype as usize];
+        let archetype = &self.archetypes.archetypes[loc.archetype];
         let state = archetype
             .get_state::<T::Component>()
             .ok_or_else(MissingComponent::new::<T::Component>)?;
@@ -849,10 +1015,22 @@ impl World {
     /// Invoked implicitly by operations that add or remove components or entities, i.e. all
     /// variations of `spawn`, `despawn`, `insert`, and `remove`.
     pub fn flush(&mut self) {
-        let arch = &mut self.archetypes.archetypes[0];
+        let arch =
+            &self.archetypes.archetypes[self.archetypes.archetypes.key_from_index(0).unwrap()];
         let world_slot = self.world_slot;
 
         self.entities.flush(|id, location| {
+            //SAFETY: we have &mut self
+            location.index = unsafe { arch.allocate_nonsync(id, world_slot) }
+        });
+    }
+
+    pub unsafe fn flush_nonsync(&self) {
+        let arch =
+            &self.archetypes.archetypes[self.archetypes.archetypes.key_from_index(0).unwrap()];
+        let world_slot = self.world_slot;
+
+        self.entities.flush_nonsync(|id, location| {
             //SAFETY: we have &mut self
             location.index = unsafe { arch.allocate_nonsync(id, world_slot) }
         });
@@ -862,14 +1040,8 @@ impl World {
     ///
     /// Useful for dynamically scheduling concurrent queries by checking borrows in advance, and for
     /// efficient serialization.
-    pub fn archetypes(&self) -> impl ExactSizeIterator<Item = &'_ Archetype> + '_ {
+    pub fn archetypes(&self) -> impl Iterator<Item = (sharedvec::DefaultKey, &'_ Archetype)> + '_ {
         self.archetypes_inner().iter()
-    }
-
-    pub(crate) fn archetypes_mut(
-        &mut self,
-    ) -> impl ExactSizeIterator<Item = &'_ mut Archetype> + '_ {
-        self.archetypes.archetypes.iter_mut()
     }
 
     /// Despawn `entity`, yielding a [`DynamicBundle`] of its components
@@ -878,7 +1050,7 @@ impl World {
     pub fn take(&mut self, entity: Entity) -> Result<TakenEntity<'_>, NoSuchEntity> {
         self.flush();
         let loc = self.entities.get(entity)?;
-        let archetype = &mut self.archetypes.archetypes[loc.archetype as usize];
+        let archetype = &mut self.archetypes.archetypes[loc.archetype];
         unsafe {
             Ok(TakenEntity::new(
                 &mut self.entities,
@@ -947,6 +1119,13 @@ fn index2<T>(x: &mut [T], i: usize, j: usize) -> (&mut T, &mut T) {
     assert!(j < x.len());
     let ptr = x.as_mut_ptr();
     unsafe { (&mut *ptr.add(i), &mut *ptr.add(j)) }
+}
+fn index2_nonsync<T>(x: &[T], i: usize, j: usize) -> (&T, &T) {
+    assert!(i != j);
+    assert!(i < x.len());
+    assert!(j < x.len());
+    let ptr = x.as_ptr();
+    unsafe { (&*ptr.add(i), &*ptr.add(j)) }
 }
 
 /// Errors that arise when accessing components
@@ -1020,14 +1199,14 @@ impl<T: Reflect + Send + Sync + 'static> Component for T {}
 
 /// Iterator over all of a world's entities
 pub struct Iter<'a> {
-    archetypes: core::slice::Iter<'a, Archetype>,
+    archetypes: sharedvec::Iter<'a, Archetype, sharedvec::DefaultKey>,
     entities: &'a Entities,
     current: Option<&'a Archetype>,
     index: u32,
 }
 
 impl<'a> Iter<'a> {
-    fn new(archetypes: &'a [Archetype], entities: &'a Entities) -> Self {
+    fn new(archetypes: &'a sharedvec::SharedVec<Archetype>, entities: &'a Entities) -> Self {
         Self {
             archetypes: archetypes.iter(),
             entities,
@@ -1046,7 +1225,7 @@ impl<'a> Iterator for Iter<'a> {
         loop {
             match self.current {
                 None => {
-                    self.current = Some(self.archetypes.next()?);
+                    self.current = Some(self.archetypes.next()?.1);
                     self.index = 0;
                 }
                 Some(current) => {
@@ -1107,7 +1286,7 @@ where
 {
     inner: I,
     entities: &'a mut Entities,
-    archetype_id: u32,
+    archetype_id: sharedvec::DefaultKey,
     archetype: &'a mut Archetype,
     world_slot: &'a NonZeroU32,
 }
@@ -1197,18 +1376,21 @@ impl Drop for SpawnColumnBatchIter<'_> {
 
 struct ArchetypeSet {
     /// Maps sorted component type sets to archetypes
-    index: PtrCell<HashMap<Box<[TypeId]>, u32>>,
-    archetypes: Vec<Archetype>,
+    index: NonSyncCell<HashMap<Box<[TypeId]>, sharedvec::DefaultKey>>,
+    archetypes: sharedvec::SharedVec<Archetype>,
 }
 
 impl ArchetypeSet {
     fn new() -> Self {
         // `flush` assumes archetype 0 always exists, representing entities with no components.
+        let default_archetype = Archetype::new(Vec::new());
+        let archetypes = sharedvec::SharedVec::new();
+        let (key, _) = archetypes.push(default_archetype);
         Self {
-            index: PtrCell::new(Box::into_raw(Box::new(
-                Some((Box::default(), 0)).into_iter().collect(),
-            ))),
-            archetypes: vec![Archetype::new(Vec::new())],
+            index: NonSyncCell(UnsafeCell::new(
+                Some((Box::default(), key)).into_iter().collect(),
+            )),
+            archetypes,
         }
     }
 
@@ -1217,35 +1399,57 @@ impl ArchetypeSet {
         &mut self,
         components: T,
         info: impl FnOnce() -> Vec<TypeInfo>,
-    ) -> u32 {
-        unsafe { &*self.index.read() }
+    ) -> sharedvec::DefaultKey {
+        self.index
+            .0
+            .get_mut()
             .get(components.borrow())
             .copied()
             .unwrap_or_else(|| self.insert(components.into(), info()))
     }
+    unsafe fn get_nonsync<T: Borrow<[TypeId]> + Into<Box<[TypeId]>>>(
+        &self,
+        components: T,
+        info: impl FnOnce() -> Vec<TypeInfo>,
+    ) -> sharedvec::DefaultKey {
+        unsafe { &*self.index.0.get() }
+            .get(components.borrow())
+            .copied()
+            .unwrap_or_else(|| self.insert_nonsync(components.into(), info()))
+    }
 
-    fn insert(&mut self, components: Box<[TypeId]>, info: Vec<TypeInfo>) -> u32 {
-        let x = self.archetypes.len() as u32;
-        self.archetypes.push(Archetype::new(info));
-        let index = unsafe { &mut *self.index.read() };
-        let old = index.insert(components, x);
+    fn insert(&mut self, components: Box<[TypeId]>, info: Vec<TypeInfo>) -> sharedvec::DefaultKey {
+        let (key, _) = self.archetypes.push(Archetype::new(info));
+        let idx = self.index.0.get_mut();
+        let old = idx.insert(components, key);
         debug_assert!(old.is_none(), "inserted duplicate archetype");
-        x
+        key
+    }
+    unsafe fn insert_nonsync(
+        &self,
+        components: Box<[TypeId]>,
+        info: Vec<TypeInfo>,
+    ) -> sharedvec::DefaultKey {
+        let (key, _) = self.archetypes.push(Archetype::new(info));
+        let idx = unsafe { &mut *self.index.0.get() };
+        let old = idx.insert(components, key);
+        debug_assert!(old.is_none(), "inserted duplicate archetype");
+        key
     }
 
     /// Returns archetype ID and starting location index
-    fn insert_batch(&mut self, archetype: Archetype) -> (u32, u32) {
+    fn insert_batch(&mut self, archetype: Archetype) -> (sharedvec::DefaultKey, u32) {
         let ids = archetype
             .types()
             .iter()
             .map(|info| info.id())
             .collect::<Box<_>>();
 
-        let index = unsafe { &mut *self.index.read() };
+        let index = self.index.0.get_mut();
         match index.entry(ids) {
             Entry::Occupied(x) => {
                 // Duplicate of existing archetype
-                let existing = &mut self.archetypes[*x.get() as usize];
+                let existing = &mut self.archetypes[*x.get()];
                 // SAFETY: we have &mut self
                 let base = unsafe { existing.allocated_values_nonsync() };
                 unsafe {
@@ -1256,8 +1460,7 @@ impl ArchetypeSet {
             }
             Entry::Vacant(x) => {
                 // Brand new archetype
-                let id = self.archetypes.len() as u32;
-                self.archetypes.push(archetype);
+                let (id, _) = self.archetypes.push(archetype);
                 x.insert(id);
                 (id, 0)
             }
@@ -1268,9 +1471,13 @@ impl ArchetypeSet {
         self.archetypes.len() as u32
     }
 
-    fn get_insert_target(&mut self, src: u32, components: &impl DynamicBundle) -> InsertTarget {
+    unsafe fn get_insert_target_nonsync(
+        &self,
+        src: sharedvec::DefaultKey,
+        components: &impl DynamicBundle,
+    ) -> InsertTarget {
         // Assemble Vec<TypeInfo> for the final entity
-        let arch = &mut self.archetypes[src as usize];
+        let arch = &self.archetypes[src];
         let mut info = arch.types().to_vec();
         let mut replaced = Vec::new(); // Elements in both archetype.types() and components.type_info()
         let mut retained = Vec::new(); // Elements in archetype.types() but not components.type_info()
@@ -1297,7 +1504,7 @@ impl ArchetypeSet {
 
         // Find the archetype it'll live in
         let elements = info.iter().map(|x| x.id()).collect::<Box<_>>();
-        let index = self.get(elements, move || info);
+        let index = self.get_nonsync(elements, move || info);
         InsertTarget {
             replaced,
             retained,
@@ -1313,10 +1520,11 @@ struct InsertTarget {
     /// Components from the current archetype that are moved by the insert
     retained: Vec<TypeInfo>,
     /// ID of the target archetype
-    index: u32,
+    index: sharedvec::DefaultKey,
 }
 
-type IndexTypeIdMap<V> = HashMap<(u32, TypeId), V, BuildHasherDefault<IndexTypeIdHasher>>;
+type IndexTypeIdMap<V> =
+    HashMap<(sharedvec::DefaultKey, TypeId), V, BuildHasherDefault<IndexTypeIdHasher>>;
 
 #[derive(Default)]
 struct IndexTypeIdHasher(u64);
@@ -1342,7 +1550,11 @@ impl Hasher for IndexTypeIdHasher {
 #[cfg(test)]
 pub(crate) mod tests {
     use alloc::string::{String, ToString};
+    #[cfg(feature = "bevy_reflect")]
     use bevy_reflect::TypeRegistry;
+
+    #[cfg(feature = "mirror_mirror")]
+    use crate::gc::TypeRegistry;
 
     use super::*;
 

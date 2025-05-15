@@ -11,6 +11,7 @@ use std::error::Error;
 
 use crate::gc::cells::{IsizeCell, U32Cell};
 use crate::gc::kvec::KVec;
+use crate::sharedvec;
 
 /// Lightweight unique ID, or handle, of an entity
 ///
@@ -267,6 +268,12 @@ impl Entities {
             "flush() needs to be called before this operation is legal"
         );
     }
+    unsafe fn verify_flushed_nonsync(&self) {
+        debug_assert!(
+            !self.needs_flush_nonsync(),
+            "flush() needs to be called before this operation is legal"
+        );
+    }
 
     /// Allocate an entity ID directly
     ///
@@ -293,11 +300,42 @@ impl Entities {
             }
         }
     }
+    ///
+    /// Allocate an entity ID directly
+    ///
+    /// Location should be written immediately.
+    pub unsafe fn alloc_nonsync(&self) -> Entity {
+        self.verify_flushed_nonsync();
+
+        let len = self.len.read_nonsync();
+        self.len.write_nonsync(len + 1);
+        if let Some(id) = self.pending.pop_nonsync() {
+            let new_free_cursor = self.pending.len() as isize;
+            self.free_cursor.write_nonsync(new_free_cursor);
+            Entity {
+                generation: self.meta[id as usize].generation,
+                id,
+            }
+        } else {
+            let id = u32::try_from(self.meta.len()).expect("too many entities");
+            self.meta.push_nonsync(EntityMeta::EMPTY);
+            debug_assert!(self.meta[id as usize].generation == EntityMeta::EMPTY.generation);
+            Entity {
+                generation: NonZeroU32::new(1).unwrap(),
+                id,
+            }
+        }
+    }
 
     /// Allocate and set locations for many entity IDs laid out contiguously in an archetype
     ///
     /// `self.finish_alloc_many()` must be called after!
-    pub fn alloc_many(&mut self, n: u32, archetype: u32, mut first_index: u32) -> AllocManyState {
+    pub fn alloc_many(
+        &mut self,
+        n: u32,
+        archetype: sharedvec::DefaultKey,
+        mut first_index: u32,
+    ) -> AllocManyState {
         self.verify_flushed();
 
         let fresh = (n as usize).saturating_sub(self.pending.len()) as u32;
@@ -370,6 +408,39 @@ impl Entities {
 
         loc
     }
+
+    // pub unsafe fn alloc_at_nonsync(&self, entity: Entity) -> Option<Location> {
+    //     self.verify_flushed_nonsync();
+
+    //     let loc = if entity.id as usize >= self.meta.len() {
+    //         for v in (self.meta.len() as u32)..entity.id {
+    //             self.pending.push_nonsync(v);
+    //         }
+
+    //         let new_free_cursor = self.pending.len() as isize;
+    //         self.free_cursor.write_nonsync(new_free_cursor); // Not racey due to &mut self
+    //         self.meta.resize(entity.id as usize + 1, EntityMeta::EMPTY);
+    //         let len = self.len.read_nonsync();
+    //         self.len.write_nonsync(len + 1);
+    //         None
+    //     } else if let Some(index) = self.pending.iter().position(|item| *item == entity.id) {
+    //         self.pending.swap_remove(index);
+    //         let new_free_cursor = self.pending.len() as isize;
+    //         self.free_cursor.set(new_free_cursor);
+    //         let len = self.len.read();
+    //         self.len.set(len + 1);
+    //         None
+    //     } else {
+    //         Some(mem::replace(
+    //             &mut self.meta[entity.id as usize].location,
+    //             EntityMeta::EMPTY.location,
+    //         ))
+    //     };
+
+    //     self.meta[entity.id as usize].generation = entity.generation;
+
+    //     loc
+    // }
 
     /// Destroy an entity, allowing it to be reused
     ///
@@ -458,10 +529,7 @@ impl Entities {
                 && free < 0
                 && (entity.id as isize) < (free.abs() + self.meta.len() as isize)
             {
-                return Ok(Location {
-                    archetype: 0,
-                    index: u32::max_value(),
-                });
+                return Ok(EntityMeta::EMPTY.location);
             } else {
                 return Err(NoSuchEntity);
             }
@@ -507,6 +575,10 @@ impl Entities {
         self.free_cursor.read() != self.pending.len() as isize
     }
 
+    unsafe fn needs_flush_nonsync(&self) -> bool {
+        self.free_cursor.read_nonsync() != self.pending.len() as isize
+    }
+
     /// Allocates space for entities previously reserved with `reserve_entity` or
     /// `reserve_entities`, then initializes each one using the supplied function.
     pub fn flush(&mut self, mut init: impl FnMut(u32, &mut Location)) {
@@ -538,38 +610,46 @@ impl Entities {
         self.pending.truncate(new_free_cursor);
     }
 
-    // unsafe fn flush_nonsync(&self, mut init: impl FnMut(u32, &mut Location)) {
-    //     let free_cursor = self.free_cursor.read_nonsync();
+    pub unsafe fn flush_nonsync(&self, mut init: impl FnMut(u32, &mut Location)) {
+        let free_cursor = self.free_cursor.read_nonsync();
 
-    //     let new_free_cursor = if free_cursor >= 0 {
-    //         free_cursor as usize
-    //     } else {
-    //         let old_meta_len = self.meta.len();
-    //         self.meta
-    //             .extend_with_nonsync((-free_cursor) as usize, EntityMeta::EMPTY);
+        let new_free_cursor = if free_cursor >= 0 {
+            free_cursor as usize
+        } else {
+            let old_meta_len = self.meta.len();
+            self.meta
+                .extend_with_nonsync((-free_cursor) as usize, EntityMeta::EMPTY);
 
-    //         let len = self.len.read_nonsync();
-    //         self.len.write_nonsync(len + (-free_cursor) as u32);
-    //         // there can be no active references to individual locations in a !Sync context
-    //         for (id, meta) in self.meta.iter_mut().enumerate().skip(old_meta_len) {
-    //             init(id as u32, &mut meta.location);
-    //         }
+            let len = self.len.read_nonsync();
+            self.len.write_nonsync(len + (-free_cursor) as u32);
+            // there can be no active references to individual locations in a !Sync context
+            let mut_ptr = self.meta.as_ptr() as *mut EntityMeta;
+            let meta_slice = core::slice::from_raw_parts_mut(mut_ptr, self.meta.len_nonsync());
 
-    //         self.free_cursor.write_nonsync(0);
-    //         0
-    //     };
+            for (id, meta) in meta_slice.iter_mut().enumerate().skip(old_meta_len) {
+                init(id as u32, &mut meta.location);
+            }
 
-    //     let len = self.len.read_nonsync();
-    //     self.len
-    //         .write_nonsync(len + (self.pending.len_nonsync() - new_free_cursor) as u32);
-    //     // there can be no active references to individual locations in a !Sync context
-    //     for id in &self.pending[new_free_cursor..] {
-    //         init(*id, &mut self.meta[*id as usize].location);
-    //     }
-    //     // there can be no active references to the pending list in a !Sync context
-    //     // (reserve_entities cannot be called)
-    //     self.pending.truncate(new_free_cursor);
-    // }
+            self.free_cursor.write_nonsync(0);
+            0
+        };
+
+        let len = self.len.read_nonsync();
+        self.len
+            .write_nonsync(len + (self.pending.len_nonsync() - new_free_cursor) as u32);
+        // there can be no active references to individual locations in a !Sync context
+        let mut_ptr = self.meta.as_ptr() as *mut EntityMeta;
+        let meta_slice = core::slice::from_raw_parts_mut(mut_ptr, self.meta.len_nonsync());
+
+        for id in &self.pending[new_free_cursor..] {
+            init(*id, &mut meta_slice[*id as usize].location);
+        }
+        // there can be no active references to the pending list in a !Sync context
+        // (reserve_entities cannot be called)
+        let pending_ptr = core::ptr::addr_of!(self.pending) as *mut KVec<EntityMeta>;
+        let pending_mut = &mut *pending_ptr;
+        pending_mut.truncate(new_free_cursor);
+    }
 
     #[inline]
     pub fn len(&self) -> u32 {
@@ -590,7 +670,7 @@ impl EntityMeta {
             None => unreachable!(),
         },
         location: Location {
-            archetype: 0,
+            archetype: unsafe { core::mem::transmute((0, 0)) },
             index: u32::max_value(), // dummy value, to be filled in
         },
     };
@@ -598,7 +678,7 @@ impl EntityMeta {
 
 #[derive(Copy, Clone)]
 pub(crate) struct Location {
-    pub archetype: u32,
+    pub archetype: sharedvec::DefaultKey,
     pub index: u32,
 }
 

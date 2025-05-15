@@ -22,8 +22,11 @@ use core::{arch, fmt};
 use std::thread::current;
 
 use alloc::alloc::alloc_zeroed;
+#[cfg(feature = "bevy_reflect")]
 use bevy_reflect::{Reflect, ReflectFromPtr};
 use hashbrown::{hash_map::DefaultHashBuilder, HashMap};
+#[cfg(feature = "mirror_mirror")]
+use mirror_mirror::Reflect;
 
 use crate::borrow::AtomicBorrow;
 use crate::query::Fetch;
@@ -217,6 +220,10 @@ impl Archetype {
     pub(crate) fn set_entity_id(&mut self, index: usize, id: u32) {
         self.entities[index].set(id);
     }
+    #[inline]
+    pub(crate) unsafe fn set_entity_id_nonsync(&self, index: usize, id: u32) {
+        self.entities[index].write_nonsync(id);
+    }
 
     pub(crate) fn types(&self) -> &[TypeInfo] {
         &self.types
@@ -398,17 +405,24 @@ impl Archetype {
         }
         self.entities[index as usize].set(u32::MAX);
     }
+    pub(crate) unsafe fn remove_nonsync(&self, index: u32) {
+        for (ty, data) in self.types.iter().zip(&*self.data) {
+            let mut to_remove = data.get_gc_ptr(index);
+            to_remove.drop_value_and_tombstone(ty);
+        }
+        self.entities[index as usize].write_nonsync(u32::MAX);
+    }
 
     /// Returns the ID of the entity moved into `index`, if any
     pub(crate) unsafe fn move_to(
-        &mut self,
+        &self,
         index: u32,
         mut f: impl FnMut(GCPtr, &TypeInfo),
     ) -> Option<u32> {
         for (ty, data) in self.types.iter().zip(&*self.data) {
             let gc_ptr = data.get_gc_ptr(index);
             f(gc_ptr, ty);
-            self.entities[index as usize].set(u32::MAX);
+            self.entities[index as usize].write_nonsync(u32::MAX);
         }
         None
     }

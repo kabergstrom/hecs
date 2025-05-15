@@ -520,6 +520,25 @@ impl<T: Clone> KVec<T> {
         }
     }
 
+    pub unsafe fn pop_nonsync(&self) -> Option<T> {
+        if let Some((data, mut header)) = unsafe { self.current_memory_nonsync() } {
+            unsafe {
+                let header = header.as_mut();
+                debug_assert!(header.written.read() == header.reserved.read());
+                let len = header.written.read_nonsync();
+                if len == 0 {
+                    return None;
+                }
+                let new_len = len - 1;
+                header.written.write_nonsync(new_len);
+                header.reserved.write_nonsync(new_len);
+                Some(data.as_ptr().add(new_len).read())
+            }
+        } else {
+            None
+        }
+    }
+
     pub fn push(&mut self, value: T) {
         let (ptr, reserved_range) = self.reserve_storage(1);
         debug_assert!(reserved_range.len() == 1);
@@ -770,6 +789,15 @@ impl<T: Clone> KVec<T> {
             }
         }
     }
+    pub unsafe fn set_nonsync(&self, idx: usize, value: T) {
+        if let Some((data, mut header)) = self.current_memory_nonsync() {
+            unsafe {
+                let slice =
+                    core::slice::from_raw_parts_mut(data.as_ptr(), header.as_mut().written.read());
+                slice[idx] = value;
+            }
+        }
+    }
 }
 
 fn alloc_guard(alloc_size: usize) -> bool {
@@ -780,21 +808,21 @@ fn alloc_guard(alloc_size: usize) -> bool {
     }
 }
 
-impl<T: Clone, I: SliceIndex<[T]>> Index<I> for KVec<T> {
-    type Output = I::Output;
+// impl<T: Clone, I: SliceIndex<[T]>> Index<I> for KVec<T> {
+//     type Output = I::Output;
 
-    #[inline]
-    fn index(&self, index: I) -> &Self::Output {
-        Index::index(&**self, index)
-    }
-}
+//     #[inline]
+//     fn index(&self, index: I) -> &Self::Output {
+//         Index::index(&**self, index)
+//     }
+// }
 
-impl<T: Clone, I: SliceIndex<[T]>> IndexMut<I> for KVec<T> {
-    #[inline]
-    fn index_mut(&mut self, index: I) -> &mut Self::Output {
-        IndexMut::index_mut(&mut **self, index)
-    }
-}
+// impl<T: Clone, I: SliceIndex<[T]>> IndexMut<I> for KVec<T> {
+//     #[inline]
+//     fn index_mut(&mut self, index: I) -> &mut Self::Output {
+//         IndexMut::index_mut(&mut **self, index)
+//     }
+// }
 
 impl<T: Clone> ops::Deref for KVec<T> {
     type Target = [T];

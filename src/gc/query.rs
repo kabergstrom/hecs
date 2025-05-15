@@ -6,7 +6,7 @@ use alloc::rc::Rc;
 
 use crate::archetype::Data;
 use crate::{entities::EntityMeta, Archetype, Component, Entity};
-use crate::{CRef, ComponentError, MissingComponent, TypeInfo};
+use crate::{sharedvec, CRef, ComponentError, MissingComponent, TypeInfo};
 
 /// Errors that arise when fetching
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -269,7 +269,7 @@ unsafe impl<'a, L: Fetch<'a>, R: Fetch<'a>> Fetch<'a> for FetchOr<L, R> {
 /// let a = world.spawn((123, true, "abc".to_string()));
 /// let b = world.spawn((456, false));
 /// let c = world.spawn((42, "def".to_string()));
-/// let ergo = GCWorld::new(&mut world);
+/// let ergo = GcWorld::new_scope(&mut world);
 /// let entities = ergo.query::<Without<&i32, &bool>>()
 ///     .iter()
 ///     .map(|(e, i)| (e, *i.read()))
@@ -320,7 +320,7 @@ unsafe impl<'a, F: Fetch<'a>, G: Fetch<'a>> Fetch<'a> for FetchWithout<F, G> {
 /// let a = world.spawn((123, true, "abc".to_string()));
 /// let b = world.spawn((456, false));
 /// let c = world.spawn((42, "def".to_string()));
-/// let ergo = GCWorld::new(&mut world);
+/// let ergo = GcWorld::new_scope(&mut world);
 /// let entities = ergo.query::<With<&i32, &bool>>()
 ///     .iter()
 ///     .map(|(e, i)| (e, *i.read()))
@@ -371,7 +371,7 @@ unsafe impl<'a, F: Fetch<'a>, G: Fetch<'a>> Fetch<'a> for FetchWith<F, G> {
 /// let a = world.spawn((123, true, "abc".to_string()));
 /// let b = world.spawn((456, false));
 /// let c = world.spawn((42, "def".to_string()));
-/// let ergo = GCWorld::new(&mut world);
+/// let ergo = GcWorld::new_scope(&mut world);
 /// let entities = ergo.query::<Satisfies<&bool>>()
 ///     .iter()
 ///     .map(|(e, x)| (e, x))
@@ -416,12 +416,15 @@ unsafe impl<'a, F: Fetch<'a>> Fetch<'a> for FetchSatisfies<F> {
 /// Note that borrows are not released until this object is dropped.
 pub struct QueryBorrow<'w, Q: Query> {
     meta: &'w [EntityMeta],
-    archetypes: &'w [Archetype],
+    archetypes: sharedvec::Iter<'w, Archetype, sharedvec::DefaultKey>,
     _marker: PhantomData<Q>,
 }
 
 impl<'w, Q: Query> QueryBorrow<'w, Q> {
-    pub(crate) fn new(meta: &'w [EntityMeta], archetypes: &'w [Archetype]) -> Self {
+    pub(crate) fn new(
+        meta: &'w [EntityMeta],
+        archetypes: sharedvec::Iter<'w, Archetype, sharedvec::DefaultKey>,
+    ) -> Self {
         Self {
             meta,
             archetypes,
@@ -432,7 +435,7 @@ impl<'w, Q: Query> QueryBorrow<'w, Q> {
     /// Execute the query
     // The lifetime narrowing here is required for soundness.
     pub fn iter(&mut self) -> QueryIter<'_, Q> {
-        unsafe { QueryIter::new(self.meta, self.archetypes.iter()) }
+        unsafe { QueryIter::new(self.meta, self.archetypes.clone()) }
     }
 
     /// Transform the query into one that requires a certain component without borrowing it
@@ -449,7 +452,7 @@ impl<'w, Q: Query> QueryBorrow<'w, Q> {
     /// let a = world.spawn((123, true, "abc".to_string()));
     /// let b = world.spawn((456, false));
     /// let c = world.spawn((42, "def".to_string()));
-    /// let ergo = GCWorld::new(&mut world);
+    /// let ergo = GcWorld::new_scope(&mut world);
     /// let entities = ergo.query::<&i32>()
     ///     .with::<&bool>()
     ///     .iter()
@@ -473,7 +476,7 @@ impl<'w, Q: Query> QueryBorrow<'w, Q> {
     /// let a = world.spawn((123, true, "abc".to_string()));
     /// let b = world.spawn((456, false));
     /// let c = world.spawn((42, "def".to_string()));
-    /// let ergo = GCWorld::new(&mut world);
+    /// let ergo = GcWorld::new_scope(&mut world);
     /// let entities = ergo.query::<&i32>()
     ///     .without::<&bool>()
     ///     .iter()
@@ -513,7 +516,7 @@ impl<'q, 'w: 'q, Q: Query> IntoIterator for &'q mut QueryBorrow<'w, Q> {
 /// Iterator over the set of entities with the components in `Q`
 pub struct QueryIter<'q, Q: Query> {
     meta: &'q [EntityMeta],
-    archetypes: SliceIter<'q, Archetype>,
+    archetypes: sharedvec::Iter<'q, Archetype, sharedvec::DefaultKey>,
     iter: ChunkIter<Q>,
 }
 
@@ -522,7 +525,10 @@ impl<'q, Q: Query> QueryIter<'q, Q> {
     ///
     /// `'q` must be sufficient to guarantee that `Q` cannot violate borrow safety, either with
     /// dynamic borrow checks or by representing exclusive access to the `World`.
-    unsafe fn new(meta: &'q [EntityMeta], archetypes: SliceIter<'q, Archetype>) -> Self {
+    unsafe fn new(
+        meta: &'q [EntityMeta],
+        archetypes: sharedvec::Iter<'q, Archetype, sharedvec::DefaultKey>,
+    ) -> Self {
         Self {
             meta,
             archetypes,
@@ -542,7 +548,7 @@ impl<'q, Q: Query> Iterator for QueryIter<'q, Q> {
         loop {
             match unsafe { self.iter.next() } {
                 None => {
-                    let archetype = self.archetypes.next()?;
+                    let archetype = self.archetypes.next()?.1;
                     let state = Q::Fetch::prepare(archetype);
                     let fetch = state.map(|state| Q::Fetch::execute(archetype, state));
                     self.iter = fetch.map_or(ChunkIter::empty(), |fetch| ChunkIter {
@@ -644,7 +650,7 @@ smaller_tuples_too!(tuple_impl, O, N, M, L, K, J, I, H, G, F, E, D, C, B, A);
 mod tests {
     use alloc::vec::Vec;
 
-    use crate::{GCWorld, World};
+    use crate::{GcWorld, World};
 
     #[test]
     fn ergo_query_iter() {
@@ -653,13 +659,13 @@ mod tests {
         let e2 = world.spawn((6i32, 2.5f32));
         assert!(world.len() == 2);
         {
-            let ergo_scope = GCWorld::new(&mut world);
+            let ergo_scope = GcWorld::new_scope(&mut world);
             let entities = ergo_scope
                 .query::<(&i32, &f32)>()
                 .iter()
                 .map(|(e, (i, b))| (e, i, b)) // Copy out of the world
                 .collect::<Vec<_>>();
-            assert!(entities.len() == 2);
+            assert_eq!(entities.len(), 2);
 
             assert_eq!(entities[0].0, e1);
             assert_eq!(*entities[0].1.read(), 5i32);
@@ -678,7 +684,7 @@ mod tests {
     //     let e1 = world.spawn((5i32, 1.5f32));
     //     let e2 = world.spawn((6i32, 2.5f32));
     //     assert!(world.len() == 2);
-    //     let ergo_scope = GCWorld::new(&mut world);
+    //     let ergo_scope = GcWorld::new_scope(&mut world);
     //     let mut query = ergo_scope.query::<(&i32, &f32)>();
     //     let mut entities = query.iter();
 
@@ -698,7 +704,7 @@ mod tests {
     //     let e1 = world.spawn((5i32, 1.5f32));
     //     let e2 = world.spawn((6i32,));
     //     assert!(world.len() == 2);
-    //     let ergo_scope = GCWorld::new(&mut world);
+    //     let ergo_scope = GcWorld::new_scope(&mut world);
     //     let mut query = ergo_scope.query::<(&i32, &f32)>();
     //     let mut entities = query.iter();
 
@@ -729,7 +735,7 @@ mod tests {
     //     let e1 = world.spawn((5i32, 1.5f32));
     //     let e2 = world.spawn((6i32,));
     //     assert!(world.len() == 2);
-    //     let ergo_scope = GCWorld::new(&mut world);
+    //     let ergo_scope = GcWorld::new(&mut world);
     //     let mut query = ergo_scope.query::<(&i32, &f32)>();
     //     let mut entities = query.iter();
 
@@ -753,7 +759,7 @@ mod tests {
     //     let e1 = world.spawn((5i32, 1.5f32));
     //     let e2 = world.spawn((6i32, 1.8f32));
     //     assert!(world.len() == 2);
-    //     let ergo_scope = GCWorld::new(&mut world);
+    //     let ergo_scope = GcWorld::new(&mut world);
     //     let mut query = ergo_scope.query::<(&i32, &f32)>();
     //     let mut entities = query.iter();
 
@@ -780,7 +786,7 @@ mod tests {
     //     let e1 = world.spawn((5i32, 1.5f32));
     //     let e2 = world.spawn((6i32, 1.8f32));
     //     assert!(world.len() == 2);
-    //     let ergo_scope = GCWorld::new(&mut world);
+    //     let ergo_scope = GcWorld::new(&mut world);
     //     let mut query = ergo_scope.query::<(&i32, &f32)>();
     //     let mut entities = query.iter();
 

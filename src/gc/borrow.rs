@@ -85,9 +85,20 @@ pub struct Ref<'b, T: ?Sized + 'b> {
     // `Ref` argument doesn't hold immutability for its whole scope, only until it drops.
     // `NonNull` is also covariant over `T`, just like we would have with `&T`.
     pub(super) value: NonNull<T>,
+    pub(super) state: NonNull<super::State>,
     pub(super) borrow: BorrowRef<'b>,
 }
 
+impl<'b, T: ?Sized + 'b> Drop for Ref<'b, T> {
+    fn drop(&mut self) {
+        unsafe {
+            if self.state.read() == super::State::PendingDead && self.borrow.borrow.get() == 1 {
+                core::ptr::drop_in_place(self.value.as_ptr());
+                self.state.write(super::State::Dead);
+            }
+        }
+    }
+}
 impl<T: ?Sized> Deref for Ref<'_, T> {
     type Target = T;
 
@@ -112,6 +123,7 @@ impl<'b, T: ?Sized> Ref<'b, T> {
     pub fn clone(orig: &Ref<'b, T>) -> Ref<'b, T> {
         Ref {
             value: orig.value,
+            state: orig.state,
             borrow: orig.borrow.clone(),
         }
     }
@@ -141,7 +153,8 @@ impl<'b, T: ?Sized> Ref<'b, T> {
     {
         Ref {
             value: NonNull::from(f(&*orig)),
-            borrow: orig.borrow,
+            state: orig.state,
+            borrow: orig.borrow.clone(),
         }
     }
 
@@ -173,7 +186,8 @@ impl<'b, T: ?Sized> Ref<'b, T> {
         match f(&*orig) {
             Some(value) => Ok(Ref {
                 value: NonNull::from(value),
-                borrow: orig.borrow,
+                state: orig.state,
+                borrow: orig.borrow.clone(),
             }),
             None => Err(orig),
         }
@@ -210,10 +224,12 @@ impl<'b, T: ?Sized> Ref<'b, T> {
             Ref {
                 value: NonNull::from(a),
                 borrow,
+                state: orig.state,
             },
             Ref {
                 value: NonNull::from(b),
-                borrow: orig.borrow,
+                borrow: orig.borrow.clone(),
+                state: orig.state,
             },
         )
     }
@@ -257,7 +273,8 @@ impl<'b, T: ?Sized> RefMut<'b, T> {
         let value = NonNull::from(f(&mut *orig));
         RefMut {
             value,
-            borrow: orig.borrow,
+            borrow: orig.borrow.clone(),
+            state: orig.state,
             marker: PhantomData,
         }
     }
@@ -302,7 +319,8 @@ impl<'b, T: ?Sized> RefMut<'b, T> {
         match f(&mut *orig) {
             Some(value) => Ok(RefMut {
                 value: NonNull::from(value),
-                borrow: orig.borrow,
+                borrow: orig.borrow.clone(),
+                state: orig.state,
                 marker: PhantomData,
             }),
             None => Err(orig),
@@ -343,16 +361,19 @@ impl<'b, T: ?Sized> RefMut<'b, T> {
         F: FnOnce(&mut T) -> (&mut U, &mut V),
     {
         let borrow = orig.borrow.clone();
+        let state = orig.state;
         let (a, b) = f(&mut *orig);
         (
             RefMut {
                 value: NonNull::from(a),
-                borrow,
+                state,
+                borrow: borrow.clone(),
                 marker: PhantomData,
             },
             RefMut {
                 value: NonNull::from(b),
-                borrow: orig.borrow,
+                borrow,
+                state,
                 marker: PhantomData,
             },
         )
@@ -413,6 +434,7 @@ pub struct RefMut<'b, T: ?Sized + 'b> {
     // NB: we use a pointer instead of `&'b mut T` to avoid `noalias` violations, because a
     // `RefMut` argument doesn't hold exclusivity for its whole scope, only until it drops.
     pub(super) value: NonNull<T>,
+    pub(super) state: NonNull<super::State>,
     pub(super) borrow: BorrowRefMut<'b>,
     // `NonNull` is covariant over `T`, so we need to reintroduce invariance.
     pub(super) marker: PhantomData<&'b mut T>,
@@ -439,5 +461,15 @@ impl<T: ?Sized> DerefMut for RefMut<'_, T> {
 impl<T: ?Sized + fmt::Display> fmt::Display for RefMut<'_, T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         (**self).fmt(f)
+    }
+}
+impl<'b, T: ?Sized + 'b> Drop for RefMut<'b, T> {
+    fn drop(&mut self) {
+        unsafe {
+            if self.state.read() == super::State::PendingDead {
+                core::ptr::drop_in_place(self.value.as_ptr());
+                self.state.write(super::State::Dead);
+            }
+        }
     }
 }

@@ -19,7 +19,7 @@ rustdoc-args = ["--cfg", "docsrs"]
 maintenance = { status = "actively-developed" }
 
 [features]
-default = ["std"]
+default = ["std", "bevy_reflect"]
 std = []
 # Enables derive(Bundle)
 macros = ["hecs-macros", "lazy_static"]
@@ -28,14 +28,23 @@ column-serialize = ["serde"]
 # Enables the serialize::row module
 row-serialize = ["serde"]
 glam = ["bevy_reflect/glam"]
+bevy_reflect = []
 
 [dependencies]
 hecs-macros = { path = "macros", version = "0.8.2", optional = true }
-hashbrown = { version = "0.13.1", default-features = false, features = ["ahash", "inline-more"] }
+hashbrown = { version = "0.13.1", default-features = false, features = [
+    "ahash",
+    "inline-more",
+] }
 lazy_static = { version = "1.4.0", optional = true, features = ["spin_no_std"] }
 serde = { version = "1.0.117", default-features = false, optional = true }
-spin = { version = "0.9.2", default-features = false, features = ["mutex", "spin_mutex"] }
-bevy_reflect = { version = "0.9", default-features = false } 
+spin = { version = "0.9.2", default-features = false, features = [
+    "mutex",
+    "spin_mutex",
+] }
+bevy_reflect = { version = "0.15", default-features = false}
+# sharedvec = "0.2"
+# sharedvec = { path = "../sharedvec-rs/sharedvec" }
 
 [dev-dependencies]
 bencher = "0.1.5"

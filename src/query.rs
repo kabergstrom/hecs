@@ -13,6 +13,8 @@ use core::ops::Range;
 use core::ptr::NonNull;
 use core::slice::Iter as SliceIter;
 
+use crate::sharedvec::{self, Key};
+
 use crate::alloc::{boxed::Box, vec::Vec};
 use crate::archetype::{Archetype, Data};
 use crate::entities::EntityMeta;
@@ -697,13 +699,16 @@ unsafe impl<'a, F: Fetch<'a>> Fetch<'a> for FetchSatisfies<F> {
 /// Note that borrows are not released until this object is dropped.
 pub struct QueryBorrow<'w, Q: Query> {
     meta: &'w [EntityMeta],
-    archetypes: &'w [Archetype],
+    archetypes: &'w sharedvec::SharedVec<Archetype>,
     borrowed: bool,
     _marker: PhantomData<Q>,
 }
 
 impl<'w, Q: Query> QueryBorrow<'w, Q> {
-    pub(crate) fn new(meta: &'w [EntityMeta], archetypes: &'w [Archetype]) -> Self {
+    pub(crate) fn new(
+        meta: &'w [EntityMeta],
+        archetypes: &'w sharedvec::SharedVec<Archetype>,
+    ) -> Self {
         Self {
             meta,
             archetypes,
@@ -722,7 +727,7 @@ impl<'w, Q: Query> QueryBorrow<'w, Q> {
     /// Provide random access to the query results
     pub fn view(&mut self) -> View<'_, Q> {
         self.borrow();
-        unsafe { View::new(self.meta, self.archetypes) }
+        unsafe { View::new(self.meta, self.archetypes.iter()) }
     }
 
     /// Like `iter`, but returns child iterators of at most `batch_size` elements
@@ -738,7 +743,7 @@ impl<'w, Q: Query> QueryBorrow<'w, Q> {
         if self.borrowed {
             return;
         }
-        for x in self.archetypes {
+        for (_, x) in self.archetypes {
             if x.is_empty_sync() {
                 continue;
             }
@@ -818,7 +823,7 @@ unsafe impl<'w, Q: Query> Sync for QueryBorrow<'w, Q> where <Q::Fetch as Fetch<'
 impl<'w, Q: Query> Drop for QueryBorrow<'w, Q> {
     fn drop(&mut self) {
         if self.borrowed {
-            for x in self.archetypes {
+            for (_, x) in self.archetypes {
                 if x.is_empty_sync() {
                     continue;
                 }
@@ -842,7 +847,7 @@ impl<'q, 'w, Q: Query> IntoIterator for &'q mut QueryBorrow<'w, Q> {
 /// Iterator over the set of entities with the components in `Q`
 pub struct QueryIter<'q, Q: Query> {
     meta: &'q [EntityMeta],
-    archetypes: SliceIter<'q, Archetype>,
+    archetypes: sharedvec::Iter<'q, Archetype, sharedvec::DefaultKey>,
     iter: ChunkIter<Q>,
 }
 
@@ -851,7 +856,10 @@ impl<'q, Q: Query> QueryIter<'q, Q> {
     ///
     /// `'q` must be sufficient to guarantee that `Q` cannot violate borrow safety, either with
     /// dynamic borrow checks or by representing exclusive access to the `World`.
-    unsafe fn new(meta: &'q [EntityMeta], archetypes: SliceIter<'q, Archetype>) -> Self {
+    unsafe fn new(
+        meta: &'q [EntityMeta],
+        archetypes: sharedvec::Iter<'q, Archetype, sharedvec::DefaultKey>,
+    ) -> Self {
         Self {
             meta,
             archetypes,
@@ -871,7 +879,7 @@ impl<'q, Q: Query> Iterator for QueryIter<'q, Q> {
         loop {
             match unsafe { self.iter.next() } {
                 None => {
-                    let archetype = self.archetypes.next()?;
+                    let archetype = self.archetypes.next()?.1;
                     let state = Q::Fetch::prepare(archetype);
                     let fetch = state.map(|state| Q::Fetch::execute(archetype, state));
                     self.iter = fetch.map_or(ChunkIter::empty(), |fetch| ChunkIter {
@@ -905,7 +913,10 @@ pub struct QueryMut<'q, Q: Query> {
 }
 
 impl<'q, Q: Query> QueryMut<'q, Q> {
-    pub(crate) fn new(meta: &'q [EntityMeta], archetypes: &'q mut [Archetype]) -> Self {
+    pub(crate) fn new(
+        meta: &'q [EntityMeta],
+        archetypes: &'q mut sharedvec::SharedVec<Archetype>,
+    ) -> Self {
         assert_borrow::<Q>();
 
         Self {
@@ -915,7 +926,7 @@ impl<'q, Q: Query> QueryMut<'q, Q> {
 
     /// Provide random access to the query results
     pub fn view(&mut self) -> View<'_, Q> {
-        unsafe { View::new(self.iter.meta, self.iter.archetypes.as_slice()) }
+        unsafe { View::new(self.iter.meta, self.iter.archetypes.clone()) }
     }
 
     /// Transform the query into one that requires another query be satisfied
@@ -1016,7 +1027,7 @@ impl<Q: Query> ChunkIter<Q> {
 pub struct BatchedIter<'q, Q: Query> {
     _marker: PhantomData<&'q Q>,
     meta: &'q [EntityMeta],
-    archetypes: SliceIter<'q, Archetype>,
+    archetypes: sharedvec::Iter<'q, Archetype, sharedvec::DefaultKey>,
     batch_size: u32,
     batch: u32,
 }
@@ -1028,7 +1039,7 @@ impl<'q, Q: Query> BatchedIter<'q, Q> {
     /// dynamic borrow checks or by representing exclusive access to the `World`.
     unsafe fn new(
         meta: &'q [EntityMeta],
-        archetypes: SliceIter<'q, Archetype>,
+        archetypes: sharedvec::Iter<'q, Archetype, sharedvec::DefaultKey>,
         batch_size: u32,
     ) -> Self {
         Self {
@@ -1050,7 +1061,7 @@ impl<'q, Q: Query> Iterator for BatchedIter<'q, Q> {
     fn next(&mut self) -> Option<Self::Item> {
         loop {
             let mut archetypes = self.archetypes.clone();
-            let archetype = archetypes.next()?;
+            let archetype = archetypes.next()?.1;
             let offset = self.batch_size * self.batch;
             if offset >= archetype.allocated_values_sync() {
                 self.archetypes = archetypes;
@@ -1178,7 +1189,7 @@ smaller_tuples_too!(tuple_impl, O, N, M, L, K, J, I, H, G, F, E, D, C, B, A);
 /// A prepared query can be stored independently of the [`World`] to amortize query set-up costs.
 pub struct PreparedQuery<Q: Query> {
     memo: (u64, u32),
-    state: Box<[(usize, <Q::Fetch as Fetch<'static>>::State)]>,
+    state: Box<[(sharedvec::DefaultKey, <Q::Fetch as Fetch<'static>>::State)]>,
     fetch: Box<[Option<Q::Fetch>]>,
 }
 
@@ -1205,7 +1216,6 @@ impl<Q: Query> PreparedQuery<Q> {
 
         let state = world
             .archetypes()
-            .enumerate()
             .filter_map(|(idx, x)| Q::Fetch::prepare(x).map(|state| (idx, state)))
             .collect();
 
@@ -1242,7 +1252,7 @@ impl<Q: Query> PreparedQuery<Q> {
         let meta = world.entities_meta();
         let archetypes = world.archetypes_inner();
 
-        let state: &'q [(usize, <Q::Fetch as Fetch<'q>>::State)] =
+        let state: &'q [(sharedvec::DefaultKey, <Q::Fetch as Fetch<'q>>::State)] =
             unsafe { mem::transmute(&*self.state) };
 
         unsafe { PreparedQueryIter::new(meta, archetypes, state.iter()) }
@@ -1259,7 +1269,7 @@ impl<Q: Query> PreparedQuery<Q> {
         let meta = world.entities_meta();
         let archetypes = world.archetypes_inner();
 
-        let state: &'q [(usize, <Q::Fetch as Fetch<'q>>::State)] =
+        let state: &'q [(sharedvec::DefaultKey, <Q::Fetch as Fetch<'q>>::State)] =
             unsafe { mem::transmute(&*self.state) };
 
         unsafe { PreparedView::new(meta, archetypes, state.iter(), &mut self.fetch) }
@@ -1269,16 +1279,16 @@ impl<Q: Query> PreparedQuery<Q> {
 /// Combined borrow of a [`PreparedQuery`] and a [`World`]
 pub struct PreparedQueryBorrow<'q, Q: Query> {
     meta: &'q [EntityMeta],
-    archetypes: &'q [Archetype],
-    state: &'q [(usize, <Q::Fetch as Fetch<'static>>::State)],
+    archetypes: &'q sharedvec::SharedVec<Archetype>,
+    state: &'q [(sharedvec::DefaultKey, <Q::Fetch as Fetch<'static>>::State)],
     fetch: &'q mut [Option<Q::Fetch>],
 }
 
 impl<'q, Q: Query> PreparedQueryBorrow<'q, Q> {
     fn new(
         meta: &'q [EntityMeta],
-        archetypes: &'q [Archetype],
-        state: &'q [(usize, <Q::Fetch as Fetch<'static>>::State)],
+        archetypes: &'q sharedvec::SharedVec<Archetype>,
+        state: &'q [(sharedvec::DefaultKey, <Q::Fetch as Fetch<'static>>::State)],
         fetch: &'q mut [Option<Q::Fetch>],
     ) -> Self {
         for (idx, state) in state {
@@ -1299,7 +1309,7 @@ impl<'q, Q: Query> PreparedQueryBorrow<'q, Q> {
     /// Execute the prepared query
     // The lifetime narrowing here is required for soundness.
     pub fn iter<'i>(&'i mut self) -> PreparedQueryIter<'i, Q> {
-        let state: &'i [(usize, <Q::Fetch as Fetch<'i>>::State)] =
+        let state: &'i [(sharedvec::DefaultKey, <Q::Fetch as Fetch<'i>>::State)] =
             unsafe { mem::transmute(self.state) };
 
         unsafe { PreparedQueryIter::new(self.meta, self.archetypes, state.iter()) }
@@ -1307,7 +1317,7 @@ impl<'q, Q: Query> PreparedQueryBorrow<'q, Q> {
 
     /// Provides random access to the results of the prepared query
     pub fn view<'i>(&'i mut self) -> PreparedView<'i, Q> {
-        let state: &'i [(usize, <Q::Fetch as Fetch<'i>>::State)] =
+        let state: &'i [(sharedvec::DefaultKey, <Q::Fetch as Fetch<'i>>::State)] =
             unsafe { mem::transmute(self.state) };
 
         unsafe { PreparedView::new(self.meta, self.archetypes, state.iter(), self.fetch) }
@@ -1328,8 +1338,8 @@ impl<Q: Query> Drop for PreparedQueryBorrow<'_, Q> {
 /// Iterates over all entities matching a [`PreparedQuery`]
 pub struct PreparedQueryIter<'q, Q: Query> {
     meta: &'q [EntityMeta],
-    archetypes: &'q [Archetype],
-    state: SliceIter<'q, (usize, <Q::Fetch as Fetch<'q>>::State)>,
+    archetypes: &'q sharedvec::SharedVec<Archetype>,
+    state: SliceIter<'q, (sharedvec::DefaultKey, <Q::Fetch as Fetch<'q>>::State)>,
     iter: ChunkIter<Q>,
 }
 
@@ -1340,8 +1350,8 @@ impl<'q, Q: Query> PreparedQueryIter<'q, Q> {
     /// dynamic borrow checks or by representing exclusive access to the `World`.
     unsafe fn new(
         meta: &'q [EntityMeta],
-        archetypes: &'q [Archetype],
-        state: SliceIter<'q, (usize, <Q::Fetch as Fetch<'q>>::State)>,
+        archetypes: &'q sharedvec::SharedVec<Archetype>,
+        state: SliceIter<'q, (sharedvec::DefaultKey, <Q::Fetch as Fetch<'q>>::State)>,
     ) -> Self {
         Self {
             meta,
@@ -1406,10 +1416,12 @@ impl<'q, Q: Query> View<'q, Q> {
     ///
     /// `'q` must be sufficient to guarantee that `Q` cannot violate borrow safety, either with
     /// dynamic borrow checks or by representing exclusive access to the `World`.
-    unsafe fn new(meta: &'q [EntityMeta], archetypes: &'q [Archetype]) -> Self {
+    unsafe fn new(
+        meta: &'q [EntityMeta],
+        archetypes: sharedvec::Iter<'q, Archetype, sharedvec::DefaultKey>,
+    ) -> Self {
         let fetch = archetypes
-            .iter()
-            .map(|archetype| {
+            .map(|(_, archetype)| {
                 Q::Fetch::prepare(archetype).map(|state| Q::Fetch::execute(archetype, state))
             })
             .collect();
@@ -1431,7 +1443,7 @@ impl<'q, Q: Query> View<'q, Q> {
             return None;
         }
 
-        self.fetch[meta.location.archetype as usize]
+        self.fetch[meta.location.archetype.index()]
             .as_ref()
             .map(|fetch| unsafe { fetch.get(meta.location.index as usize) })
     }
@@ -1454,7 +1466,7 @@ impl<'q, Q: Query> View<'q, Q> {
             return None;
         }
 
-        self.fetch[meta.location.archetype as usize]
+        self.fetch[sharedvec::Key::index(meta.location.archetype)]
             .as_ref()
             .map(|fetch| fetch.get(meta.location.index as usize))
     }
@@ -1515,15 +1527,15 @@ impl<'q, Q: Query> PreparedView<'q, Q> {
     /// dynamic borrow checks or by representing exclusive access to the `World`.
     unsafe fn new(
         meta: &'q [EntityMeta],
-        archetypes: &'q [Archetype],
-        state: SliceIter<'q, (usize, <Q::Fetch as Fetch<'q>>::State)>,
+        archetypes: &'q sharedvec::SharedVec<Archetype>,
+        state: SliceIter<'q, (sharedvec::DefaultKey, <Q::Fetch as Fetch<'q>>::State)>,
         fetch: &'q mut [Option<Q::Fetch>],
     ) -> Self {
         fetch.iter_mut().for_each(|fetch| *fetch = None);
 
         for (idx, state) in state {
             let archetype = &archetypes[*idx];
-            fetch[*idx] = Some(Q::Fetch::execute(archetype, *state));
+            fetch[sharedvec::Key::index(*idx)] = Some(Q::Fetch::execute(archetype, *state));
         }
 
         Self { meta, fetch }
@@ -1543,7 +1555,7 @@ impl<'q, Q: Query> PreparedView<'q, Q> {
             return None;
         }
 
-        self.fetch[meta.location.archetype as usize]
+        self.fetch[meta.location.archetype.index()]
             .as_ref()
             .map(|fetch| unsafe { fetch.get(meta.location.index as usize) })
     }
@@ -1566,7 +1578,7 @@ impl<'q, Q: Query> PreparedView<'q, Q> {
             return None;
         }
 
-        self.fetch[meta.location.archetype as usize]
+        self.fetch[meta.location.archetype.index()]
             .as_ref()
             .map(|fetch| fetch.get(meta.location.index as usize))
     }

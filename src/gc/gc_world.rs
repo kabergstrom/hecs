@@ -1,28 +1,52 @@
-use core::marker::PhantomData;
+use core::{
+    marker::PhantomData,
+    ops::{Deref, DerefMut},
+};
 
 use crate::{
-    Bundle, CRef, Component, ComponentError, DynamicBundle, Entity, MissingComponent, NoSuchEntity,
-    TypeInfo, World,
+    Archetype, Bundle, CRef, Component, ComponentError, DynamicBundle, Entity, MissingComponent,
+    NoSuchEntity, TypeInfo, World,
 };
 
 use super::query::{Query, QueryBorrow};
 
-pub struct GCWorld<'a> {
+pub struct GcWorldScope<'a> {
     original_world_ref: &'a mut World,
-    // We have to take ownership by core::mem::swap-ing the World into the scope,
-    // since it'd otherwise be possible to core::mem::forget the ErgoScope to avoid
-    // invoking the `Drop` impl, which is required for soundness.
+    gc_world: GcWorld,
+}
+impl<'a> Deref for GcWorldScope<'a> {
+    type Target = GcWorld;
+
+    fn deref(&self) -> &Self::Target {
+        &self.gc_world
+    }
+}
+impl<'a> DerefMut for GcWorldScope<'a> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.gc_world
+    }
+}
+
+pub struct GcWorld {
     pub(super) world: World,
 }
 
-impl<'a> GCWorld<'a> {
-    pub fn new(world: &'a mut World) -> Self {
+impl GcWorld {
+    pub fn new() -> Self {
+        let world = World::new();
+        unsafe { super::enable_gc_borrows(world.world_slot()) };
+        Self { world }
+    }
+    pub fn new_scope(world: &mut World) -> GcWorldScope<'_> {
         let mut world_temp = World::default();
         unsafe { super::enable_gc_borrows(world.world_slot()) };
+        // We have to take ownership by core::mem::swap-ing the World into the scope,
+        // since it'd otherwise be possible to core::mem::forget the ErgoScope to avoid
+        // invoking the `Drop` impl, which is required for soundness.
         core::mem::swap(&mut world_temp, world);
-        Self {
+        GcWorldScope {
             original_world_ref: world,
-            world: world_temp,
+            gc_world: Self { world: world_temp },
         }
     }
 
@@ -61,7 +85,7 @@ impl<'a> GCWorld<'a> {
         entity: Entity,
         components: impl DynamicBundle,
     ) -> Result<(), NoSuchEntity> {
-        todo!()
+        unsafe { self.world.insert_nonsync(entity, components) }
     }
 
     /// Create an entity with certain components
@@ -80,91 +104,40 @@ impl<'a> GCWorld<'a> {
     /// ```
     /// # use hecs::gc::*;
     /// let mut world = hecs::World::new();
-    /// let ergo = GCWorld::new(&mut world);
+    /// let ergo = GcWorld::new_scope(&mut world);
     /// let a = ergo.spawn((123, "abc".to_string()));
     /// let b = ergo.spawn((456, true));
     /// ```
     pub fn spawn(&self, components: impl DynamicBundle) -> Entity {
-        todo!();
-    }
-
-    // fn spawn_inner(&mut self, entity: Entity, components: impl DynamicBundle) {
-    //     let archetype_id = match components.key() {
-    //         Some(k) => {
-    //             let archetypes = &mut self.archetypes;
-    //             *self.bundle_to_archetype.entry(k).or_insert_with(|| {
-    //                 components.with_ids(|ids| archetypes.get(ids, || components.type_info()))
-    //             })
-    //         }
-    //         None => components.with_ids(|ids| self.archetypes.get(ids, || components.type_info())),
-    //     };
-
-    //     let archetype = &mut self.archetypes.archetypes[archetype_id as usize];
-    //     unsafe {
-    //         let index = archetype.allocate(entity.id, self.world_slot);
-    //         components.put(|ptr, ty| {
-    //             archetype.put_new_dynamic(ptr, &ty, index);
-    //         });
-    //         self.entities.meta[entity.id as usize].location = Location {
-    //             archetype: archetype_id,
-    //             index,
-    //         };
-    //     }
-    // }
-
-    /// Create an entity with certain components and a specific [`Entity`] handle.
-    ///
-    /// See [`spawn`](Self::spawn).
-    ///
-    /// Despawns any existing entity with the same [`Entity::id`].
-    ///
-    /// # Example
-    /// ```
-    /// # use hecs::gc::*;
-    /// let mut world = hecs::World::new();
-    /// let ergo = GCWorld::new(&mut world);
-    /// let a = ergo.spawn((123, "abc".to_string()));
-    /// let b = ergo.spawn((456, true));
-    /// ergo.despawn(a);
-    /// assert!(!ergo.contains(a));
-    /// // all previous Entity values pointing to 'a' will be live again, instead pointing to the new entity.
-    /// ergo.spawn_at(a, (789, "ABC".to_string()));
-    /// assert!(ergo.contains(a));
-    /// ```
-    pub fn spawn_at(&self, entity: Entity, components: impl DynamicBundle) {
-        todo!();
-    }
-
-    /// Allocate an entity ID
-    pub fn reserve_entity(&self) -> Entity {
-        self.world.entities().reserve_entity()
+        unsafe { self.world.spawn_nonsync(components) }
     }
 
     /// Remove the `T` component from `entity`
     ///
     /// See [`remove`](Self::remove).
     pub fn remove_one<T: Component>(&self, entity: Entity) -> Result<T, ComponentError> {
-        todo!()
+        unsafe { self.world.remove_one_nonsync::<T>(entity) }
     }
 
     /// Remove components from `entity`
     ///
     /// When removing a single component, see [`remove_one`](Self::remove_one) for convenience.
     pub fn remove<T: Bundle + 'static>(&self, entity: Entity) -> Result<T, ComponentError> {
-        todo!()
+        unsafe { self.world.remove_nonsync::<T>(entity) }
     }
 
     // /// Destroy an entity and all its components
     pub fn despawn(&self, entity: Entity) -> Result<(), NoSuchEntity> {
-        todo!()
+        unsafe { self.world.despawn_nonsync(entity) }
     }
 
     // TODO implement len()
+    //    pub fn entity(&self, entity: Entity) -> Result<EntityRef<'_>, NoSuchEntity> {}
 
     // TODO implement
-    pub fn satisfies<Q: Query>(&self, entity: Entity) -> Result<bool, NoSuchEntity> {
-        todo!()
-    }
+    // pub fn satisfies<Q: Query>(&self, entity: Entity) -> Result<bool, NoSuchEntity> {
+    //     Ok(self.entity(entity)?)
+    // }
 
     /// Whether `entity` exists
     pub fn contains(&self, entity: Entity) -> bool {
@@ -198,7 +171,7 @@ impl<'a> GCWorld<'a> {
     /// let a = world.spawn((123, true, "abc".to_string()));
     /// let b = world.spawn((456, false));
     /// let c = world.spawn((42, "def".to_string()));
-    /// let ergo = GCWorld::new(&mut world);
+    /// let ergo = GcWorld::new_scope(&mut world);
     /// let entities = ergo.query::<(&i32, &bool)>()
     ///     .iter()
     ///     .map(|(e, (i, b))| (e, *i.read(), *b.read())) // Copy out of the world
@@ -208,13 +181,49 @@ impl<'a> GCWorld<'a> {
     /// assert!(entities.contains(&(b, 456, false)));
     /// ```
     pub fn query<Q: Query>(&self) -> QueryBorrow<'_, Q> {
-        QueryBorrow::new(&self.world.entities().meta, self.world.archetypes_inner())
+        QueryBorrow::new(
+            &self.world.entities().meta,
+            self.world.archetypes_inner().iter(),
+        )
     }
 }
 
-impl<'a> Drop for GCWorld<'a> {
+impl<'a> Drop for GcWorldScope<'a> {
+    fn drop(&mut self) {
+        core::mem::swap(self.original_world_ref, &mut self.gc_world.world);
+    }
+}
+
+impl Drop for GcWorld {
     fn drop(&mut self) {
         unsafe { super::disable_gc_borrows(self.world.world_slot()) };
-        core::mem::swap(self.original_world_ref, &mut self.world);
+    }
+}
+
+#[derive(Copy, Clone)]
+pub struct EntityRef<'a> {
+    archetype: &'a Archetype,
+    entity: Entity,
+    index: u32,
+}
+
+impl<'a> EntityRef<'a> {
+    #[inline]
+    pub fn entity(&self) -> Entity {
+        self.entity
+    }
+
+    /// Determine whether this entity has a `T` component without borrowing it
+    ///
+    /// Equivalent to [`satisfies::<&T>`](Self::satisfies)
+    pub fn has<T: Component>(&self) -> bool {
+        self.archetype.has::<T>()
+    }
+
+    pub(crate) fn archetype(&self) -> &Archetype {
+        &self.archetype
+    }
+    pub(crate) fn index(&self) -> u32 {
+        self.index
     }
 }

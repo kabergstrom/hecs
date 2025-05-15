@@ -4,6 +4,7 @@ pub mod kvec;
 
 pub(crate) mod cells;
 pub mod query;
+use bevy_reflect::impl_reflect_opaque;
 use core::{
     any::{Any, TypeId},
     cell::Cell,
@@ -13,18 +14,17 @@ use core::{
     ptr::NonNull,
     sync::atomic::{AtomicBool, Ordering},
 };
-pub use gc_world::GCWorld;
+pub use gc_world::{GcWorld, GcWorldScope};
 pub use query::*;
-
-use alloc::boxed::Box;
-use alloc::vec::Vec;
-use bevy_reflect::{impl_reflect_value, FromReflect, FromType, Reflect, ReflectMut, TypeRegistry};
-use hashbrown::HashSet;
 
 use crate::{
     archetype::{StorageHeader, DATA_CHUNK_SIZE_BYTES},
     Component, Entity, TypeInfo, World,
 };
+use alloc::vec::Vec;
+#[cfg(feature = "bevy_reflect")]
+use bevy_reflect::{FromType, Reflect, ReflectMut, TypeRegistry};
+use hashbrown::HashSet;
 
 use self::borrow::{BorrowFlag, BorrowRef, BorrowRefMut, Ref, RefMut};
 
@@ -116,14 +116,19 @@ impl GCPtr {
         self.header_ptr().as_mut().referenced = true;
     }
     pub unsafe fn drop_value_and_tombstone(&mut self, ty: &TypeInfo) {
-        assert!(
-            self.header_ptr().as_ref().state
-                == State::Alive {
-                    borrow: Cell::new(0)
+        match self.header_ptr().as_ref().state {
+            State::Alive { ref borrow, .. } => {
+                if borrow.get() == 0 {
+                    ty.drop_value(self.value_ptr().as_ptr());
+                    self.header_ptr().as_mut().set_tombstone();
+                } else {
+                    self.header_ptr().as_mut().state = State::PendingDead;
                 }
-        );
-        ty.drop_value(self.value_ptr().as_ptr());
-        self.header_ptr().as_mut().set_tombstone();
+            }
+            ref state => {
+                panic!("unexpected state when dropping value: {:?}", state)
+            }
+        }
     }
     pub unsafe fn move_from_value(&mut self, ty: &TypeInfo, value: *mut u8) {
         let dst_header = self.header_ptr().as_ptr();
@@ -168,7 +173,7 @@ impl GCPtr {
         match header.state {
             State::Dead => !header.referenced,
             State::Moved { .. } => !header.referenced,
-            State::Free { .. } | State::Alive { .. } => false,
+            State::Free { .. } | State::Alive { .. } | State::PendingDead => false,
         }
     }
 }
@@ -182,6 +187,8 @@ pub(crate) enum State {
     Moved { new_ptr: GCPtr },
     /// Slot contains a valid value
     Alive { borrow: Cell<BorrowFlag> },
+    /// Slot contains a valid value, but borrows exist so the value will be dropped when all active borrows expire
+    PendingDead,
     /// Slot does not contain a valid value, but references may exist to it so it cannot be reused.
     Dead,
 }
@@ -229,12 +236,57 @@ pub struct CRef<T: Component> {
     pub(crate) _marker: PhantomData<&'static T>,
 }
 
-impl_reflect_value!(CRef<T: Clone + Component + 'static>());
-impl<T: Clone + Component> FromReflect for CRef<T> {
-    fn from_reflect(reflect: &dyn Reflect) -> Option<Self> {
-        reflect.downcast_ref::<Self>().cloned()
+#[cfg(feature = "mirror_mirror")]
+impl<T: Clone + Component> Reflect for CRef<T> {
+    fn type_descriptor(&self) -> alloc::borrow::Cow<'static, mirror_mirror::TypeDescriptor> {
+        todo!()
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        todo!()
+    }
+
+    fn as_any_mut(&mut self) -> &mut dyn Any {
+        todo!()
+    }
+
+    fn as_reflect(&self) -> &dyn Reflect {
+        todo!()
+    }
+
+    fn as_reflect_mut(&mut self) -> &mut dyn Reflect {
+        todo!()
+    }
+
+    fn reflect_owned(self: Box<Self>) -> mirror_mirror::ReflectOwned {
+        todo!()
+    }
+
+    fn reflect_ref(&self) -> mirror_mirror::ReflectRef<'_> {
+        todo!()
+    }
+
+    fn reflect_mut(&mut self) -> ReflectMut<'_> {
+        todo!()
+    }
+
+    fn patch(&mut self, value: &dyn Reflect) {
+        todo!()
+    }
+
+    fn to_value(&self) -> mirror_mirror::Value {
+        todo!()
+    }
+
+    fn clone_reflect(&self) -> Box<dyn Reflect> {
+        todo!()
+    }
+
+    fn debug(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        todo!()
     }
 }
+
 impl<T: core::fmt::Debug + Component> core::fmt::Debug for CRef<T> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         todo!();
@@ -251,10 +303,14 @@ impl<T: Component> CRef<T> {
         let slot = self.ptr.world_slot();
         assert!(is_gc_borrows_enabled(slot), "gc borrows not enabled");
         let ptr = self.ptr.resolve_moved();
-        if let State::Alive { borrow } = unsafe { &ptr.header_ptr().as_ref().state } {
+        let header = unsafe { ptr.header_ptr().as_ref() };
+        if let State::Alive { borrow } = &header.state {
             let borrow = BorrowRef::new(&borrow).expect("already mutable borrowed");
             Ref {
                 borrow,
+                state: unsafe {
+                    NonNull::new_unchecked(core::ptr::addr_of!(header.state).cast_mut())
+                },
                 value: ptr.value_ptr().cast(),
             }
         } else {
@@ -262,19 +318,61 @@ impl<T: Component> CRef<T> {
         }
     }
 
+    pub fn try_read(&self) -> Option<Ref<'_, T>> {
+        let slot = self.ptr.world_slot();
+        assert!(is_gc_borrows_enabled(slot), "gc borrows not enabled");
+        let ptr = self.ptr.resolve_moved();
+        let header = unsafe { ptr.header_ptr().as_ref() };
+        if let State::Alive { borrow } = &header.state {
+            let borrow = BorrowRef::new(&borrow).expect("already mutable borrowed");
+            Some(Ref {
+                borrow,
+                state: unsafe {
+                    NonNull::new_unchecked(core::ptr::addr_of!(header.state).cast_mut())
+                },
+                value: ptr.value_ptr().cast(),
+            })
+        } else {
+            None
+        }
+    }
+
     pub fn write(&self) -> RefMut<'_, T> {
         let slot = self.ptr.world_slot();
         assert!(is_gc_borrows_enabled(slot), "gc borrows not enabled");
         let ptr = self.ptr.resolve_moved();
-        if let State::Alive { borrow } = unsafe { &ptr.header_ptr().as_ref().state } {
+        let header = unsafe { ptr.header_ptr().as_ref() };
+        if let State::Alive { borrow } = &header.state {
             let borrow = BorrowRefMut::new(&borrow).expect("already mutable borrowed");
             RefMut {
                 borrow,
+                state: unsafe {
+                    NonNull::new_unchecked(core::ptr::addr_of!(header.state).cast_mut())
+                },
                 value: ptr.value_ptr().cast(),
                 marker: Default::default(),
             }
         } else {
             panic!("Borrowing a deleted component")
+        }
+    }
+    pub fn try_write(&self) -> Option<RefMut<'_, T>> {
+        let slot = self.ptr.world_slot();
+        assert!(is_gc_borrows_enabled(slot), "gc borrows not enabled");
+        let ptr = self.ptr.resolve_moved();
+        let header = unsafe { ptr.header_ptr().as_ref() };
+        if let State::Alive { borrow } = &header.state {
+            let borrow = BorrowRefMut::new(&borrow).expect("already mutable borrowed");
+            Some(RefMut {
+                borrow,
+                state: unsafe {
+                    NonNull::new_unchecked(core::ptr::addr_of!(header.state).cast_mut())
+                },
+                value: ptr.value_ptr().cast(),
+                marker: Default::default(),
+            })
+        } else {
+            None
         }
     }
 }
@@ -297,6 +395,7 @@ impl<T: Component> GCRef for CRef<T> {
         ))
     }
 }
+#[cfg(feature = "bevy_reflect")]
 impl<T: Component + Clone> FromType<CRef<T>> for GCRefTypeData {
     fn from_type() -> Self {
         Self {
@@ -323,9 +422,10 @@ pub(crate) fn gc_type_traversal(
     let ty_info = type_registry
         .get_type_info(ty)
         .expect("archetype type not registered");
+    use bevy_reflect::TypeInfo;
 
     match ty_info {
-        bevy_reflect::TypeInfo::Struct(s) => {
+        TypeInfo::Struct(s) => {
             let mut retval = false;
             for i in 0..s.field_len() {
                 let field = s.field_at(i).unwrap();
@@ -338,13 +438,13 @@ pub(crate) fn gc_type_traversal(
             }
             retval
         }
-        bevy_reflect::TypeInfo::TupleStruct(_) => todo!(),
-        bevy_reflect::TypeInfo::Tuple(_) => todo!(),
-        bevy_reflect::TypeInfo::List(_) => todo!(),
-        bevy_reflect::TypeInfo::Array(_) => todo!(),
-        bevy_reflect::TypeInfo::Map(_) => todo!(),
-        bevy_reflect::TypeInfo::Enum(_) => todo!(),
-        bevy_reflect::TypeInfo::Value(v) => {
+        TypeInfo::TupleStruct(_) => todo!(),
+        TypeInfo::Tuple(_) => todo!(),
+        TypeInfo::List(_) => todo!(),
+        TypeInfo::Array(_) => todo!(),
+        TypeInfo::Map(_) => todo!(),
+        TypeInfo::Enum(_) => todo!(),
+        TypeInfo::Opaque(v) => {
             if let Some(get_gc_info) = type_registry.get_type_data::<GCRefTypeData>(v.type_id()) {
                 out.push(TraversalCommand::GCInfoFn(get_gc_info.gc_info));
                 true
@@ -352,7 +452,7 @@ pub(crate) fn gc_type_traversal(
                 false
             }
         }
-        bevy_reflect::TypeInfo::Dynamic(_) => unimplemented!(),
+        TypeInfo::Set(_) => todo!(),
     }
 }
 
@@ -416,13 +516,14 @@ pub unsafe fn trace(
                     }
                 }
             }
+            State::PendingDead => assert!(false, "Pointer to borrowed memory, pending dead"),
             State::Free { .. } => assert!(false, "Pointer to freed memory"),
             State::Dead => {}
         }
     }
 
     let mut archetype_iter_set = Vec::new();
-    for archetype in world.archetypes_mut() {
+    for (_, archetype) in world.archetypes() {
         archetype_iter_set.clear();
         // prepare iterators for each storage
         for (idx, _) in archetype.types().iter().enumerate() {

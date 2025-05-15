@@ -19,6 +19,9 @@ impl UsizeCell {
     pub fn load_atomic(&self, ordering: Ordering) -> usize {
         unsafe { (&*self.0.get().cast::<AtomicUsize>()).load(ordering) }
     }
+    pub fn increment_atomic(&self, ordering: Ordering) -> usize {
+        unsafe { (&*self.0.get().cast::<AtomicUsize>()).fetch_add(1, ordering) }
+    }
     pub unsafe fn write_nonsync(&self, val: usize) {
         self.0.get().write(val)
     }
