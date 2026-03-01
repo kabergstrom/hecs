@@ -5,10 +5,10 @@ use core::{
 
 use crate::{
     Archetype, Bundle, CRef, Component, ComponentError, DynamicBundle, Entity, MissingComponent,
-    NoSuchEntity, TypeInfo, World,
+    NoSuchEntity, QueryOneError, TypeInfo, World,
 };
 
-use super::query::{Query, QueryBorrow};
+use super::query::{Fetch, Query, QueryBorrow, QueryItem};
 
 pub struct GcWorldScope<'a> {
     original_world_ref: &'a mut World,
@@ -131,20 +131,54 @@ impl GcWorld {
         unsafe { self.world.despawn_nonsync(entity) }
     }
 
-    // TODO implement len()
-    //    pub fn entity(&self, entity: Entity) -> Result<EntityRef<'_>, NoSuchEntity> {}
+    /// Returns the number of entities in the world
+    pub fn len(&self) -> u32 {
+        self.world.len()
+    }
 
-    // TODO implement
-    // pub fn satisfies<Q: Query>(&self, entity: Entity) -> Result<bool, NoSuchEntity> {
-    //     Ok(self.entity(entity)?)
-    // }
+    /// Returns `true` if the world contains no entities
+    pub fn is_empty(&self) -> bool {
+        self.world.is_empty()
+    }
+
+    /// Resolve entity location, returning `Err` if despawned (including nonsync/tombstoned)
+    fn resolve(&self, entity: Entity) -> Result<(&Archetype, u32), NoSuchEntity> {
+        let loc = self.world.entities().get(entity)?;
+        let archetype = &self.world.archetypes_inner()[loc.archetype];
+        if archetype.entity_id(loc.index) == u32::MAX {
+            return Err(NoSuchEntity);
+        }
+        Ok((archetype, loc.index))
+    }
+
+    /// Returns an [`EntityRef`] for the given entity
+    pub fn entity(&self, entity: Entity) -> Result<EntityRef<'_>, NoSuchEntity> {
+        let (archetype, index) = self.resolve(entity)?;
+        Ok(EntityRef {
+            archetype,
+            entity,
+            index,
+        })
+    }
+
+    /// Returns `true` if `entity` satisfies the query `Q`
+    pub fn satisfies<Q: Query>(&self, entity: Entity) -> Result<bool, NoSuchEntity> {
+        let e = self.entity(entity)?;
+        Ok(Q::Fetch::prepare(e.archetype()).is_some())
+    }
 
     /// Whether `entity` exists
     pub fn contains(&self, entity: Entity) -> bool {
-        self.world.contains(entity)
+        self.resolve(entity).is_ok()
     }
 
-    // TODO implement query_one
+    /// Query a single entity
+    pub fn query_one<Q: Query>(&self, entity: Entity) -> Result<QueryItem<'_, Q>, QueryOneError> {
+        let (archetype, index) = self.resolve(entity)?;
+        let state = Q::Fetch::prepare(archetype).ok_or(QueryOneError::Unsatisfied)?;
+        let fetch = Q::Fetch::execute(archetype, state);
+        unsafe { Ok(fetch.get(index as usize)) }
+    }
 
     /// Iterate over all entities that have certain components.
     ///
@@ -220,10 +254,157 @@ impl<'a> EntityRef<'a> {
         self.archetype.has::<T>()
     }
 
+    /// Borrow the component of type `T`, if it exists
+    pub fn get<T: Component>(&self) -> Result<CRef<T>, MissingComponent> {
+        let gc_ptr = unsafe {
+            self.archetype
+                .get_dynamic(&TypeInfo::of::<T>(), self.index)
+        };
+        gc_ptr
+            .map(|ptr| CRef {
+                ptr,
+                _marker: PhantomData,
+            })
+            .ok_or(MissingComponent::new::<T>())
+    }
+
     pub(crate) fn archetype(&self) -> &Archetype {
         &self.archetype
     }
     pub(crate) fn index(&self) -> u32 {
         self.index
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::{World, GcWorld, QueryOneError};
+
+    #[test]
+    fn len_and_is_empty() {
+        let mut world = World::new();
+        {
+            let gc = GcWorld::new_scope(&mut world);
+            assert!(gc.is_empty());
+            assert_eq!(gc.len(), 0);
+            gc.spawn((1i32,));
+            gc.spawn((2i32,));
+            assert_eq!(gc.len(), 2);
+            assert!(!gc.is_empty());
+        }
+        crate::world::tests::cleanup(world);
+    }
+
+    #[test]
+    fn entity_ref_get() {
+        let mut world = World::new();
+        {
+            let gc = GcWorld::new_scope(&mut world);
+            let e = gc.spawn((42i32, true));
+            let entity_ref = gc.entity(e).unwrap();
+            assert!(entity_ref.has::<i32>());
+            assert!(!entity_ref.has::<f32>());
+            let val = entity_ref.get::<i32>().unwrap();
+            assert_eq!(*val.read(), 42);
+            let val = entity_ref.get::<bool>().unwrap();
+            assert_eq!(*val.read(), true);
+            assert!(entity_ref.get::<f32>().is_err());
+        }
+        crate::world::tests::cleanup(world);
+    }
+
+    #[test]
+    fn satisfies() {
+        let mut world = World::new();
+        {
+            let gc = GcWorld::new_scope(&mut world);
+            let e = gc.spawn((42i32, true));
+            assert!(gc.satisfies::<(&i32,)>(e).unwrap());
+            assert!(gc.satisfies::<(&i32, &bool)>(e).unwrap());
+            assert!(!gc.satisfies::<(&f32,)>(e).unwrap());
+        }
+        crate::world::tests::cleanup(world);
+    }
+
+    #[test]
+    fn query_one() {
+        let mut world = World::new();
+        {
+            let gc = GcWorld::new_scope(&mut world);
+            let e = gc.spawn((42i32, 3.14f32));
+            let (i, f) = gc.query_one::<(&i32, &f32)>(e).unwrap();
+            assert_eq!(*i.read(), 42);
+            assert_eq!(*f.read(), 3.14f32);
+        }
+        crate::world::tests::cleanup(world);
+    }
+
+    #[test]
+    fn query_one_unsatisfied() {
+        let mut world = World::new();
+        {
+            let gc = GcWorld::new_scope(&mut world);
+            let e = gc.spawn((42i32,));
+            let result = gc.query_one::<(&f32,)>(e);
+            assert!(matches!(result, Err(QueryOneError::Unsatisfied)));
+        }
+        crate::world::tests::cleanup(world);
+    }
+
+    #[test]
+    fn query_one_no_such_entity() {
+        let mut world = World::new();
+        let stale = world.spawn((42i32,));
+        world.despawn(stale).unwrap();
+        {
+            let gc = GcWorld::new_scope(&mut world);
+            let result = gc.query_one::<(&i32,)>(stale);
+            assert!(matches!(result, Err(QueryOneError::NoSuchEntity)));
+        }
+        crate::world::tests::cleanup(world);
+    }
+
+    #[test]
+    fn contains_and_entity_detect_nonsync_despawn() {
+        let mut world = World::new();
+        {
+            let gc = GcWorld::new_scope(&mut world);
+            let e = gc.spawn((42i32,));
+            assert!(gc.contains(e));
+            assert!(gc.entity(e).is_ok());
+            gc.despawn(e).unwrap();
+            assert!(!gc.contains(e));
+            assert!(gc.entity(e).is_err());
+        }
+        crate::world::tests::cleanup(world);
+    }
+
+    #[test]
+    fn query_one_after_nonsync_despawn() {
+        let mut world = World::new();
+        {
+            let gc = GcWorld::new_scope(&mut world);
+            let e = gc.spawn((42i32,));
+            assert!(gc.query_one::<(&i32,)>(e).is_ok());
+            gc.despawn(e).unwrap();
+            assert!(matches!(
+                gc.query_one::<(&i32,)>(e),
+                Err(QueryOneError::NoSuchEntity)
+            ));
+        }
+        crate::world::tests::cleanup(world);
+    }
+
+    #[test]
+    fn entity_ref_after_sync_despawn() {
+        let mut world = World::new();
+        let e = world.spawn((42i32,));
+        world.despawn(e).unwrap();
+        {
+            let gc = GcWorld::new_scope(&mut world);
+            assert!(gc.entity(e).is_err());
+            assert!(!gc.contains(e));
+        }
+        crate::world::tests::cleanup(world);
     }
 }

@@ -1,5 +1,6 @@
 mod borrow;
 mod gc_world;
+#[allow(missing_documentation)]
 pub mod kvec;
 
 pub(crate) mod cells;
@@ -289,7 +290,10 @@ impl<T: Clone + Component> Reflect for CRef<T> {
 
 impl<T: core::fmt::Debug + Component> core::fmt::Debug for CRef<T> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        todo!();
+        f.debug_struct("CRef")
+            .field("type", &core::any::type_name::<T>())
+            .field("ptr", &self.ptr.resolve_moved())
+            .finish()
     }
 }
 
