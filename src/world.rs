@@ -499,6 +499,46 @@ impl World {
         self.world_slot
     }
 
+    /// Resolve a GCPtr (from a CRef) to the Entity it belongs to.
+    ///
+    /// Returns `None` if the pointer belongs to a different world, the slot
+    /// is not alive, or the entity id is invalid.
+    ///
+    /// # Safety
+    /// `ptr` must be a valid GCPtr originating from this World.
+    pub unsafe fn entity_from_gc_ptr(&self, ptr: crate::gc::GCPtr) -> Option<Entity> {
+        use crate::archetype::DATA_CHUNK_SIZE_BYTES;
+        // Verify the pointer belongs to this world
+        if ptr.world_slot() != self.world_slot {
+            return None;
+        }
+        // Resolve moved pointers
+        let resolved = ptr.resolve_moved();
+        let header = resolved.header_ptr().as_ref();
+        if !matches!(header.state, crate::gc::State::Alive { .. }) {
+            return None;
+        }
+        let addr = resolved.value_ptr().as_ptr() as usize;
+        // Find the archetype containing this pointer by checking chunk address ranges
+        for (_, archetype) in self.archetypes() {
+            for (col_idx, _) in archetype.types().iter().enumerate() {
+                let data = archetype.get_data_storage(col_idx);
+                for chunk_ptr in data.chunks() {
+                    let chunk_addr = *chunk_ptr as usize;
+                    if addr >= chunk_addr && addr < chunk_addr + DATA_CHUNK_SIZE_BYTES {
+                        let slot = resolved.archetype_slot();
+                        let entity_id = archetype.entity_id(slot);
+                        if entity_id != u32::MAX {
+                            return Some(self.entities.resolve_unknown_gen(entity_id));
+                        }
+                        return None;
+                    }
+                }
+            }
+        }
+        None
+    }
+
     /// Prepare a query against a single entity, using dynamic borrow checking
     ///
     /// Prefer [`query_one_mut`](Self::query_one_mut) when concurrent access to the [`World`] is not

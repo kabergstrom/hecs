@@ -73,7 +73,7 @@ mod sharedvec;
 mod take;
 mod world;
 
-pub use archetype::Archetype;
+pub use archetype::{Archetype, Data, DATA_CHUNK_SIZE_BYTES};
 pub use batch::{BatchIncomplete, BatchWriter, ColumnBatch, ColumnBatchBuilder, ColumnBatchType};
 #[cfg(feature = "bevy_reflect")]
 pub use bevy_reflect;

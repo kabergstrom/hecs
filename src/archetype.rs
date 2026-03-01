@@ -193,7 +193,7 @@ impl Archetype {
     }
 
     #[inline]
-    pub(crate) fn allocated_values_sync(&self) -> u32 {
+    pub fn allocated_values_sync(&self) -> u32 {
         self.len.load_atomic(Ordering::Relaxed)
     }
 
@@ -212,7 +212,7 @@ impl Archetype {
         unsafe { NonNull::new_unchecked(self.entities.as_ptr() as *mut u32) }
     }
 
-    pub(crate) fn entity_id(&self, index: u32) -> u32 {
+    pub fn entity_id(&self, index: u32) -> u32 {
         (&self.entities[index as usize]).into()
     }
 
@@ -225,7 +225,7 @@ impl Archetype {
         self.entities[index].write_nonsync(id);
     }
 
-    pub(crate) fn types(&self) -> &[TypeInfo] {
+    pub fn types(&self) -> &[TypeInfo] {
         &self.types
     }
 
@@ -252,7 +252,7 @@ impl Archetype {
     }
 
     /// `index` must be in-bounds or just past the end
-    pub(crate) unsafe fn get_data_storage(&self, state: usize) -> &Data {
+    pub unsafe fn get_data_storage(&self, state: usize) -> &Data {
         debug_assert!(state < self.types.len());
         self.data.get_unchecked(state)
     }
@@ -555,14 +555,14 @@ impl Drop for Archetype {
     }
 }
 
-pub(crate) const DATA_CHUNK_SIZE_BYTES: usize = 0x10000;
+pub const DATA_CHUNK_SIZE_BYTES: usize = 0x10000;
 pub(crate) struct StorageHeader {
     pub(crate) world_slot: NonZeroU32,
     pub(crate) chunk_idx: usize,
     pub(crate) data_start: usize,
     pub(crate) stride: usize,
 }
-pub(crate) struct Data {
+pub struct Data {
     storage: KVec<*mut u8>,
     storage_layout: Layout,
     header_layout: Layout,
@@ -587,7 +587,7 @@ impl Data {
         }
     }
     #[inline(always)]
-    pub(crate) fn chunks(&self) -> &[*mut u8] {
+    pub fn chunks(&self) -> &[*mut u8] {
         &self.storage
     }
     #[inline(always)]
@@ -607,7 +607,7 @@ impl Data {
         self.entities_per_chunk
     }
 
-    pub(crate) unsafe fn get_gc_ptr(&self, idx: u32) -> GCPtr {
+    pub unsafe fn get_gc_ptr(&self, idx: u32) -> GCPtr {
         let idx = idx as usize;
         let entities_per_chunk = self.entities_per_chunk;
         let chunk_idx = idx / entities_per_chunk;

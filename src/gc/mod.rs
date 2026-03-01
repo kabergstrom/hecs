@@ -161,7 +161,7 @@ impl GCPtr {
         );
     }
 
-    fn resolve_moved(&self) -> Self {
+    pub fn resolve_moved(&self) -> Self {
         let mut ptr = *self;
         while let State::Moved { new_ptr } = unsafe { self.header_ptr().as_ref() }.state {
             ptr = new_ptr;
@@ -181,7 +181,7 @@ impl GCPtr {
 
 #[derive(PartialEq, Debug)]
 #[repr(u8)]
-pub(crate) enum State {
+pub enum State {
     /// Slot is free and available for use
     Free { next_free: Option<GCPtr> },
     /// Slot has been moved elsewhere.
@@ -217,6 +217,10 @@ impl GCHeader {
     }
     pub fn set_tombstone(&mut self) {
         self.state = State::Dead;
+    }
+    /// Returns true if this slot is in the Alive state.
+    pub fn is_alive(&self) -> bool {
+        matches!(self.state, State::Alive { .. })
     }
 }
 impl<T: Component + core::fmt::Debug> core::fmt::Debug for GC<T> {
@@ -563,6 +567,57 @@ pub unsafe fn trace(
             }
         }
     }
+}
+
+/// Sweep tombstones from the world, freeing slots where all components are
+/// Dead/Moved and not marked as referenced. Resets all `referenced` flags.
+///
+/// Call this after marking live slots with `GCPtr::mark_referenced()`.
+/// Returns the number of entity slots freed.
+///
+/// # Safety
+/// Must not be called while any GcWorld scope is active or while component
+/// borrows are held.
+pub unsafe fn sweep(world: &World) -> u32 {
+    let mut freed = 0u32;
+    let mut archetype_iter_set = Vec::new();
+    for (_, archetype) in world.archetypes() {
+        let count = archetype.allocated_values_nonsync();
+        archetype_iter_set.clear();
+        for (idx, _) in archetype.types().iter().enumerate() {
+            let storage = archetype.get_data_storage(idx);
+            archetype_iter_set.push(
+                storage
+                    .iter_gc_ptr(count)
+                    .into_iter(),
+            );
+        }
+        for slot in 0..count {
+            let mut can_free = true;
+            for iter in &mut archetype_iter_set {
+                let gc_ptr = iter.next().unwrap();
+                can_free &= gc_ptr.can_free();
+            }
+            if can_free {
+                archetype.free_slot(slot);
+                freed += 1;
+            }
+        }
+        // Reset referenced flags
+        for (idx, _) in archetype.types().iter().enumerate() {
+            let storage = archetype.get_data_storage(idx);
+            for ptr in storage
+                .iter_gc_ptr(count)
+                .into_iter()
+            {
+                let header = &mut *ptr.header_ptr().as_ptr();
+                if header.referenced {
+                    header.referenced = false;
+                }
+            }
+        }
+    }
+    freed
 }
 
 const FALSE_BOOL: AtomicBool = AtomicBool::new(false);
