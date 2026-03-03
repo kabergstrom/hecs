@@ -10,7 +10,7 @@ use crate::alloc::boxed::Box;
 use crate::alloc::{vec, vec::Vec};
 use crate::gc::cells::{PtrCell, U32Cell};
 use crate::gc::kvec::KVec;
-use crate::gc::{GCHeader, GCPtr, TraversalCommand, GC};
+use crate::gc::{GCHeader, GCPtr, GC};
 use core::any::{type_name, TypeId};
 use core::cell::{Cell, RefCell, UnsafeCell};
 use core::hash::{BuildHasher, BuildHasherDefault, Hasher};
@@ -22,8 +22,6 @@ use core::{arch, fmt};
 use std::thread::current;
 
 use alloc::alloc::alloc_zeroed;
-#[cfg(feature = "bevy_reflect")]
-use bevy_reflect::{Reflect, ReflectFromPtr};
 use hashbrown::{hash_map::DefaultHashBuilder, HashMap};
 #[cfg(feature = "mirror_mirror")]
 use mirror_mirror::Reflect;
@@ -773,7 +771,6 @@ pub struct TypeInfo {
     value_layout: Layout,
     gc_layout: Layout,
     drop: unsafe fn(*mut u8),
-    reflect_from_ptr: unsafe fn(*mut u8) -> *mut dyn Reflect,
     data_start: usize,
     #[cfg(debug_assertions)]
     type_name: &'static str,
@@ -781,7 +778,7 @@ pub struct TypeInfo {
 
 impl TypeInfo {
     /// Construct a `TypeInfo` directly from the static type.
-    pub fn of<T: Reflect + 'static>() -> Self {
+    pub fn of<T: 'static>() -> Self {
         unsafe fn drop_ptr<T>(x: *mut u8) {
             x.cast::<T>().drop_in_place()
         }
@@ -797,7 +794,6 @@ impl TypeInfo {
             value_layout: type_layout,
             data_start,
             drop: drop_ptr::<T>,
-            reflect_from_ptr: |ptr| unsafe { &mut *ptr.cast::<T>() as &mut dyn Reflect },
             #[cfg(debug_assertions)]
             type_name: core::any::type_name::<T>(),
         }
@@ -811,7 +807,6 @@ impl TypeInfo {
         id: TypeId,
         layout: Layout,
         drop: unsafe fn(*mut u8),
-        reflect_from_ptr: unsafe fn(*mut u8) -> *mut dyn Reflect,
     ) -> Self {
         let (gc_layout, data_start) = Layout::new::<GCHeader>().extend(layout).unwrap();
         let gc_layout = gc_layout.pad_to_align();
@@ -821,7 +816,6 @@ impl TypeInfo {
             gc_layout,
             value_layout: layout,
             data_start,
-            reflect_from_ptr,
             drop,
             #[cfg(debug_assertions)]
             type_name: "<unknown> (TypeInfo constructed from parts)",
@@ -856,10 +850,6 @@ impl TypeInfo {
     /// that this method is being called on a pointer to an object of the correct component type.
     pub unsafe fn drop_value(&self, data: *mut u8) {
         (self.drop)(data);
-    }
-
-    pub fn reflect_from_ptr(&self) -> unsafe fn(*mut u8) -> *mut dyn Reflect {
-        self.reflect_from_ptr
     }
 
     /// Get the function pointer encoding the destructor for the component type this `TypeInfo`

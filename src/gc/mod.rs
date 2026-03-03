@@ -5,7 +5,6 @@ pub mod kvec;
 
 pub(crate) mod cells;
 pub mod query;
-use bevy_reflect::impl_reflect_opaque;
 use core::{
     any::{Any, TypeId},
     cell::Cell,
@@ -20,13 +19,9 @@ pub use query::*;
 
 use crate::{
     archetype::{StorageHeader, DATA_CHUNK_SIZE_BYTES},
-    Component, Entity, TypeInfo, World,
+    Component, TypeInfo, World,
 };
 use alloc::vec::Vec;
-#[cfg(feature = "bevy_reflect")]
-use bevy_reflect::{FromType, Reflect, ReflectMut, TypeRegistry};
-use hashbrown::HashSet;
-
 use self::borrow::{BorrowFlag, BorrowRef, BorrowRefMut, Ref, RefMut};
 
 #[derive(Debug, PartialEq, Eq, Clone, Copy, Hash)]
@@ -385,189 +380,6 @@ impl<T: Component> CRef<T> {
     }
 }
 
-#[derive(Clone)]
-struct GCRefTypeData {
-    gc_info: unsafe fn(&dyn Reflect) -> Option<(GCPtr, unsafe fn(*mut u8) -> *mut dyn Reflect)>,
-}
-trait GCRef {
-    fn gc_info(&self) -> Option<(GCPtr, unsafe fn(*mut u8) -> *mut dyn Reflect)>;
-}
-unsafe fn reflect_from_ptr<T: Reflect + 'static>(p: *mut u8) -> *mut dyn Reflect {
-    &mut *p.cast::<T>() as &mut dyn Reflect
-}
-impl<T: Component> GCRef for CRef<T> {
-    fn gc_info(&self) -> Option<(GCPtr, unsafe fn(*mut u8) -> *mut dyn Reflect)> {
-        Some((
-            self.ptr,
-            reflect_from_ptr::<T> as unsafe fn(*mut u8) -> *mut dyn Reflect,
-        ))
-    }
-}
-#[cfg(feature = "bevy_reflect")]
-impl<T: Component + Clone> FromType<CRef<T>> for GCRefTypeData {
-    fn from_type() -> Self {
-        Self {
-            gc_info: |v| {
-                <CRef<T> as GCRef>::gc_info(unsafe {
-                    &*(v.as_any() as *const dyn core::any::Any as *const CRef<T>)
-                })
-            },
-        }
-    }
-}
-
-#[derive(Copy, Clone)]
-pub(crate) enum TraversalCommand {
-    StructField(usize),
-    GCInfoFn(unsafe fn(&dyn Reflect) -> Option<(GCPtr, unsafe fn(*mut u8) -> *mut dyn Reflect)>),
-}
-
-pub(crate) fn gc_type_traversal(
-    type_registry: &TypeRegistry,
-    ty: TypeId,
-    out: &mut Vec<TraversalCommand>,
-) -> bool {
-    let ty_info = type_registry
-        .get_type_info(ty)
-        .expect("archetype type not registered");
-    use bevy_reflect::TypeInfo;
-
-    match ty_info {
-        TypeInfo::Struct(s) => {
-            let mut retval = false;
-            for i in 0..s.field_len() {
-                let field = s.field_at(i).unwrap();
-                out.push(TraversalCommand::StructField(i));
-                let has_gc_ptr = gc_type_traversal(type_registry, field.type_id(), out);
-                if !has_gc_ptr {
-                    out.pop();
-                }
-                retval |= has_gc_ptr;
-            }
-            retval
-        }
-        TypeInfo::TupleStruct(_) => todo!(),
-        TypeInfo::Tuple(_) => todo!(),
-        TypeInfo::List(_) => todo!(),
-        TypeInfo::Array(_) => todo!(),
-        TypeInfo::Map(_) => todo!(),
-        TypeInfo::Enum(_) => todo!(),
-        TypeInfo::Opaque(v) => {
-            if let Some(get_gc_info) = type_registry.get_type_data::<GCRefTypeData>(v.type_id()) {
-                out.push(TraversalCommand::GCInfoFn(get_gc_info.gc_info));
-                true
-            } else {
-                false
-            }
-        }
-        TypeInfo::Set(_) => todo!(),
-    }
-}
-
-pub unsafe fn trace(
-    type_registry: &TypeRegistry,
-    world: &mut World,
-    entity_roots: impl IntoIterator<Item = Entity>,
-    ptr_roots: impl IntoIterator<Item = (GCPtr, TypeInfo)>,
-) {
-    let mut to_process: Vec<(GCPtr, unsafe fn(*mut u8) -> *mut dyn Reflect)> = Vec::new();
-    let mut processed = HashSet::<GCPtr>::new();
-    for (ptr, ty) in ptr_roots {
-        if processed.insert(ptr) {
-            to_process.push((ptr, ty.reflect_from_ptr()));
-        }
-    }
-    for ent in entity_roots {
-        if let Ok(entity) = world.entity(ent) {
-            unsafe {
-                let archetype = entity.archetype();
-                for (storage_idx, ty) in archetype.types().iter().enumerate() {
-                    let data = archetype.get_data_storage(storage_idx);
-                    let gc_ptr = data.get_gc_ptr(entity.index());
-                    if processed.insert(gc_ptr) {
-                        to_process.push((gc_ptr, ty.reflect_from_ptr()));
-                    }
-                }
-            }
-        }
-    }
-    let mut commands = Vec::new();
-    while let Some((mut gc_ptr, ty)) = to_process.pop() {
-        gc_ptr.mark_referenced();
-        let header = gc_ptr.header_ptr().as_mut();
-        match &header.state {
-            State::Moved { new_ptr } => {
-                if processed.insert(*new_ptr) {
-                    to_process.push((*new_ptr, ty));
-                }
-            }
-            State::Alive { .. } => {
-                let ptr = &mut *ty(gc_ptr.value_ptr().as_ptr());
-                commands.clear();
-                gc_type_traversal(type_registry, ptr.type_id(), &mut commands);
-                for command in &commands {
-                    match command {
-                        TraversalCommand::StructField(field_idx) => {
-                            if let ReflectMut::Struct(s) = ptr.reflect_mut() {
-                                s.field_at(*field_idx);
-                            } else {
-                                panic!("expected struct when traversing type {:?}", ty);
-                            }
-                        }
-                        TraversalCommand::GCInfoFn(f) => {
-                            if let Some((ptr, ty)) = f(ptr) {
-                                if processed.insert(ptr) {
-                                    to_process.push((ptr, ty));
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-            State::PendingDead => assert!(false, "Pointer to borrowed memory, pending dead"),
-            State::Free { .. } => assert!(false, "Pointer to freed memory"),
-            State::Dead => {}
-        }
-    }
-
-    let mut archetype_iter_set = Vec::new();
-    for (_, archetype) in world.archetypes() {
-        archetype_iter_set.clear();
-        // prepare iterators for each storage
-        for (idx, _) in archetype.types().iter().enumerate() {
-            let storage = archetype.get_data_storage(idx);
-            archetype_iter_set.push(
-                storage
-                    .iter_gc_ptr(archetype.allocated_values_nonsync())
-                    .into_iter(),
-            );
-        }
-        // check each slot for whether it can be freed or not, by checking each component
-        for slot in 0..archetype.allocated_values_nonsync() {
-            let mut can_free = true;
-            for iter in &mut archetype_iter_set {
-                let gc_ptr = iter.next().unwrap();
-                can_free &= gc_ptr.can_free();
-            }
-            if can_free {
-                archetype.free_slot(slot);
-            }
-        }
-        // reset referenced flag
-        for (idx, _) in archetype.types().iter().enumerate() {
-            let storage = archetype.get_data_storage(idx);
-            for ptr in storage
-                .iter_gc_ptr(archetype.allocated_values_nonsync())
-                .into_iter()
-            {
-                let header = unsafe { &mut *ptr.header_ptr().as_ptr() };
-                if header.referenced {
-                    header.referenced = false;
-                }
-            }
-        }
-    }
-}
 
 /// Sweep tombstones from the world, freeing slots where all components are
 /// Dead/Moved and not marked as referenced. Resets all `referenced` flags.

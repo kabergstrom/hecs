@@ -9,8 +9,6 @@ use crate::alloc::{vec, vec::Vec};
 use crate::gc::cells::PtrCell;
 use crate::gc::kvec::KVec;
 use crate::gc::{alloc_world_slot, free_world_slot};
-#[cfg(feature = "bevy_reflect")]
-use bevy_reflect::Reflect;
 use core::any::TypeId;
 use core::borrow::Borrow;
 use core::cell::{Cell, UnsafeCell};
@@ -1234,8 +1232,8 @@ impl From<NoSuchEntity> for QueryOneError {
 ///
 /// This is just a convenient shorthand for `Send + Sync + 'static`, and never needs to be
 /// implemented manually.
-pub trait Component: Reflect + Send + Sync + 'static {}
-impl<T: Reflect + Send + Sync + 'static> Component for T {}
+pub trait Component: Send + Sync + 'static {}
+impl<T: Send + Sync + 'static> Component for T {}
 
 /// Iterator over all of a world's entities
 pub struct Iter<'a> {
@@ -1590,25 +1588,12 @@ impl Hasher for IndexTypeIdHasher {
 #[cfg(test)]
 pub(crate) mod tests {
     use alloc::string::{String, ToString};
-    #[cfg(feature = "bevy_reflect")]
-    use bevy_reflect::TypeRegistry;
-
-    #[cfg(feature = "mirror_mirror")]
-    use crate::gc::TypeRegistry;
 
     use super::*;
 
-    fn registry() -> TypeRegistry {
-        let mut registry = TypeRegistry::new();
-        registry.register::<i32>();
-        registry.register::<String>();
-        registry.register::<bool>();
-        registry
-    }
-
     pub(crate) fn cleanup(mut world: World) {
         world.clear();
-        unsafe { crate::gc_trace(&registry(), &mut world, [], []) };
+        unsafe { crate::gc::sweep(&world) };
     }
     #[test]
     fn reuse_empty() {

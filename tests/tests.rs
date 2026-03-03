@@ -8,20 +8,11 @@
 
 use std::borrow::Cow;
 
-use bevy_reflect::TypeRegistry;
 use hecs::*;
-
-fn registry() -> TypeRegistry {
-    let mut registry = TypeRegistry::new();
-    registry.register::<i32>();
-    registry.register::<String>();
-    registry.register::<bool>();
-    registry
-}
 
 fn cleanup(mut world: World) {
     world.clear();
-    unsafe { hecs::gc_trace(&registry(), &mut world, [], []) };
+    unsafe { hecs::gc::sweep(&world) };
 }
 
 #[test]
@@ -977,7 +968,7 @@ fn empty_archetype_conflict() {
     let _ = world.spawn((17, "abc".to_string()));
     let e = world.spawn((12, false, "def".to_string()));
     world.despawn(e).unwrap();
-    unsafe { hecs::gc_trace(&registry(), &mut world, [], []) };
+    unsafe { hecs::gc::sweep(&world) };
     for _ in world.query::<(&mut i32, &String)>().iter() {
         for _ in world.query::<(&mut i32, &bool)>().iter() {}
     }

@@ -1,4 +1,3 @@
-use bevy_reflect::{Reflect, TypeRegistry};
 use hecs::*;
 use rand::{thread_rng, Rng};
 use std::io;
@@ -15,22 +14,22 @@ use std::io;
 State of the simulation is displayed in the sconsole through println! functions.
 */
 
-#[derive(Clone, Debug, Reflect)]
+#[derive(Clone, Debug)]
 struct Position {
     x: i32,
     y: i32,
 }
 
-#[derive(Debug, Reflect)]
+#[derive(Debug)]
 struct Health(i32);
 
-#[derive(Debug, Reflect)]
+#[derive(Debug)]
 struct Speed(i32);
 
-#[derive(Debug, Reflect)]
+#[derive(Debug)]
 struct Damage(i32);
 
-#[derive(Debug, Reflect)]
+#[derive(Debug)]
 struct KillCount(i32);
 
 #[derive(Default, Debug)]
@@ -196,17 +195,7 @@ fn main() {
     cleanup(world);
 }
 
-fn registry() -> TypeRegistry {
-    let mut registry = TypeRegistry::new();
-    registry.register::<Position>();
-    registry.register::<Health>();
-    registry.register::<Speed>();
-    registry.register::<Damage>();
-    registry.register::<KillCount>();
-    registry
-}
-
 fn cleanup(mut world: World) {
     world.clear();
-    unsafe { hecs::gc_trace(&registry(), &mut world, [], []) };
+    unsafe { hecs::gc::sweep(&world) };
 }

@@ -75,14 +75,12 @@ mod world;
 
 pub use archetype::{Archetype, Data, DATA_CHUNK_SIZE_BYTES};
 pub use batch::{BatchIncomplete, BatchWriter, ColumnBatch, ColumnBatchBuilder, ColumnBatchType};
-#[cfg(feature = "bevy_reflect")]
-pub use bevy_reflect;
 pub use bundle::{Bundle, DynamicBundle, DynamicBundleClone, MissingComponent};
 pub use command_buffer::CommandBuffer;
 pub use entities::{Entity, NoSuchEntity};
 pub use entity_builder::{BuiltEntity, BuiltEntityClone, EntityBuilder, EntityBuilderClone};
 pub use entity_ref::{ComponentRef, ComponentRefShared, EntityRef, Ref, RefMut};
-pub use gc::{trace as gc_trace, CRef, GcWorld};
+pub use gc::{CRef, GcWorld};
 #[cfg(feature = "mirror_mirror")]
 pub use mirror_mirror;
 pub use query::{

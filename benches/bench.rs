@@ -6,12 +6,11 @@
 // copied, modified, or distributed except according to those terms.
 
 use bencher::{benchmark_group, benchmark_main, Bencher};
-use bevy_reflect::Reflect;
 use hecs::*;
 
-#[derive(Clone, Reflect)]
+#[derive(Clone)]
 struct Position(f32);
-#[derive(Clone, Reflect)]
+#[derive(Clone)]
 struct Velocity(f32);
 
 fn spawn_tuple(b: &mut Bencher) {
