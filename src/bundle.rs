@@ -11,7 +11,7 @@ use core::ptr::NonNull;
 use core::{fmt, mem};
 
 use crate::archetype::TypeInfo;
-use crate::Component;
+use crate::{Component, StableTypeId};
 
 /// A dynamically typed collection of components
 ///
@@ -27,7 +27,7 @@ pub unsafe trait DynamicBundle {
 
     /// Invoke a callback on the fields' type IDs, sorted by descending alignment then id
     #[doc(hidden)]
-    fn with_ids<T>(&self, f: impl FnOnce(&[TypeId]) -> T) -> T;
+    fn with_ids<T>(&self, f: impl FnOnce(&[StableTypeId]) -> T) -> T;
 
     /// Obtain the fields' TypeInfos, sorted by descending alignment then id
     #[doc(hidden)]
@@ -46,7 +46,7 @@ pub unsafe trait DynamicBundle {
 #[allow(clippy::missing_safety_doc)]
 pub unsafe trait Bundle: DynamicBundle {
     #[doc(hidden)]
-    fn with_static_ids<T>(f: impl FnOnce(&[TypeId]) -> T) -> T;
+    fn with_static_ids<T>(f: impl FnOnce(&[StableTypeId]) -> T) -> T;
 
     /// Obtain the fields' TypeInfos, sorted by descending alignment then id
     #[doc(hidden)]
@@ -103,6 +103,11 @@ impl MissingComponent {
     pub fn new<T: Component>() -> Self {
         Self(type_name::<T>())
     }
+
+    /// Construct an error for a dynamically identified component.
+    pub fn custom(name: &'static str) -> Self {
+        Self(name)
+    }
 }
 
 impl fmt::Display for MissingComponent {
@@ -121,7 +126,7 @@ macro_rules! tuple_impl {
                 Some(TypeId::of::<Self>())
             }
 
-            fn with_ids<T>(&self, f: impl FnOnce(&[TypeId]) -> T) -> T {
+            fn with_ids<T>(&self, f: impl FnOnce(&[StableTypeId]) -> T) -> T {
                 Self::with_static_ids(f)
             }
 
@@ -161,11 +166,11 @@ macro_rules! tuple_impl {
         }
 
         unsafe impl<$($name: Component),*> Bundle for ($($name,)*) {
-            fn with_static_ids<T>(f: impl FnOnce(&[TypeId]) -> T) -> T {
+            fn with_static_ids<T>(f: impl FnOnce(&[StableTypeId]) -> T) -> T {
                 const N: usize = count!($($name),*);
-                let mut xs: [(usize, TypeId); N] = [$((mem::align_of::<$name>(), TypeId::of::<$name>())),*];
+                let mut xs: [(usize, StableTypeId); N] = [$((mem::align_of::<$name>(), $name::STABLE_TYPE_ID)),*];
                 xs.sort_unstable_by(|x, y| x.0.cmp(&y.0).reverse().then(x.1.cmp(&y.1)));
-                let mut ids = [TypeId::of::<()>(); N];
+                let mut ids = [StableTypeId(0); N];
                 for (slot, &(_, id)) in ids.iter_mut().zip(xs.iter()) {
                     *slot = id;
                 }

@@ -1,6 +1,7 @@
-use core::any::TypeId;
 use core::ops::{Deref, DerefMut};
 use core::ptr::NonNull;
+
+use crate::StableTypeId;
 
 use crate::archetype::Archetype;
 use crate::gc::GC;
@@ -94,7 +95,7 @@ impl<'a> EntityRef<'a> {
     /// can be combined with a `HashMap<TypeId, Box<dyn Handler>>` where `Handler` is some
     /// user-defined trait with methods for serialization, or to be called after spawning or before
     /// despawning to maintain secondary indices.
-    pub fn component_types(&self) -> impl Iterator<Item = TypeId> + 'a {
+    pub fn component_types(&self) -> impl Iterator<Item = StableTypeId> + 'a {
         self.archetype.types().iter().map(|ty| ty.id())
     }
 

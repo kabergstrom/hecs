@@ -51,6 +51,10 @@ trybuild = "1.0.23"
 serde = { version = "1.0.117", features = ["derive"] }
 serde_test = "1.0.117"
 
+[[example]]
+name = "ffa_simulation"
+required-features = ["macros"]
+
 [[bench]]
 name = "bench"
 harness = false

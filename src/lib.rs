@@ -70,6 +70,7 @@ mod query_one;
 #[cfg(any(feature = "row-serialize", feature = "column-serialize"))]
 pub mod serialize;
 mod sharedvec;
+mod stable_type_id;
 mod take;
 mod world;
 
@@ -90,6 +91,7 @@ pub use query::{
 };
 pub use query_one::QueryOne;
 pub use take::TakenEntity;
+pub use stable_type_id::StableTypeId;
 pub use world::{
     ArchetypesGeneration, Component, ComponentError, Iter, QueryOneError, SpawnBatchIter,
     SpawnColumnBatchIter, World,
@@ -107,7 +109,7 @@ pub use lazy_static;
 pub use query::Fetch;
 
 #[cfg(feature = "macros")]
-pub use hecs_macros::{Bundle, DynamicBundleClone, Query};
+pub use hecs_macros::{Bundle, Component, DynamicBundleClone, Query};
 
 fn align(x: usize, alignment: usize) -> usize {
     debug_assert!(alignment.is_power_of_two());

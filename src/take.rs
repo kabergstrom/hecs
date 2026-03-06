@@ -33,7 +33,7 @@ impl<'a> TakenEntity<'a> {
 }
 
 unsafe impl<'a> DynamicBundle for TakenEntity<'a> {
-    fn with_ids<T>(&self, f: impl FnOnce(&[core::any::TypeId]) -> T) -> T {
+    fn with_ids<T>(&self, f: impl FnOnce(&[crate::StableTypeId]) -> T) -> T {
         f(self.archetype.type_ids())
     }
 

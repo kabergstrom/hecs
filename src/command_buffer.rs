@@ -5,13 +5,12 @@
 // http://opensource.org/licenses/MIT>, at your option. This file may not be
 // copied, modified, or distributed except according to those terms.
 
-use core::any::TypeId;
 use core::ptr::{self, NonNull};
 
 use crate::alloc::alloc::{alloc, dealloc, Layout};
 use crate::alloc::vec::Vec;
 use crate::archetype::TypeInfo;
-use crate::{align, DynamicBundle};
+use crate::{align, DynamicBundle, StableTypeId};
 use crate::{Bundle, Entity};
 use crate::{Component, World};
 
@@ -36,7 +35,7 @@ pub struct CommandBuffer {
     layout: Layout,
     cursor: usize,
     components: Vec<ComponentInfo>,
-    ids: Vec<TypeId>,
+    ids: Vec<StableTypeId>,
 }
 
 impl CommandBuffer {
@@ -236,7 +235,7 @@ struct RecordedEntity<'a> {
 }
 
 unsafe impl DynamicBundle for RecordedEntity<'_> {
-    fn with_ids<T>(&self, f: impl FnOnce(&[TypeId]) -> T) -> T {
+    fn with_ids<T>(&self, f: impl FnOnce(&[StableTypeId]) -> T) -> T {
         f(&self.cmd.ids)
     }
 

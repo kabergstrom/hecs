@@ -14,25 +14,25 @@ use std::io;
 State of the simulation is displayed in the sconsole through println! functions.
 */
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Component)]
 struct Position {
     x: i32,
     y: i32,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Component)]
 struct Health(i32);
 
-#[derive(Debug)]
+#[derive(Debug, Component)]
 struct Speed(i32);
 
-#[derive(Debug)]
+#[derive(Debug, Component)]
 struct Damage(i32);
 
-#[derive(Debug)]
+#[derive(Debug, Component)]
 struct KillCount(i32);
 
-#[derive(Default, Debug)]
+#[derive(Default, Debug, Component)]
 struct TargetTrack {
     target: Option<CRef<Position>>,
 }

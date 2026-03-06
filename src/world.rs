@@ -6,7 +6,7 @@
 // copied, modified, or distributed except according to those terms.
 
 use crate::alloc::{vec, vec::Vec};
-use crate::gc::cells::PtrCell;
+use crate::gc::cells::{PtrCell, U32Cell};
 use crate::gc::kvec::KVec;
 use crate::gc::{alloc_world_slot, free_world_slot};
 use core::any::TypeId;
@@ -610,6 +610,20 @@ impl World {
         })
     }
 
+    /// Get a raw GC pointer to `entity`'s component identified by `type_id`.
+    ///
+    /// Unlike `new_cref`, this takes a `StableTypeId` directly — useful for
+    /// type-erased access from dynamically loaded modules.
+    pub fn get_gc_ptr_by_id(
+        &self,
+        entity: Entity,
+        type_id: crate::StableTypeId,
+    ) -> Result<crate::gc::GCPtr, ComponentError> {
+        let entity = self.entity(entity)?;
+        let ptr = unsafe { entity.archetype().get_dynamic_by_id(type_id, entity.index()) };
+        ptr.ok_or(ComponentError::MissingComponent(MissingComponent::custom("<unknown component>")))
+    }
+
     /// Short-hand for [`entity`](Self::entity) followed by [`EntityRef::satisfies`]
     pub fn satisfies<Q: Query>(&self, entity: Entity) -> Result<bool, NoSuchEntity> {
         Ok(self.entity(entity)?.satisfies::<Q>())
@@ -1074,6 +1088,175 @@ impl World {
         });
     }
 
+    /// Dynamically query all entities that have every component in `type_ids`.
+    ///
+    /// For each matching entity the callback receives the `Entity` handle and a
+    /// slice of `GCPtr`s in the same order as `type_ids`.
+    pub fn query_dynamic(
+        &self,
+        type_ids: &[crate::StableTypeId],
+        cb: &mut dyn FnMut(Entity, &[crate::gc::GCPtr]),
+    ) {
+        // Stack-allocate for the common case (≤8 components), spill to heap otherwise
+        let n = type_ids.len();
+        let mut ptrs_inline = [crate::gc::GCPtr { value: core::ptr::NonNull::dangling() }; 8];
+        let mut cols_inline = [0usize; 8];
+        let mut ptrs_heap;
+        let mut cols_heap;
+        let (ptrs, cols): (&mut [crate::gc::GCPtr], &mut [usize]) = if n <= 8 {
+            (&mut ptrs_inline[..n], &mut cols_inline[..n])
+        } else {
+            ptrs_heap = vec![crate::gc::GCPtr { value: core::ptr::NonNull::dangling() }; n];
+            cols_heap = vec![0usize; n];
+            (&mut ptrs_heap, &mut cols_heap)
+        };
+        for (_, archetype) in self.archetypes() {
+            // Resolve column indices once per archetype
+            let mut matched = true;
+            for (i, id) in type_ids.iter().enumerate() {
+                match archetype.column_index(*id) {
+                    Some(col) => cols[i] = col,
+                    None => { matched = false; break; }
+                }
+            }
+            if !matched { continue; }
+            let total = archetype.allocated_values_sync();
+            let entities: &[U32Cell] = archetype.entity_ids();
+            // Precompute strides per column
+            let mut strides_inline = [0usize; 8];
+            let mut strides_heap;
+            let strides: &[usize] = if n <= 8 {
+                for (i, &col) in cols.iter().enumerate() {
+                    strides_inline[i] = unsafe { archetype.get_data_storage(col) }.stride();
+                }
+                &strides_inline[..n]
+            } else {
+                strides_heap = cols.iter().map(|&col| unsafe { archetype.get_data_storage(col) }.stride()).collect::<Vec<_>>();
+                &strides_heap
+            };
+            // Iterate chunk-linearly to avoid div/mod per entity
+            let epc = unsafe { archetype.get_data_storage(cols[0]) }.entities_per_chunk();
+            let mut slot = 0u32;
+            while slot < total {
+                let chunk_idx = slot as usize / epc;
+                let value_in_chunk = slot as usize % epc;
+                // Set up pointers to start of this chunk run
+                for (i, &col) in cols.iter().enumerate() {
+                    let data = unsafe { archetype.get_data_storage(col) };
+                    let chunk_base = unsafe { *data.chunks().get_unchecked(chunk_idx) };
+                    let base = unsafe {
+                        chunk_base.add(data.data_start() + value_in_chunk * strides[i])
+                    };
+                    ptrs[i] = unsafe {
+                        crate::gc::GCPtr::from_base_with_offset(
+                            data.value_start(),
+                            core::ptr::NonNull::new_unchecked(base),
+                        )
+                    };
+                }
+                let run_end = (((chunk_idx + 1) * epc) as u32).min(total);
+                // Linear scan: bump pointers by stride instead of recomputing
+                for s in slot..run_end {
+                    let entity_id: u32 = (&entities[s as usize]).into();
+                    if entity_id != u32::MAX {
+                        let entity = unsafe { self.find_entity_from_id(entity_id) };
+                        cb(entity, ptrs);
+                    }
+                    // Bump all column pointers by their stride
+                    for i in 0..n {
+                        ptrs[i] = crate::gc::GCPtr {
+                            value: unsafe {
+                                core::ptr::NonNull::new_unchecked(
+                                    ptrs[i].value.as_ptr().add(strides[i])
+                                )
+                            },
+                        };
+                    }
+                }
+                slot = run_end;
+            }
+        }
+    }
+
+    /// Like `query_dynamic`, but skips entity resolution — only passes component pointers.
+    pub fn query_dynamic_values(
+        &self,
+        type_ids: &[crate::StableTypeId],
+        cb: &mut dyn FnMut(&[crate::gc::GCPtr]),
+    ) {
+        let n = type_ids.len();
+        let mut ptrs_inline = [crate::gc::GCPtr { value: core::ptr::NonNull::dangling() }; 8];
+        let mut cols_inline = [0usize; 8];
+        let mut ptrs_heap;
+        let mut cols_heap;
+        let (ptrs, cols): (&mut [crate::gc::GCPtr], &mut [usize]) = if n <= 8 {
+            (&mut ptrs_inline[..n], &mut cols_inline[..n])
+        } else {
+            ptrs_heap = vec![crate::gc::GCPtr { value: core::ptr::NonNull::dangling() }; n];
+            cols_heap = vec![0usize; n];
+            (&mut ptrs_heap, &mut cols_heap)
+        };
+        for (_, archetype) in self.archetypes() {
+            let mut matched = true;
+            for (i, id) in type_ids.iter().enumerate() {
+                match archetype.column_index(*id) {
+                    Some(col) => cols[i] = col,
+                    None => { matched = false; break; }
+                }
+            }
+            if !matched { continue; }
+            let total = archetype.allocated_values_sync();
+            let entities: &[U32Cell] = archetype.entity_ids();
+            let mut strides_inline = [0usize; 8];
+            let mut strides_heap;
+            let strides: &[usize] = if n <= 8 {
+                for (i, &col) in cols.iter().enumerate() {
+                    strides_inline[i] = unsafe { archetype.get_data_storage(col) }.stride();
+                }
+                &strides_inline[..n]
+            } else {
+                strides_heap = cols.iter().map(|&col| unsafe { archetype.get_data_storage(col) }.stride()).collect::<Vec<_>>();
+                &strides_heap
+            };
+            let epc = unsafe { archetype.get_data_storage(cols[0]) }.entities_per_chunk();
+            let mut slot = 0u32;
+            while slot < total {
+                let chunk_idx = slot as usize / epc;
+                let value_in_chunk = slot as usize % epc;
+                for (i, &col) in cols.iter().enumerate() {
+                    let data = unsafe { archetype.get_data_storage(col) };
+                    let chunk_base = unsafe { *data.chunks().get_unchecked(chunk_idx) };
+                    let base = unsafe {
+                        chunk_base.add(data.data_start() + value_in_chunk * strides[i])
+                    };
+                    ptrs[i] = unsafe {
+                        crate::gc::GCPtr::from_base_with_offset(
+                            data.value_start(),
+                            core::ptr::NonNull::new_unchecked(base),
+                        )
+                    };
+                }
+                let run_end = (((chunk_idx + 1) * epc) as u32).min(total);
+                for s in slot..run_end {
+                    let entity_id: u32 = (&entities[s as usize]).into();
+                    if entity_id != u32::MAX {
+                        cb(ptrs);
+                    }
+                    for i in 0..n {
+                        ptrs[i] = crate::gc::GCPtr {
+                            value: unsafe {
+                                core::ptr::NonNull::new_unchecked(
+                                    ptrs[i].value.as_ptr().add(strides[i])
+                                )
+                            },
+                        };
+                    }
+                }
+                slot = run_end;
+            }
+        }
+    }
+
     /// Inspect the archetypes that entities are organized into
     ///
     /// Useful for dynamically scheduling concurrent queries by checking borrows in advance, and for
@@ -1228,12 +1411,77 @@ impl From<NoSuchEntity> for QueryOneError {
     }
 }
 
-/// Types that can be components, implemented automatically for all `Send + Sync + 'static` types
+/// Types that can be components.
 ///
-/// This is just a convenient shorthand for `Send + Sync + 'static`, and never needs to be
-/// implemented manually.
-pub trait Component: Send + Sync + 'static {}
-impl<T: Send + Sync + 'static> Component for T {}
+/// Requires `Send + Sync + 'static` and a `STABLE_TYPE_ID` — a cross-cdylib
+/// stable type identifier computed from the type's qualified name.
+///
+/// Use `#[derive(Component)]` to implement this trait. Common std types
+/// (primitives, String, etc.) have built-in impls.
+pub trait Component: Send + Sync + 'static {
+    /// A stable type identifier computed at compile time from the type's
+    /// qualified name. Unlike `std::any::TypeId`, this is identical across
+    /// separately compiled cdylibs that share the same source crate.
+    const STABLE_TYPE_ID: crate::StableTypeId;
+
+    /// The qualified type name used to compute STABLE_TYPE_ID.
+    /// Matches `concat!(module_path!(), "::", stringify!(Type))`.
+    const TYPE_NAME: &'static str = "<unknown>";
+}
+
+/// Implement `Component` for a type using `module_path!() :: stringify!()` as
+/// the hash input. For use on types defined in hecs or std.
+macro_rules! impl_component {
+    ($($ty:ty),* $(,)?) => {
+        $(
+            impl Component for $ty {
+                const STABLE_TYPE_ID: crate::StableTypeId = crate::StableTypeId(
+                    crate::StableTypeId::fnv1a(
+                        concat!(module_path!(), "::", stringify!($ty)).as_bytes()
+                    )
+                );
+                const TYPE_NAME: &'static str = concat!(module_path!(), "::", stringify!($ty));
+            }
+        )*
+    };
+}
+
+// Primitives and common std types
+impl_component!(
+    i8, i16, i32, i64, i128, isize,
+    u8, u16, u32, u64, u128, usize,
+    f32, f64,
+    bool, char,
+    (),
+);
+impl_component!(alloc::string::String);
+impl_component!(alloc::vec::Vec<u8>);
+
+impl Component for alloc::borrow::Cow<'static, str> {
+    const STABLE_TYPE_ID: crate::StableTypeId = crate::StableTypeId(
+        crate::StableTypeId::fnv1a(b"alloc::borrow::Cow<'static, str>"),
+    );
+    const TYPE_NAME: &'static str = "alloc::borrow::Cow<'static, str>";
+}
+
+/// Implement `Component` for `[T; N]` arrays of common sizes.
+macro_rules! impl_component_array {
+    ($($n:literal),* $(,)?) => {
+        $(
+            impl<T: Component> Component for [T; $n] {
+                const STABLE_TYPE_ID: crate::StableTypeId = crate::StableTypeId(
+                    T::STABLE_TYPE_ID.0 ^ crate::StableTypeId::fnv1a(
+                        concat!("[; ", stringify!($n), "]").as_bytes()
+                    )
+                );
+            }
+        )*
+    };
+}
+impl_component_array!(
+    0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16,
+    24, 32, 48, 64, 128, 256, 512, 1024, 2048, 4096,
+);
 
 /// Iterator over all of a world's entities
 pub struct Iter<'a> {
@@ -1414,7 +1662,7 @@ impl Drop for SpawnColumnBatchIter<'_> {
 
 struct ArchetypeSet {
     /// Maps sorted component type sets to archetypes
-    index: NonSyncCell<HashMap<Box<[TypeId]>, sharedvec::DefaultKey>>,
+    index: NonSyncCell<HashMap<Box<[crate::StableTypeId]>, sharedvec::DefaultKey>>,
     archetypes: sharedvec::SharedVec<Archetype>,
 }
 
@@ -1433,7 +1681,7 @@ impl ArchetypeSet {
     }
 
     /// Find the archetype ID that has exactly `components`
-    fn get<T: Borrow<[TypeId]> + Into<Box<[TypeId]>>>(
+    fn get<T: Borrow<[crate::StableTypeId]> + Into<Box<[crate::StableTypeId]>>>(
         &mut self,
         components: T,
         info: impl FnOnce() -> Vec<TypeInfo>,
@@ -1445,7 +1693,7 @@ impl ArchetypeSet {
             .copied()
             .unwrap_or_else(|| self.insert(components.into(), info()))
     }
-    unsafe fn get_nonsync<T: Borrow<[TypeId]> + Into<Box<[TypeId]>>>(
+    unsafe fn get_nonsync<T: Borrow<[crate::StableTypeId]> + Into<Box<[crate::StableTypeId]>>>(
         &self,
         components: T,
         info: impl FnOnce() -> Vec<TypeInfo>,
@@ -1456,7 +1704,7 @@ impl ArchetypeSet {
             .unwrap_or_else(|| self.insert_nonsync(components.into(), info()))
     }
 
-    fn insert(&mut self, components: Box<[TypeId]>, info: Vec<TypeInfo>) -> sharedvec::DefaultKey {
+    fn insert(&mut self, components: Box<[crate::StableTypeId]>, info: Vec<TypeInfo>) -> sharedvec::DefaultKey {
         let (key, _) = self.archetypes.push(Archetype::new(info));
         let idx = self.index.0.get_mut();
         let old = idx.insert(components, key);
@@ -1465,7 +1713,7 @@ impl ArchetypeSet {
     }
     unsafe fn insert_nonsync(
         &self,
-        components: Box<[TypeId]>,
+        components: Box<[crate::StableTypeId]>,
         info: Vec<TypeInfo>,
     ) -> sharedvec::DefaultKey {
         let (key, _) = self.archetypes.push(Archetype::new(info));

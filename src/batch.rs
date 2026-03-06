@@ -3,10 +3,10 @@ use crate::{
     archetype::Data,
     gc::{GCHeader, GCPtr, GC},
 };
-use core::{any::TypeId, fmt, marker::PhantomData, mem::MaybeUninit, ptr::NonNull, slice};
+use core::{fmt, marker::PhantomData, mem::MaybeUninit, ptr::NonNull, slice};
 
 use crate::{
-    archetype::{TypeIdMap, TypeInfo},
+    archetype::{StableTypeIdMap, TypeInfo},
     Archetype, Component,
 };
 
@@ -32,7 +32,7 @@ impl ColumnBatchType {
     pub fn into_batch(self, size: u32) -> ColumnBatchBuilder {
         let mut types = self.types.into_sorted_vec();
         types.dedup();
-        let fill = TypeIdMap::with_capacity_and_hasher(types.len(), Default::default());
+        let fill = StableTypeIdMap::with_capacity_and_hasher(types.len(), Default::default());
         let mut arch = Archetype::new(types);
         todo!();
         // arch.reserve(size);
@@ -47,7 +47,7 @@ impl ColumnBatchType {
 /// An incomplete collection of component data for entities with the same component types
 pub struct ColumnBatchBuilder {
     /// Number of components written so far for each component type
-    fill: TypeIdMap<u32>,
+    fill: StableTypeIdMap<u32>,
     target_fill: u32,
     pub(crate) archetype: Option<Archetype>,
 }
@@ -67,7 +67,7 @@ impl ColumnBatchBuilder {
         let state = archetype.get_state::<T>()?;
         let data = unsafe { archetype.get_data_storage_mut(state) };
         Some(BatchWriter {
-            fill: self.fill.entry(TypeId::of::<T>()).or_insert(0),
+            fill: self.fill.entry(T::STABLE_TYPE_ID).or_insert(0),
             ty: TypeInfo::of::<T>(),
             size: archetype.capacity(),
             storage: data,

@@ -5,7 +5,6 @@
 // http://opensource.org/licenses/MIT>, at your option. This file may not be
 // copied, modified, or distributed except according to those terms.
 
-use core::any::TypeId;
 use core::cell::Cell;
 use core::marker::PhantomData;
 use core::mem;
@@ -19,7 +18,7 @@ use crate::alloc::{boxed::Box, vec::Vec};
 use crate::archetype::{Archetype, Data};
 use crate::entities::EntityMeta;
 use crate::gc::GC;
-use crate::{Component, Entity, World};
+use crate::{Component, Entity, StableTypeId, World};
 
 /// A collection of component types to fetch from a [`World`](crate::World)
 ///
@@ -64,7 +63,7 @@ pub unsafe trait Fetch<'a>: Sized {
     fn release(archetype: &Archetype, state: Self::State);
 
     /// Invoke `f` for every component type that may be borrowed and whether the borrow is unique
-    fn for_each_borrow(f: impl FnMut(TypeId, bool));
+    fn for_each_borrow(f: impl FnMut(StableTypeId, bool));
 
     /// Access the `n`th item in this archetype without bounds checking
     ///
@@ -170,8 +169,8 @@ unsafe impl<'a, T: Component> Fetch<'a> for FetchRead<T> {
         archetype.release::<T>(state);
     }
 
-    fn for_each_borrow(mut f: impl FnMut(TypeId, bool)) {
-        f(TypeId::of::<T>(), false);
+    fn for_each_borrow(mut f: impl FnMut(StableTypeId, bool)) {
+        f(T::STABLE_TYPE_ID, false);
     }
 
     unsafe fn get(&self, n: usize) -> Self::Item {
@@ -276,8 +275,8 @@ unsafe impl<'a, T: Component> Fetch<'a> for FetchWrite<T> {
         archetype.release_mut::<T>(state);
     }
 
-    fn for_each_borrow(mut f: impl FnMut(TypeId, bool)) {
-        f(TypeId::of::<T>(), true);
+    fn for_each_borrow(mut f: impl FnMut(StableTypeId, bool)) {
+        f(T::STABLE_TYPE_ID, true);
     }
 
     unsafe fn get(&self, n: usize) -> Self::Item {
@@ -345,7 +344,7 @@ unsafe impl<'a, T: Fetch<'a>> Fetch<'a> for TryFetch<T> {
         }
     }
 
-    fn for_each_borrow(f: impl FnMut(TypeId, bool)) {
+    fn for_each_borrow(f: impl FnMut(StableTypeId, bool)) {
         T::for_each_borrow(f);
     }
 
@@ -484,7 +483,7 @@ unsafe impl<'a, L: Fetch<'a>, R: Fetch<'a>> Fetch<'a> for FetchOr<L, R> {
         state.map(|l| L::release(archetype, l), |r| R::release(archetype, r));
     }
 
-    fn for_each_borrow(mut f: impl FnMut(TypeId, bool)) {
+    fn for_each_borrow(mut f: impl FnMut(StableTypeId, bool)) {
         L::for_each_borrow(&mut f);
         R::for_each_borrow(&mut f);
     }
@@ -555,7 +554,7 @@ unsafe impl<'a, F: Fetch<'a>, G: Fetch<'a>> Fetch<'a> for FetchWithout<F, G> {
         F::release(archetype, state)
     }
 
-    fn for_each_borrow(f: impl FnMut(TypeId, bool)) {
+    fn for_each_borrow(f: impl FnMut(StableTypeId, bool)) {
         F::for_each_borrow(f);
     }
 
@@ -625,7 +624,7 @@ unsafe impl<'a, F: Fetch<'a>, G: Fetch<'a>> Fetch<'a> for FetchWith<F, G> {
         F::release(archetype, state)
     }
 
-    fn for_each_borrow(f: impl FnMut(TypeId, bool)) {
+    fn for_each_borrow(f: impl FnMut(StableTypeId, bool)) {
         F::for_each_borrow(f);
     }
 
@@ -687,7 +686,7 @@ unsafe impl<'a, F: Fetch<'a>> Fetch<'a> for FetchSatisfies<F> {
     }
     fn release(_archetype: &Archetype, _state: Self::State) {}
 
-    fn for_each_borrow(_: impl FnMut(TypeId, bool)) {}
+    fn for_each_borrow(_: impl FnMut(StableTypeId, bool)) {}
 
     unsafe fn get(&self, _: usize) -> bool {
         self.0
@@ -1163,7 +1162,7 @@ macro_rules! tuple_impl {
             }
 
             #[allow(unused_variables, unused_mut, clippy::unused_unit)]
-            fn for_each_borrow(mut f: impl FnMut(TypeId, bool)) {
+            fn for_each_borrow(mut f: impl FnMut(StableTypeId, bool)) {
                 $($name::for_each_borrow(&mut f);)*
             }
 

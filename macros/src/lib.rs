@@ -9,6 +9,7 @@ extern crate proc_macro;
 
 mod bundle;
 mod bundle_clone;
+mod component;
 mod query;
 
 pub(crate) mod common;
@@ -57,6 +58,34 @@ pub fn derive_bundle(input: TokenStream) -> TokenStream {
 pub fn derive_dynamic_bundle_clone(input: TokenStream) -> TokenStream {
     let input = parse_macro_input!(input as DeriveInput);
     match bundle_clone::derive(input) {
+        Ok(ts) => ts,
+        Err(e) => e.to_compile_error(),
+    }
+    .into()
+}
+
+/// Implement `Component` for a struct or enum
+///
+/// Generates a `STABLE_TYPE_ID` from `module_path!() :: type_name`, producing
+/// a cross-cdylib stable identifier via FNV-1a hash.
+///
+/// Does not support generic types (yet).
+///
+/// # Example
+/// ```
+/// # use hecs::*;
+/// #[derive(Component)]
+/// struct Transform {
+///     x: f32,
+///     y: f32,
+/// }
+/// // Proves the ID is truly const:
+/// const _: StableTypeId = <Transform as Component>::STABLE_TYPE_ID;
+/// ```
+#[proc_macro_derive(Component)]
+pub fn derive_component(input: TokenStream) -> TokenStream {
+    let input = parse_macro_input!(input as DeriveInput);
+    match component::derive(input) {
         Ok(ts) => ts,
         Err(e) => e.to_compile_error(),
     }
