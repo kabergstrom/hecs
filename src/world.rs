@@ -884,16 +884,13 @@ impl World {
     ) -> Result<T, ComponentError> {
         self.flush_nonsync();
 
-        // Gather current metadata
         let loc = self.entities.get(entity)?;
-        let old_index = loc.index;
         let source_arch = &self.archetypes.archetypes[loc.archetype];
 
-        // Move out of the source archetype, or bail out if a component is missing
+        // Extract values + mark tombstone (caller takes ownership, so no drop)
         let bundle = unsafe {
             T::get(|ty| {
-                // SAFETY: We have &mut self
-                let gc_ptr = source_arch.get_dynamic(&ty, old_index);
+                let gc_ptr = source_arch.get_dynamic(&ty, loc.index);
                 if let Some(mut gc_ptr) = gc_ptr {
                     gc_ptr.mark_tombstone();
                 }
@@ -901,29 +898,66 @@ impl World {
             })?
         };
 
-        // Find the target archetype ID
-        // SAFETY: we are in a !Sync context
-        let remove_edges = self.remove_edges.0.get().as_mut().unwrap();
-        let target = match remove_edges.entry((loc.archetype, TypeId::of::<T>())) {
-            Entry::Occupied(entry) => *entry.into_mut(),
-            Entry::Vacant(entry) => {
-                let info = T::with_static_type_info(|removed| {
-                    self.archetypes.archetypes[loc.archetype]
-                        .types()
-                        .iter()
-                        .filter(|x| removed.binary_search(x).is_err())
-                        .cloned()
-                        .collect::<Vec<_>>()
-                });
-                let elements = info.iter().map(|x| x.id()).collect::<Box<_>>();
-                let index = self.archetypes.get_nonsync(&*elements, move || info);
-                *entry.insert(index)
-            }
-        };
+        let removed_ids = T::with_static_type_info(|info| {
+            info.iter().map(|t| t.id()).collect::<Vec<_>>()
+        });
 
-        // Store components to the target archetype and update metadata
+        self.migrate_remove_nonsync(entity, loc, &removed_ids);
+        Ok(bundle)
+    }
+
+    /// Remove components identified by `StableTypeId`s from `entity`.
+    ///
+    /// Drops removed values and migrates the entity to a smaller archetype.
+    pub unsafe fn remove_by_ids_nonsync(
+        &self,
+        entity: Entity,
+        type_ids: &[crate::StableTypeId],
+    ) -> Result<(), ComponentError> {
+        self.flush_nonsync();
+
+        let loc = self.entities.get(entity)?;
+        let source_arch = &self.archetypes.archetypes[loc.archetype];
+
+        // Drop values and tombstone the removed components
+        for &id in type_ids {
+            let ty = source_arch
+                .types()
+                .iter()
+                .find(|t| t.id() == id)
+                .ok_or_else(|| {
+                    ComponentError::MissingComponent(MissingComponent::custom(
+                        "unknown (by StableTypeId)",
+                    ))
+                })?;
+            let mut gc_ptr = source_arch.get_dynamic_by_id(id, loc.index).unwrap();
+            gc_ptr.drop_value_and_tombstone(ty);
+        }
+
+        self.migrate_remove_nonsync(entity, loc, type_ids);
+        Ok(())
+    }
+
+    /// Migrate entity to archetype without the given component types.
+    ///
+    /// Caller must have already tombstoned/dropped the removed components.
+    unsafe fn migrate_remove_nonsync(
+        &self,
+        entity: Entity,
+        loc: Location,
+        removed_ids: &[crate::StableTypeId],
+    ) {
+        let source_arch = &self.archetypes.archetypes[loc.archetype];
+        let info: Vec<TypeInfo> = source_arch
+            .types()
+            .iter()
+            .filter(|x| !removed_ids.contains(&x.id()))
+            .cloned()
+            .collect();
+        let elements = info.iter().map(|x| x.id()).collect::<Box<_>>();
+        let target = self.archetypes.get_nonsync(&*elements, move || info);
+
         if loc.archetype != target {
-            // If we actually removed any components, the entity needs to be moved into a new archetype
             let source_arch = &self.archetypes.archetypes[loc.archetype];
             let target_arch = &self.archetypes.archetypes[target];
             let target_index = target_arch.allocate_nonsync(entity.id, self.world_slot);
@@ -938,21 +972,18 @@ impl World {
                 },
             );
 
-            if let Some(moved) = unsafe {
-                source_arch.move_to(old_index, |src, ty| {
-                    // Only move the components present in the target archetype, i.e. the non-removed ones.
+            if let Some(moved) = source_arch.move_to(loc.index, |src, ty| {
+                if !removed_ids.contains(&ty.id()) {
                     if let Some(mut dst) = target_arch.get_dynamic(ty, target_index) {
                         dst.move_from(ty, src);
                     }
-                })
-            } {
+                }
+            }) {
                 let mut old_moved = self.entities.meta[moved as usize];
-                old_moved.location.index = old_index;
+                old_moved.location.index = loc.index;
                 self.entities.meta.set_nonsync(moved as usize, old_moved);
             }
         }
-
-        Ok(bundle)
     }
 
     fn remove_target<T: Bundle + 'static>(
@@ -1907,6 +1938,61 @@ pub(crate) mod tests {
     fn bad_insert() {
         let mut world = World::new();
         assert!(world.insert_one(Entity::DANGLING, ()).is_err());
+        cleanup(world);
+    }
+
+    #[test]
+    fn remove_by_ids_nonsync_single() {
+        let mut world = World::new();
+        let e = world.spawn((42i32, "hello".to_string(), true));
+        // Remove i32 by StableTypeId
+        unsafe {
+            world
+                .remove_by_ids_nonsync(e, &[i32::STABLE_TYPE_ID])
+                .unwrap();
+        }
+        // i32 is gone
+        assert!(world.get::<&i32>(e).is_err());
+        // String and bool remain
+        assert_eq!(*world.get::<&String>(e).unwrap(), "hello");
+        assert_eq!(*world.get::<&bool>(e).unwrap(), true);
+        cleanup(world);
+    }
+
+    #[test]
+    fn remove_by_ids_nonsync_multiple() {
+        let mut world = World::new();
+        let e = world.spawn((42i32, "hello".to_string(), true));
+        // Remove i32 and bool in one call
+        unsafe {
+            world
+                .remove_by_ids_nonsync(e, &[i32::STABLE_TYPE_ID, bool::STABLE_TYPE_ID])
+                .unwrap();
+        }
+        assert!(world.get::<&i32>(e).is_err());
+        assert!(world.get::<&bool>(e).is_err());
+        assert_eq!(*world.get::<&String>(e).unwrap(), "hello");
+        cleanup(world);
+    }
+
+    #[test]
+    fn remove_by_ids_nonsync_missing_component() {
+        let mut world = World::new();
+        let e = world.spawn(("hello".to_string(),));
+        // Removing a component the entity doesn't have should error
+        let result = unsafe { world.remove_by_ids_nonsync(e, &[i32::STABLE_TYPE_ID]) };
+        assert!(result.is_err());
+        // Entity still has its original component
+        assert_eq!(*world.get::<&String>(e).unwrap(), "hello");
+        cleanup(world);
+    }
+
+    #[test]
+    fn remove_by_ids_nonsync_no_such_entity() {
+        let mut world = World::new();
+        let result =
+            unsafe { world.remove_by_ids_nonsync(Entity::DANGLING, &[i32::STABLE_TYPE_ID]) };
+        assert!(result.is_err());
         cleanup(world);
     }
 }
