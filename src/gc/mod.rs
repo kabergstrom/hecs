@@ -408,24 +408,20 @@ pub unsafe fn sweep(world: &World) -> u32 {
             let mut can_free = true;
             for iter in &mut archetype_iter_set {
                 let gc_ptr = iter.next().unwrap();
-                can_free &= gc_ptr.can_free();
+                let header = &mut *gc_ptr.header_ptr().as_ptr();
+                if can_free {
+                    // Inline can_free logic — header already dereferenced
+                    can_free = match header.state {
+                        State::Dead | State::Moved { .. } => !header.referenced,
+                        _ => false,
+                    };
+                }
+                // Reset referenced flag in the same pass
+                header.referenced = false;
             }
             if can_free {
                 archetype.free_slot(slot);
                 freed += 1;
-            }
-        }
-        // Reset referenced flags
-        for (idx, _) in archetype.types().iter().enumerate() {
-            let storage = archetype.get_data_storage(idx);
-            for ptr in storage
-                .iter_gc_ptr(count)
-                .into_iter()
-            {
-                let header = &mut *ptr.header_ptr().as_ptr();
-                if header.referenced {
-                    header.referenced = false;
-                }
             }
         }
     }
