@@ -494,6 +494,39 @@ impl<T: Component> CRef<T> {
         );
         unsafe { ptr.value_ptr().cast::<T>().as_ref() }
     }
+
+    /// Read the component with no runtime checks at all. The caller takes
+    /// responsibility for every invariant that [`read_bypass`](Self::read_bypass)
+    /// would otherwise verify.
+    ///
+    /// This is the fastest possible read path: a single pointer cast plus
+    /// dereference. No header load, no atomic load, no branches. In a tight
+    /// loop the compiler can hoist this trivially and the value's cache line
+    /// stays clean.
+    ///
+    /// # Safety
+    ///
+    /// All of the following must hold for the duration of `'s`:
+    /// 1. `scope` is a [`ReadWorld`] of the same [`World`] this `CRef` was
+    ///    obtained from.
+    /// 2. The `CRef` points to the component's current location. In particular,
+    ///    no archetype change (`insert`/`remove`) has moved this component
+    ///    since the `CRef` was captured. This is automatic if the `CRef` was
+    ///    obtained from a query *inside* this `ReadWorld` scope, since the
+    ///    scope blocks archetype changes.
+    /// 3. The component has not been despawned (still in [`State::Alive`] or
+    ///    [`State::PendingDead`] with valid bytes).
+    /// 4. No `RefMut<'_, T>` for this component is held anywhere, including
+    ///    `RefMut`s acquired before the `ReadWorld` scope began and not yet
+    ///    dropped.
+    ///
+    /// Violating any of these is undefined behavior. Prefer
+    /// [`read_bypass`](Self::read_bypass) unless profiling shows the asserts
+    /// dominate.
+    #[inline]
+    pub unsafe fn read_bypass_unchecked<'s>(&self, _scope: &'s ReadWorld<'_>) -> &'s T {
+        unsafe { self.ptr.value_ptr().cast::<T>().as_ref() }
+    }
 }
 
 

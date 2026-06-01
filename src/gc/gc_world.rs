@@ -708,4 +708,18 @@ mod tests {
         crate::world::tests::cleanup(world_a);
         crate::world::tests::cleanup(world_b);
     }
+
+    #[test]
+    fn read_bypass_unchecked_reads_value() {
+        let mut world = World::new();
+        {
+            let gc = GcWorld::new_scope(&mut world);
+            let e = gc.spawn((42i32,));
+            let c = gc.get::<i32>(e).unwrap();
+            let read = gc.read_only();
+            let v: &i32 = unsafe { c.read_bypass_unchecked(&read) };
+            assert_eq!(*v, 42);
+        }
+        crate::world::tests::cleanup(world);
+    }
 }
