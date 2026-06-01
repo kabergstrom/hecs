@@ -18,8 +18,8 @@ pub use gc_world::{GcWorld, GcWorldScope};
 pub use query::*;
 
 use crate::{
-    archetype::{StorageHeader, DATA_CHUNK_SIZE_BYTES},
-    Component, TypeInfo, World,
+    archetype::{Archetype, StorageHeader, DATA_CHUNK_SIZE_BYTES},
+    Component, Entity, StableTypeId, TypeInfo, World,
 };
 use alloc::vec::Vec;
 use self::borrow::{BorrowFlag, BorrowRef, BorrowRefMut, Ref, RefMut};
@@ -81,6 +81,43 @@ impl GCPtr {
     pub fn value_ptr(&self) -> NonNull<u8> {
         self.value
     }
+
+    /// Returns a raw pointer to the owning archetype.
+    ///
+    /// The back-pointer is written when the chunk is allocated and remains
+    /// valid for the lifetime of the archetype, which equals the lifetime of
+    /// the owning `World`. Callers must not outlive the `World`.
+    pub fn archetype(&self) -> *const Archetype {
+        unsafe { (*self.storage_header()).archetype }
+    }
+
+    /// Returns the [`Entity`] associated with this slot.
+    ///
+    /// # Safety
+    /// The owning `World` must still be alive.
+    pub unsafe fn entity(&self) -> Entity {
+        (*self.archetype()).entity(self.archetype_slot())
+    }
+
+    /// Returns a `GCPtr` to the sibling component of type `id` belonging to
+    /// the same entity, or `None` if the archetype does not contain that
+    /// component.
+    ///
+    /// # Safety
+    /// The owning `World` must still be alive.
+    pub unsafe fn sibling_by_id(&self, id: StableTypeId) -> Option<GCPtr> {
+        (*self.archetype()).get_dynamic_by_id(id, self.archetype_slot())
+    }
+
+    /// Returns a `GCPtr` to the sibling component of type `T` belonging to
+    /// the same entity, or `None` if the archetype does not contain `T`.
+    ///
+    /// # Safety
+    /// The owning `World` must still be alive.
+    pub unsafe fn sibling<T: Component>(&self) -> Option<GCPtr> {
+        self.sibling_by_id(T::STABLE_TYPE_ID)
+    }
+
     // pub unsafe fn drop(&mut self, ty: &TypeInfo) {
     //     self.header_ptr().as_ptr().drop_in_place();
     //     ty.drop_value(self.value_ptr().as_ptr());
@@ -158,7 +195,7 @@ impl GCPtr {
 
     pub fn resolve_moved(&self) -> Self {
         let mut ptr = *self;
-        while let State::Moved { new_ptr } = unsafe { self.header_ptr().as_ref() }.state {
+        while let State::Moved { new_ptr } = unsafe { ptr.header_ptr().as_ref() }.state {
             ptr = new_ptr;
         }
         ptr
@@ -301,6 +338,23 @@ impl<T: Component> CRef<T> {
         let a = self.ptr.resolve_moved();
         let b = other.ptr.resolve_moved();
         a == b
+    }
+
+    /// Returns the [`Entity`] this component belongs to.
+    pub fn entity(&self) -> Entity {
+        let ptr = self.ptr.resolve_moved();
+        unsafe { ptr.entity() }
+    }
+
+    /// Returns a `CRef<U>` to a sibling component on the same entity, or
+    /// `None` if the archetype does not contain `U`.
+    pub fn sibling<U: Component>(&self) -> Option<CRef<U>> {
+        let ptr = self.ptr.resolve_moved();
+        let sibling_ptr = unsafe { ptr.sibling::<U>()? };
+        Some(CRef {
+            ptr: sibling_ptr,
+            _marker: PhantomData::default(),
+        })
     }
     pub fn read(&self) -> Ref<'_, T> {
         let slot = self.ptr.world_slot();

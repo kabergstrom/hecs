@@ -5,6 +5,7 @@ use core::{marker::PhantomData, ptr::NonNull};
 use alloc::rc::Rc;
 
 use crate::archetype::Data;
+use crate::gc::cells::EntityCell;
 use crate::{entities::EntityMeta, Archetype, Component, Entity};
 use crate::{sharedvec, CRef, ComponentError, MissingComponent, TypeInfo};
 
@@ -559,17 +560,8 @@ impl<'q, Q: Query> Iterator for QueryIter<'q, Q> {
                     });
                     continue;
                 }
-                Some((id, components)) => {
-                    if id == u32::MAX {
-                        continue;
-                    }
-                    return Some((
-                        Entity {
-                            id,
-                            generation: unsafe { self.meta.get_unchecked(id as usize).generation },
-                        },
-                        components,
-                    ));
+                Some((entity, components)) => {
+                    return Some((entity, components));
                 }
             }
         }
@@ -577,7 +569,7 @@ impl<'q, Q: Query> Iterator for QueryIter<'q, Q> {
 }
 
 struct ChunkIter<Q: Query> {
-    entities: NonNull<u32>,
+    entities: NonNull<EntityCell>,
     fetch: Q::Fetch,
     position: usize,
     len: usize,
@@ -594,16 +586,17 @@ impl<Q: Query> ChunkIter<Q> {
     }
 
     #[inline]
-    unsafe fn next<'a>(&mut self) -> Option<(u32, <Q::Fetch as Fetch<'a>>::Item)> {
+    unsafe fn next<'a>(&mut self) -> Option<(Entity, <Q::Fetch as Fetch<'a>>::Item)> {
         while self.position < self.len {
-            let entity = self.entities.as_ptr().add(self.position);
+            let cell = &*self.entities.as_ptr().add(self.position);
+            let entity = cell.read_nonsync();
             let pos = self.position;
             self.position += 1;
-            if *entity == u32::MAX {
+            if entity.id == u32::MAX {
                 continue;
             }
             let item = self.fetch.get(pos);
-            return Some((*entity, item));
+            return Some((entity, item));
         }
         None
     }

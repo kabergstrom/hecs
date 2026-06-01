@@ -6,7 +6,7 @@
 // copied, modified, or distributed except according to those terms.
 
 use crate::alloc::{vec, vec::Vec};
-use crate::gc::cells::{PtrCell, U32Cell};
+use crate::gc::cells::PtrCell;
 use crate::gc::kvec::KVec;
 use crate::gc::{alloc_world_slot, free_world_slot};
 use core::any::TypeId;
@@ -191,7 +191,7 @@ impl World {
         let archetype = &mut self.archetypes.archetypes[archetype_id];
         // SAFETY: we have &mut self
         unsafe {
-            let index = archetype.allocate_nonsync(entity.id, self.world_slot);
+            let index = archetype.allocate_nonsync(entity, self.world_slot);
             components.put(|ptr, ty| {
                 archetype.put_new_dynamic_nonsync(ptr, &ty, index);
             });
@@ -223,7 +223,7 @@ impl World {
         let archetype = &self.archetypes.archetypes[archetype_id];
         // SAFETY: we have &mut self
         unsafe {
-            let index = archetype.allocate_nonsync(entity.id, self.world_slot);
+            let index = archetype.allocate_nonsync(entity, self.world_slot);
             components.put(|ptr, ty| {
                 archetype.put_new_dynamic_nonsync(ptr, &ty, index);
             });
@@ -298,7 +298,8 @@ impl World {
         let mut id_alloc_clone = id_alloc.clone();
         let mut index = base as usize;
         while let Some(id) = id_alloc_clone.next(&self.entities) {
-            archetype.set_entity_id(index, id);
+            let entity = unsafe { self.entities.resolve_unknown_gen(id) };
+            archetype.set_entity(index, entity);
             index += 1;
         }
 
@@ -335,7 +336,7 @@ impl World {
         // Fix up entity IDs
         let archetype = &mut self.archetypes.archetypes[archetype_id];
         for (&handle, index) in handles.iter().zip(base as usize..) {
-            archetype.set_entity_id(index, handle.id());
+            archetype.set_entity(index, handle);
             self.entities.meta[handle.id() as usize].location = Location {
                 archetype: archetype_id,
                 index: index as u32,
@@ -499,42 +500,25 @@ impl World {
 
     /// Resolve a GCPtr (from a CRef) to the Entity it belongs to.
     ///
-    /// Returns `None` if the pointer belongs to a different world, the slot
-    /// is not alive, or the entity id is invalid.
+    /// Returns `None` if the pointer belongs to a different world or the slot
+    /// is not alive.
     ///
     /// # Safety
     /// `ptr` must be a valid GCPtr originating from this World.
     pub unsafe fn entity_from_gc_ptr(&self, ptr: crate::gc::GCPtr) -> Option<Entity> {
-        use crate::archetype::DATA_CHUNK_SIZE_BYTES;
-        // Verify the pointer belongs to this world
         if ptr.world_slot() != self.world_slot {
             return None;
         }
-        // Resolve moved pointers
         let resolved = ptr.resolve_moved();
         let header = resolved.header_ptr().as_ref();
         if !matches!(header.state, crate::gc::State::Alive { .. }) {
             return None;
         }
-        let addr = resolved.value_ptr().as_ptr() as usize;
-        // Find the archetype containing this pointer by checking chunk address ranges
-        for (_, archetype) in self.archetypes() {
-            for (col_idx, _) in archetype.types().iter().enumerate() {
-                let data = archetype.get_data_storage(col_idx);
-                for chunk_ptr in data.chunks() {
-                    let chunk_addr = *chunk_ptr as usize;
-                    if addr >= chunk_addr && addr < chunk_addr + DATA_CHUNK_SIZE_BYTES {
-                        let slot = resolved.archetype_slot();
-                        let entity_id = archetype.entity_id(slot);
-                        if entity_id != u32::MAX {
-                            return Some(self.entities.resolve_unknown_gen(entity_id));
-                        }
-                        return None;
-                    }
-                }
-            }
+        let entity = resolved.entity();
+        if entity.id == u32::MAX {
+            return None;
         }
-        None
+        Some(entity)
     }
 
     /// Prepare a query against a single entity, using dynamic borrow checking
@@ -771,7 +755,7 @@ impl World {
             let target_arch = &self.archetypes.archetypes[target.index];
 
             // Allocate storage in the archetype and update the entity's location to address it
-            let target_index = target_arch.allocate_nonsync(entity.id, self.world_slot);
+            let target_index = target_arch.allocate_nonsync(entity, self.world_slot);
             self.entities.meta.set_nonsync(
                 entity.id as usize,
                 EntityMeta {
@@ -793,7 +777,7 @@ impl World {
                 let src = source_arch.get_dynamic(ty, loc.index).unwrap();
                 target_arch.move_from_nonsync(src, ty, target_index);
             }
-            source_arch.set_entity_id_nonsync(loc.index as usize, u32::MAX);
+            source_arch.set_entity_free_nonsync(loc.index as usize);
         }
     }
 
@@ -860,7 +844,7 @@ impl World {
             let source_arch = &self.archetypes.archetypes[loc.archetype];
             let target_arch = &self.archetypes.archetypes[target];
             // SAFETY: We have &mut self
-            let target_index = unsafe { target_arch.allocate_nonsync(entity.id, self.world_slot) };
+            let target_index = unsafe { target_arch.allocate_nonsync(entity, self.world_slot) };
             loc.archetype = target;
             loc.index = target_index;
             if let Some(moved) = unsafe {
@@ -960,7 +944,7 @@ impl World {
         if loc.archetype != target {
             let source_arch = &self.archetypes.archetypes[loc.archetype];
             let target_arch = &self.archetypes.archetypes[target];
-            let target_index = target_arch.allocate_nonsync(entity.id, self.world_slot);
+            let target_index = target_arch.allocate_nonsync(entity, self.world_slot);
             self.entities.meta.set_nonsync(
                 loc.index as usize,
                 EntityMeta {
@@ -1102,9 +1086,9 @@ impl World {
             &self.archetypes.archetypes[self.archetypes.archetypes.key_from_index(0).unwrap()];
         let world_slot = self.world_slot;
 
-        self.entities.flush(|id, location| {
+        self.entities.flush(|entity, location| {
             //SAFETY: we have &mut self
-            location.index = unsafe { arch.allocate_nonsync(id, world_slot) }
+            location.index = unsafe { arch.allocate_nonsync(entity, world_slot) }
         });
     }
 
@@ -1113,9 +1097,9 @@ impl World {
             &self.archetypes.archetypes[self.archetypes.archetypes.key_from_index(0).unwrap()];
         let world_slot = self.world_slot;
 
-        self.entities.flush_nonsync(|id, location| {
+        self.entities.flush_nonsync(|entity, location| {
             //SAFETY: we have &mut self
-            location.index = unsafe { arch.allocate_nonsync(id, world_slot) }
+            location.index = unsafe { arch.allocate_nonsync(entity, world_slot) }
         });
     }
 
@@ -1152,7 +1136,7 @@ impl World {
             }
             if !matched { continue; }
             let total = archetype.allocated_values_sync();
-            let entities: &[U32Cell] = archetype.entity_ids();
+            let entities = archetype.entities_slice();
             // Precompute strides per column
             let mut strides_inline = [0usize; 8];
             let mut strides_heap;
@@ -1188,9 +1172,8 @@ impl World {
                 let run_end = (((chunk_idx + 1) * epc) as u32).min(total);
                 // Linear scan: bump pointers by stride instead of recomputing
                 for s in slot..run_end {
-                    let entity_id: u32 = (&entities[s as usize]).into();
-                    if entity_id != u32::MAX {
-                        let entity = unsafe { self.find_entity_from_id(entity_id) };
+                    let entity = unsafe { entities[s as usize].read_nonsync() };
+                    if entity.id != u32::MAX {
                         cb(entity, ptrs);
                     }
                     // Bump all column pointers by their stride
@@ -1237,7 +1220,7 @@ impl World {
             }
             if !matched { continue; }
             let total = archetype.allocated_values_sync();
-            let entities: &[U32Cell] = archetype.entity_ids();
+            let entities = archetype.entities_slice();
             let mut strides_inline = [0usize; 8];
             let mut strides_heap;
             let strides: &[usize] = if n <= 8 {
@@ -1269,7 +1252,7 @@ impl World {
                 }
                 let run_end = (((chunk_idx + 1) * epc) as u32).min(total);
                 for s in slot..run_end {
-                    let entity_id: u32 = (&entities[s as usize]).into();
+                    let entity_id = unsafe { entities[s as usize].read_id_nonsync() };
                     if entity_id != u32::MAX {
                         cb(ptrs);
                     }
@@ -1552,20 +1535,11 @@ impl<'a> Iterator for Iter<'a> {
                     }
                     let index = self.index;
                     self.index += 1;
-                    let id = current.entity_id(index);
-                    if id == u32::MAX {
+                    let entity = current.entity(index);
+                    if entity.id == u32::MAX {
                         continue;
                     }
-                    return Some(unsafe {
-                        EntityRef::new(
-                            current,
-                            Entity {
-                                id,
-                                generation: self.entities.meta[id as usize].generation,
-                            },
-                            index,
-                        )
-                    });
+                    return Some(unsafe { EntityRef::new(current, entity, index) });
                 }
             }
         }
@@ -1629,7 +1603,7 @@ where
         let components = self.inner.next()?;
         let entity = self.entities.alloc();
         // SAFETY: we have &mut Archetype
-        let index = unsafe { self.archetype.allocate_nonsync(entity.id, *self.world_slot) };
+        let index = unsafe { self.archetype.allocate_nonsync(entity, *self.world_slot) };
         unsafe {
             components.put(|ptr, ty| {
                 // SAFETY: we have &mut Archetype

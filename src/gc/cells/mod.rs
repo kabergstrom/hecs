@@ -6,3 +6,5 @@ mod isize;
 pub use self::isize::IsizeCell;
 mod ptr;
 pub use self::ptr::PtrCell;
+mod entity;
+pub use self::entity::EntityCell;

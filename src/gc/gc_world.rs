@@ -145,7 +145,7 @@ impl GcWorld {
     fn resolve(&self, entity: Entity) -> Result<(&Archetype, u32), NoSuchEntity> {
         let loc = self.world.entities().get(entity)?;
         let archetype = &self.world.archetypes_inner()[loc.archetype];
-        if archetype.entity_id(loc.index) == u32::MAX {
+        if archetype.entity(loc.index).id == u32::MAX {
             return Err(NoSuchEntity);
         }
         Ok((archetype, loc.index))

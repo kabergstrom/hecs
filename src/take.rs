@@ -49,7 +49,7 @@ unsafe impl<'a> DynamicBundle for TakenEntity<'a> {
             let mut ptr = self.archetype.get_dynamic(ty, self.index).unwrap();
             ptr.move_value_and_tombstone(ty, &mut f);
         }
-        self.archetype.set_entity_id(self.index as usize, u32::MAX);
+        self.archetype.set_entity_free(self.index as usize);
     }
 }
 
@@ -63,7 +63,7 @@ impl Drop for TakenEntity<'_> {
                     ptr.drop_value_and_tombstone(ty);
                 }
             }
-            self.archetype.set_entity_id(self.index as usize, u32::MAX);
+            self.archetype.set_entity_free(self.index as usize);
         }
     }
 }

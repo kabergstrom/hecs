@@ -1000,3 +1000,123 @@ fn sync_world() {
         Some((&42, &true))
     );
 }
+
+#[test]
+fn gc_ptr_back_pointer_entity() {
+    let mut world = World::new();
+    let e = world.spawn((123_i32, "abc".to_string()));
+    let ptr = world.get_gc_ptr_by_id(e, <i32 as Component>::STABLE_TYPE_ID).unwrap();
+    unsafe {
+        assert_eq!(ptr.entity(), e);
+        let arch = &*ptr.archetype();
+        assert!(arch.has::<i32>());
+        assert!(arch.has::<String>());
+        assert!(!arch.has::<bool>());
+        assert_eq!(arch.entity(ptr.archetype_slot()), e);
+    }
+    cleanup(world);
+}
+
+#[test]
+fn gc_ptr_sibling_lookup() {
+    let mut world = World::new();
+    let e = world.spawn((123_i32, "abc".to_string()));
+    let ptr_i32 = world.get_gc_ptr_by_id(e, <i32 as Component>::STABLE_TYPE_ID).unwrap();
+    unsafe {
+        // Sibling by type.
+        let string_ptr = ptr_i32.sibling::<String>().unwrap();
+        let string_val: &String = &*string_ptr.value_ptr().as_ptr().cast();
+        assert_eq!(string_val, "abc");
+        // Sibling by type id resolves to the same pointer.
+        let string_ptr2 = ptr_i32
+            .sibling_by_id(<String as Component>::STABLE_TYPE_ID)
+            .unwrap();
+        assert_eq!(string_ptr.value_ptr(), string_ptr2.value_ptr());
+        // Self-sibling returns the same pointer.
+        let same = ptr_i32.sibling::<i32>().unwrap();
+        assert_eq!(same.value_ptr(), ptr_i32.value_ptr());
+        // Sibling lookup for a missing component returns None.
+        assert!(ptr_i32.sibling::<bool>().is_none());
+    }
+    cleanup(world);
+}
+
+#[test]
+fn cref_entity() {
+    let mut world = World::new();
+    let e = world.spawn((123_i32, "abc".to_string()));
+    let cref = world.new_cref::<i32>(e).unwrap();
+    assert_eq!(cref.entity(), e);
+    cleanup(world);
+}
+
+#[test]
+fn cref_sibling() {
+    let mut world = World::new();
+    let e = world.spawn((123_i32, "abc".to_string()));
+    let cref_i32 = world.new_cref::<i32>(e).unwrap();
+    // Sibling exists — points to the same entity, exposed as CRef<String>.
+    let cref_string = cref_i32.sibling::<String>().unwrap();
+    assert_eq!(cref_string.entity(), e);
+    // Sibling missing.
+    assert!(cref_i32.sibling::<bool>().is_none());
+    // Self-sibling resolves to a CRef pointing at the same component.
+    let same = cref_i32.sibling::<i32>().unwrap();
+    assert!(same.ptr_eq(&cref_i32));
+    cleanup(world);
+}
+
+#[test]
+fn cref_entity_after_archetype_move() {
+    // Capture a CRef before adding a component. The insert below moves the
+    // entity to a new archetype, marking the original slot State::Moved.
+    // cref.entity() must terminate (regression test for resolve_moved) and
+    // still resolve to the same Entity.
+    let mut world = World::new();
+    let e = world.spawn((123_i32, "abc".to_string()));
+    let cref = world.new_cref::<i32>(e).unwrap();
+    world.insert_one(e, true).unwrap();
+    assert_eq!(cref.entity(), e);
+    cleanup(world);
+}
+
+#[test]
+fn cref_sibling_after_archetype_move() {
+    // Same scenario, exercising cref.sibling() across the move.
+    let mut world = World::new();
+    let e = world.spawn((123_i32, "abc".to_string()));
+    let cref_i32 = world.new_cref::<i32>(e).unwrap();
+    world.insert_one(e, true).unwrap();
+    // Sibling that existed before the move.
+    let cref_string = cref_i32.sibling::<String>().unwrap();
+    assert_eq!(cref_string.entity(), e);
+    // Sibling added by the move is now reachable.
+    let cref_bool = cref_i32.sibling::<bool>().unwrap();
+    assert_eq!(cref_bool.entity(), e);
+    cleanup(world);
+}
+
+#[test]
+fn gc_ptr_back_pointer_across_chunks() {
+    // Spawn enough entities to span multiple chunks so we exercise the
+    // chunk_idx + offset arithmetic inside archetype_slot().
+    let mut world = World::new();
+    let mut entities = Vec::with_capacity(5000);
+    for i in 0..5000_i32 {
+        entities.push(world.spawn((i, (i as i64).wrapping_mul(7))));
+    }
+    // Verify the back-pointer round-trip for the first, middle, and last entities.
+    for &idx in &[0usize, 2500, 4999] {
+        let e = entities[idx];
+        let ptr = world.get_gc_ptr_by_id(e, <i32 as Component>::STABLE_TYPE_ID).unwrap();
+        unsafe {
+            assert_eq!(ptr.entity(), e, "entity mismatch at idx {}", idx);
+            let val_i32 = *ptr.value_ptr().as_ptr().cast::<i32>();
+            assert_eq!(val_i32, idx as i32);
+            let sibling = ptr.sibling::<i64>().unwrap();
+            let val_i64 = *sibling.value_ptr().as_ptr().cast::<i64>();
+            assert_eq!(val_i64, (idx as i64).wrapping_mul(7));
+        }
+    }
+    cleanup(world);
+}

@@ -8,12 +8,12 @@
 use crate::alloc::alloc::{alloc, dealloc, Layout};
 use crate::alloc::boxed::Box;
 use crate::alloc::{vec, vec::Vec};
-use crate::gc::cells::{PtrCell, U32Cell};
+use crate::gc::cells::{EntityCell, PtrCell, U32Cell};
 use crate::gc::kvec::KVec;
 use crate::gc::{GCHeader, GCPtr, GC};
 use core::any::type_name;
 
-use crate::StableTypeId;
+use crate::{Entity, StableTypeId};
 use core::cell::{Cell, RefCell, UnsafeCell};
 use core::hash::{BuildHasher, BuildHasherDefault, Hasher};
 use core::num::{NonZeroU128, NonZeroU32};
@@ -42,7 +42,7 @@ pub struct Archetype {
     index: OrderedTypeIdMap<usize>,
     len: U32Cell,
     num_free: U32Cell,
-    entities: KVec<U32Cell>,
+    entities: KVec<EntityCell>,
     /// One allocation per type, in the same order as `types`
     data: Box<[Data]>,
     first_free: PtrCell<u8>,
@@ -134,7 +134,7 @@ impl Archetype {
                 }
             }
         }
-        self.entities.fill(u32::MAX.into());
+        self.entities.fill(EntityCell::free());
     }
 
     /// Whether this archetype contains `T` components
@@ -208,25 +208,35 @@ impl Archetype {
     }
 
     #[inline]
-    pub(crate) fn entities(&self) -> NonNull<u32> {
-        unsafe { NonNull::new_unchecked(self.entities.as_ptr() as *mut u32) }
+    pub(crate) fn entities(&self) -> NonNull<EntityCell> {
+        unsafe { NonNull::new_unchecked(self.entities.as_ptr() as *mut EntityCell) }
     }
 
-    pub fn entity_id(&self, index: u32) -> u32 {
-        (&self.entities[index as usize]).into()
+    /// Returns the [`Entity`] occupying `index`. The id field is `u32::MAX`
+    /// when the slot is free.
+    pub fn entity(&self, index: u32) -> Entity {
+        self.entities[index as usize].load_atomic(Ordering::Relaxed)
     }
 
-    pub fn entity_ids(&self) -> &[U32Cell] {
+    pub fn entities_slice(&self) -> &[EntityCell] {
         &self.entities
     }
 
     #[inline]
-    pub(crate) fn set_entity_id(&mut self, index: usize, id: u32) {
-        self.entities[index].set(id);
+    pub(crate) fn set_entity(&mut self, index: usize, entity: Entity) {
+        self.entities[index].set(entity);
     }
     #[inline]
-    pub(crate) unsafe fn set_entity_id_nonsync(&self, index: usize, id: u32) {
-        self.entities[index].write_nonsync(id);
+    pub(crate) unsafe fn set_entity_nonsync(&self, index: usize, entity: Entity) {
+        self.entities[index].write_nonsync(entity);
+    }
+    #[inline]
+    pub(crate) fn set_entity_free(&mut self, index: usize) {
+        self.entities[index].set_free();
+    }
+    #[inline]
+    pub(crate) unsafe fn set_entity_free_nonsync(&self, index: usize) {
+        self.entities[index].write_free_nonsync();
     }
 
     pub fn types(&self) -> &[TypeInfo] {
@@ -288,7 +298,7 @@ impl Archetype {
     /// `index` must be a valid entity slot in this archetype.
     pub unsafe fn get_dynamic_by_id(&self, id: StableTypeId, index: u32) -> Option<GCPtr> {
         debug_assert!(index < self.len.read_nonsync());
-        debug_assert!(self.entities[index as usize].read_nonsync() != u32::MAX);
+        debug_assert!(self.entities[index as usize].read_id_nonsync() != u32::MAX);
         let ptr = self
             .data
             .get_unchecked(*self.index.get(&id)?)
@@ -299,7 +309,7 @@ impl Archetype {
 
     /// Every type must be written immediately after this call
     /// This cannot be called from multiple threads concurrently
-    pub(crate) unsafe fn allocate_nonsync(&self, id: u32, world_slot: NonZeroU32) -> u32 {
+    pub(crate) unsafe fn allocate_nonsync(&self, entity: Entity, world_slot: NonZeroU32) -> u32 {
         let free_ptr = self.first_free.read_nonsync();
         let new_slot =
             if let Some(free_value) = NonNull::new(free_ptr).map(|ptr| GCPtr { value: ptr }) {
@@ -325,7 +335,7 @@ impl Archetype {
                 }
                 new_slot
             };
-        self.entities[new_slot as usize].write_nonsync(id);
+        self.entities[new_slot as usize].write_nonsync(entity);
         new_slot
     }
 
@@ -347,10 +357,11 @@ impl Archetype {
 
     /// Increase capacity by at least `min_increment`
     fn grow_sync(&self, min_increment: u32, world_slot: NonZeroU32) {
+        let archetype_ptr = self as *const Archetype;
         // Double capacity or increase it by `min_increment`, whichever is larger.
         let additional = self.capacity().max(min_increment) as usize;
         let new_cap = self.entities.len() + additional;
-        self.entities.extend_with_sync(additional, u32::MAX.into());
+        self.entities.extend_with_sync(additional, EntityCell::free());
 
         for (info, data) in self.types.iter().zip(&*self.data) {
             if info.value_layout.size() != 0 {
@@ -361,8 +372,11 @@ impl Archetype {
                     unsafe {
                         let mem = alloc_zeroed(data.storage_layout);
                         assert!(!mem.is_null(), "allocation failed");
-                        mem.cast::<StorageHeader>()
-                            .write(data.new_storage_header(world_slot, data.storage.len()));
+                        mem.cast::<StorageHeader>().write(data.new_storage_header(
+                            archetype_ptr,
+                            world_slot,
+                            data.storage.len(),
+                        ));
                         data.storage.push_sync(mem);
                     }
                 }
@@ -372,11 +386,12 @@ impl Archetype {
 
     /// Increase capacity by at least `min_increment`
     unsafe fn grow_nonsync(&self, min_increment: u32, world_slot: NonZeroU32) {
+        let archetype_ptr = self as *const Archetype;
         // Double capacity or increase it by `min_increment`, whichever is larger.
         let additional = self.capacity().max(min_increment) as usize;
         let new_cap = self.entities.len() + additional;
         self.entities
-            .extend_with_nonsync(additional, u32::MAX.into());
+            .extend_with_nonsync(additional, EntityCell::free());
 
         for (info, data) in self.types.iter().zip(&*self.data) {
             if info.value_layout.size() != 0 {
@@ -388,8 +403,11 @@ impl Archetype {
                     unsafe {
                         let mem = alloc_zeroed(data.storage_layout);
                         assert!(!mem.is_null(), "allocation failed");
-                        mem.cast::<StorageHeader>()
-                            .write(data.new_storage_header(world_slot, data.storage.len()));
+                        mem.cast::<StorageHeader>().write(data.new_storage_header(
+                            archetype_ptr,
+                            world_slot,
+                            data.storage.len(),
+                        ));
                         data.storage.push_nonsync(mem);
                     }
                 }
@@ -399,10 +417,11 @@ impl Archetype {
 
     /// Increase capacity by at least `min_increment`
     fn grow(&mut self, min_increment: u32, world_slot: NonZeroU32) {
+        let archetype_ptr = self as *const Archetype;
         // Double capacity or increase it by `min_increment`, whichever is larger.
         let additional = self.capacity().max(min_increment) as usize;
         let new_cap = self.entities.len() + additional;
-        self.entities.extend_with(additional, u32::MAX.into());
+        self.entities.extend_with(additional, EntityCell::free());
 
         for (info, data) in self.types.iter().zip(self.data.iter_mut()) {
             if info.value_layout.size() != 0 {
@@ -414,8 +433,11 @@ impl Archetype {
                     unsafe {
                         let mem = alloc_zeroed(data.storage_layout);
                         assert!(!mem.is_null(), "allocation failed");
-                        mem.cast::<StorageHeader>()
-                            .write(data.new_storage_header(world_slot, data.storage.len()));
+                        mem.cast::<StorageHeader>().write(data.new_storage_header(
+                            archetype_ptr,
+                            world_slot,
+                            data.storage.len(),
+                        ));
                         data.storage.push(mem);
                     }
                 }
@@ -428,14 +450,14 @@ impl Archetype {
             let mut to_remove = data.get_gc_ptr(index);
             to_remove.drop_value_and_tombstone(ty);
         }
-        self.entities[index as usize].set(u32::MAX);
+        self.entities[index as usize].set_free();
     }
     pub(crate) unsafe fn remove_nonsync(&self, index: u32) {
         for (ty, data) in self.types.iter().zip(&*self.data) {
             let mut to_remove = data.get_gc_ptr(index);
             to_remove.drop_value_and_tombstone(ty);
         }
-        self.entities[index as usize].write_nonsync(u32::MAX);
+        self.entities[index as usize].write_free_nonsync();
     }
 
     /// Returns the ID of the entity moved into `index`, if any
@@ -447,7 +469,7 @@ impl Archetype {
         for (ty, data) in self.types.iter().zip(&*self.data) {
             let gc_ptr = data.get_gc_ptr(index);
             f(gc_ptr, ty);
-            self.entities[index as usize].write_nonsync(u32::MAX);
+            self.entities[index as usize].write_free_nonsync();
         }
         None
     }
@@ -477,6 +499,12 @@ impl Archetype {
     /// # Safety
     ///
     /// Component types must match exactly.
+    ///
+    /// When implementing this: each chunk's `StorageHeader::archetype`
+    /// back-pointer is bound to its original owning archetype. If chunks are
+    /// carried across from `other`, every header must be rewritten to point at
+    /// `self`, otherwise `GCPtr::archetype()` and the sibling/entity_id
+    /// helpers built on it will dereference a dropped archetype.
     pub(crate) unsafe fn merge(&mut self, mut other: Archetype, world_slot: NonZeroU32) {
         self.reserve(other.len.read(), world_slot);
         for ((info, dst), src) in self.types.iter().zip(&*self.data).zip(&*other.data) {
@@ -582,6 +610,10 @@ impl Drop for Archetype {
 
 pub const DATA_CHUNK_SIZE_BYTES: usize = 0x10000;
 pub(crate) struct StorageHeader {
+    /// Back-pointer to the owning archetype. Stable because archetypes live in
+    /// a `SharedVec<Archetype>` whose elements never relocate, and chunks are
+    /// only allocated after the archetype is placed in the vec.
+    pub(crate) archetype: *const Archetype,
     pub(crate) world_slot: NonZeroU32,
     pub(crate) chunk_idx: usize,
     pub(crate) data_start: usize,
@@ -601,10 +633,12 @@ pub struct Data {
 impl Data {
     pub(crate) fn new_storage_header(
         &self,
+        archetype: *const Archetype,
         world_slot: NonZeroU32,
         chunk_idx: usize,
     ) -> StorageHeader {
         StorageHeader {
+            archetype,
             world_slot,
             chunk_idx,
             data_start: self.data_start,

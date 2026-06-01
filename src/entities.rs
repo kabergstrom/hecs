@@ -581,7 +581,7 @@ impl Entities {
 
     /// Allocates space for entities previously reserved with `reserve_entity` or
     /// `reserve_entities`, then initializes each one using the supplied function.
-    pub fn flush(&mut self, mut init: impl FnMut(u32, &mut Location)) {
+    pub fn flush(&mut self, mut init: impl FnMut(Entity, &mut Location)) {
         let free_cursor = self.free_cursor.read();
 
         let new_free_cursor = if free_cursor >= 0 {
@@ -594,7 +594,11 @@ impl Entities {
             let len = self.len.read();
             self.len.set(len + (-free_cursor) as u32);
             for (id, meta) in self.meta.iter_mut().enumerate().skip(old_meta_len) {
-                init(id as u32, &mut meta.location);
+                let entity = Entity {
+                    id: id as u32,
+                    generation: meta.generation,
+                };
+                init(entity, &mut meta.location);
             }
 
             self.free_cursor.set(0);
@@ -605,12 +609,17 @@ impl Entities {
         self.len
             .set(len + (self.pending.len() - new_free_cursor) as u32);
         for id in &self.pending[new_free_cursor..] {
-            init(*id, &mut self.meta[*id as usize].location);
+            let meta = &mut self.meta[*id as usize];
+            let entity = Entity {
+                id: *id,
+                generation: meta.generation,
+            };
+            init(entity, &mut meta.location);
         }
         self.pending.truncate(new_free_cursor);
     }
 
-    pub unsafe fn flush_nonsync(&self, mut init: impl FnMut(u32, &mut Location)) {
+    pub unsafe fn flush_nonsync(&self, mut init: impl FnMut(Entity, &mut Location)) {
         let free_cursor = self.free_cursor.read_nonsync();
 
         let new_free_cursor = if free_cursor >= 0 {
@@ -627,7 +636,11 @@ impl Entities {
             let meta_slice = core::slice::from_raw_parts_mut(mut_ptr, self.meta.len_nonsync());
 
             for (id, meta) in meta_slice.iter_mut().enumerate().skip(old_meta_len) {
-                init(id as u32, &mut meta.location);
+                let entity = Entity {
+                    id: id as u32,
+                    generation: meta.generation,
+                };
+                init(entity, &mut meta.location);
             }
 
             self.free_cursor.write_nonsync(0);
@@ -642,7 +655,12 @@ impl Entities {
         let meta_slice = core::slice::from_raw_parts_mut(mut_ptr, self.meta.len_nonsync());
 
         for id in &self.pending[new_free_cursor..] {
-            init(*id, &mut meta_slice[*id as usize].location);
+            let meta = &mut meta_slice[*id as usize];
+            let entity = Entity {
+                id: *id,
+                generation: meta.generation,
+            };
+            init(entity, &mut meta.location);
         }
         // there can be no active references to the pending list in a !Sync context
         // (reserve_entities cannot be called)
@@ -911,9 +929,9 @@ mod tests {
         assert_eq!(e.free_cursor.read(), -6);
 
         let mut flushed = Vec::new();
-        e.flush(|id, loc| {
+        e.flush(|entity, loc| {
             loc.index = 0;
-            flushed.push(id);
+            flushed.push(entity.id);
         });
         flushed.sort_unstable();
 
