@@ -30,20 +30,8 @@ impl<'b> BorrowRef<'b> {
     pub(super) fn new(borrow: &'b Cell<BorrowFlag>) -> Option<BorrowRef<'b>> {
         let b = borrow.get().wrapping_add(1);
         if !is_reading(b) {
-            // Incrementing borrow can result in a non-reading value (<= 0) in these cases:
-            // 1. It was < 0, i.e. there are writing borrows, so we can't allow a read borrow
-            //    due to Rust's reference aliasing rules
-            // 2. It was isize::MAX (the max amount of reading borrows) and it overflowed
-            //    into isize::MIN (the max amount of writing borrows) so we can't allow
-            //    an additional read borrow because isize can't represent so many read borrows
-            //    (this can only happen if you mem::forget more than a small constant amount of
-            //    `Ref`s, which is not good practice)
             None
         } else {
-            // Incrementing borrow can result in a reading value (> 0) in these cases:
-            // 1. It was = 0, i.e. it wasn't borrowed, and we are taking the first read borrow
-            // 2. It was > 0 and < isize::MAX, i.e. there were read borrows, and isize
-            //    is large enough to represent having one more read borrow
             borrow.set(b);
             Some(BorrowRef { borrow })
         }
@@ -62,12 +50,9 @@ impl Drop for BorrowRef<'_> {
 impl Clone for BorrowRef<'_> {
     #[inline]
     fn clone(&self) -> Self {
-        // Since this Ref exists, we know the borrow flag
-        // is a reading borrow.
         let borrow = self.borrow.get();
         debug_assert!(is_reading(borrow));
-        // Prevent the borrow counter from overflowing into
-        // a writing borrow.
+        // Prevent the borrow counter from overflowing into a writing borrow.
         assert!(borrow != i16::MAX);
         self.borrow.set(borrow + 1);
         BorrowRef {

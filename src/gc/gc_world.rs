@@ -1,5 +1,6 @@
 use core::{
     marker::PhantomData,
+    num::NonZeroU32,
     ops::{Deref, DerefMut},
 };
 
@@ -9,6 +10,16 @@ use crate::{
 };
 
 use super::query::{Fetch, Query, QueryBorrow, QueryItem};
+use super::{slot_mode, SlotMode};
+
+#[inline]
+fn assert_writable(slot: NonZeroU32) {
+    assert_eq!(
+        slot_mode(slot),
+        SlotMode::GcDynamic,
+        "GcWorld mutation attempted while a ReadWorld scope is active"
+    );
+}
 
 pub struct GcWorldScope<'a> {
     original_world_ref: &'a mut World,
@@ -85,6 +96,7 @@ impl GcWorld {
         entity: Entity,
         components: impl DynamicBundle,
     ) -> Result<(), NoSuchEntity> {
+        assert_writable(self.world.world_slot());
         unsafe { self.world.insert_nonsync(entity, components) }
     }
 
@@ -109,6 +121,7 @@ impl GcWorld {
     /// let b = ergo.spawn((456, true));
     /// ```
     pub fn spawn(&self, components: impl DynamicBundle) -> Entity {
+        assert_writable(self.world.world_slot());
         unsafe { self.world.spawn_nonsync(components) }
     }
 
@@ -116,6 +129,7 @@ impl GcWorld {
     ///
     /// See [`remove`](Self::remove).
     pub fn remove_one<T: Component>(&self, entity: Entity) -> Result<T, ComponentError> {
+        assert_writable(self.world.world_slot());
         unsafe { self.world.remove_one_nonsync::<T>(entity) }
     }
 
@@ -123,11 +137,13 @@ impl GcWorld {
     ///
     /// When removing a single component, see [`remove_one`](Self::remove_one) for convenience.
     pub fn remove<T: Bundle + 'static>(&self, entity: Entity) -> Result<T, ComponentError> {
+        assert_writable(self.world.world_slot());
         unsafe { self.world.remove_nonsync::<T>(entity) }
     }
 
     // /// Destroy an entity and all its components
     pub fn despawn(&self, entity: Entity) -> Result<(), NoSuchEntity> {
+        assert_writable(self.world.world_slot());
         unsafe { self.world.despawn_nonsync(entity) }
     }
 
@@ -220,11 +236,117 @@ impl GcWorld {
             self.world.archetypes_inner().iter(),
         )
     }
+
+    /// Enter a read-only scope on this world.
+    ///
+    /// While the returned [`ReadWorld`] is alive, all `GcWorld` mutation methods
+    /// (`spawn`, `insert`, `remove`, `despawn`, ...) panic, and [`CRef::write`] panics.
+    /// In exchange, [`CRef::read_bypass`] becomes available — it hands out a `&T`
+    /// bound to the scope's lifetime without touching the dynamic borrow counter.
+    /// [`CRef::read`] continues to work and behaves exactly as in `GcDynamic` mode
+    /// (incrementing the borrow counter, returning a `Ref<'_, T>`) so any `Ref`
+    /// still outstanding when the scope drops keeps `write()` blocked until it does.
+    ///
+    /// `ReadWorld` scopes are reentrant — open as many as you like; the slot returns
+    /// to its writable state only when the last one drops.
+    pub fn read_only(&self) -> ReadWorld<'_> {
+        unsafe { super::enter_read_only(self.world.world_slot()) };
+        ReadWorld { gc: self }
+    }
+}
+
+/// Read-only handle to a [`GcWorld`].
+///
+/// Created via [`GcWorld::read_only`]. While alive, blocks all mutation through the
+/// owning `GcWorld` (runtime check), and enables [`CRef::read_bypass`] for cheap,
+/// scope-lifetime `&T` access that bypasses the dynamic borrow counter.
+pub struct ReadWorld<'a> {
+    gc: &'a GcWorld,
+}
+
+impl<'a> ReadWorld<'a> {
+    #[inline]
+    pub(crate) fn world_slot(&self) -> NonZeroU32 {
+        self.gc.world.world_slot()
+    }
+
+    /// Returns a `CRef` to the `T` component of `entity`.
+    pub fn get<T: Component>(&self, entity: Entity) -> Result<CRef<T>, ComponentError> {
+        self.gc.get::<T>(entity)
+    }
+
+    /// Resolve entity location, returning `Err` if despawned.
+    fn resolve(&self, entity: Entity) -> Result<(&Archetype, u32), NoSuchEntity> {
+        let loc = self.gc.world.entities().get(entity)?;
+        let archetype = &self.gc.world.archetypes_inner()[loc.archetype];
+        if archetype.entity(loc.index).id == u32::MAX {
+            return Err(NoSuchEntity);
+        }
+        Ok((archetype, loc.index))
+    }
+
+    /// Returns an [`EntityRef`] for the given entity.
+    pub fn entity(&self, entity: Entity) -> Result<EntityRef<'_>, NoSuchEntity> {
+        let (archetype, index) = self.resolve(entity)?;
+        Ok(EntityRef {
+            archetype,
+            entity,
+            index,
+        })
+    }
+
+    /// Returns `true` if `entity` satisfies the query `Q`.
+    pub fn satisfies<Q: Query>(&self, entity: Entity) -> Result<bool, NoSuchEntity> {
+        let e = self.entity(entity)?;
+        Ok(Q::Fetch::prepare(e.archetype()).is_some())
+    }
+
+    /// Whether `entity` exists.
+    pub fn contains(&self, entity: Entity) -> bool {
+        self.resolve(entity).is_ok()
+    }
+
+    /// Query a single entity.
+    pub fn query_one<Q: Query>(&self, entity: Entity) -> Result<QueryItem<'_, Q>, QueryOneError> {
+        let (archetype, index) = self.resolve(entity)?;
+        let state = Q::Fetch::prepare(archetype).ok_or(QueryOneError::Unsatisfied)?;
+        let fetch = Q::Fetch::execute(archetype, state);
+        unsafe { Ok(fetch.get(index as usize)) }
+    }
+
+    /// Iterate over all entities matching `Q`. See [`GcWorld::query`].
+    pub fn query<Q: Query>(&self) -> QueryBorrow<'_, Q> {
+        QueryBorrow::new(
+            &self.gc.world.entities().meta,
+            self.gc.world.archetypes_inner().iter(),
+        )
+    }
+
+    /// Returns the number of entities in the world.
+    pub fn len(&self) -> u32 {
+        self.gc.world.len()
+    }
+
+    /// Returns `true` if the world contains no entities.
+    pub fn is_empty(&self) -> bool {
+        self.gc.world.is_empty()
+    }
+}
+
+impl<'a> Drop for ReadWorld<'a> {
+    fn drop(&mut self) {
+        unsafe { super::exit_read_only(self.gc.world.world_slot()) };
+    }
 }
 
 impl<'a> Drop for GcWorldScope<'a> {
     fn drop(&mut self) {
+        // The original slot lives in `gc_world.world` until we swap it back.
+        // Disable here so that after the swap, the user's `World` is left in `Off`.
+        unsafe { super::disable_gc_borrows(self.gc_world.world.world_slot()) };
         core::mem::swap(self.original_world_ref, &mut self.gc_world.world);
+        // GcWorld::Drop will then run on the temp World's slot, which was never
+        // enabled — harmless no-op.
     }
 }
 
@@ -406,5 +528,184 @@ mod tests {
             assert!(!gc.contains(e));
         }
         crate::world::tests::cleanup(world);
+    }
+
+    #[test]
+    fn read_world_read_bypass_and_read() {
+        let mut world = World::new();
+        {
+            let gc = GcWorld::new_scope(&mut world);
+            let e = gc.spawn((42i32, true));
+            let c = gc.get::<i32>(e).unwrap();
+            {
+                let read = gc.read_only();
+                // Cheap path: scope-lifetime &T, no borrow-counter traffic.
+                let v: &i32 = c.read_bypass(&read);
+                assert_eq!(*v, 42);
+                // Dynamic path still works in ReadOnly mode and uses the borrow counter
+                // exactly as in GcDynamic mode.
+                assert_eq!(*c.read(), 42);
+                // ReadWorld's own lookup API returns CRef<T>.
+                let c2 = read.get::<i32>(e).unwrap();
+                assert_eq!(*c2.read_bypass(&read), 42);
+            }
+            // Back to GcDynamic — writes work again.
+            *c.write() = 100;
+            assert_eq!(*c.read(), 100);
+        }
+        crate::world::tests::cleanup(world);
+    }
+
+    #[test]
+    fn read_world_nested_scopes() {
+        let mut world = World::new();
+        {
+            let gc = GcWorld::new_scope(&mut world);
+            let e = gc.spawn((42i32,));
+            let c = gc.get::<i32>(e).unwrap();
+            let outer = gc.read_only();
+            {
+                let inner = gc.read_only();
+                assert_eq!(*c.read_bypass(&inner), 42);
+                assert_eq!(*c.read_bypass(&outer), 42);
+            }
+            // Still in ReadOnly because outer is alive.
+            assert_eq!(*c.read_bypass(&outer), 42);
+            drop(outer);
+            // Back to GcDynamic.
+            *c.write() = 7;
+            assert_eq!(*c.read(), 7);
+        }
+        crate::world::tests::cleanup(world);
+    }
+
+    #[test]
+    fn read_world_query() {
+        use alloc::vec;
+        use alloc::vec::Vec;
+        let mut world = World::new();
+        {
+            let gc = GcWorld::new_scope(&mut world);
+            let a = gc.spawn((1i32, true));
+            let b = gc.spawn((2i32, false));
+            gc.spawn((3i32,)); // missing bool
+            let read = gc.read_only();
+            let mut found = Vec::new();
+            for (e, (i, b_)) in read.query::<(&i32, &bool)>().iter() {
+                found.push((e, *i.read_bypass(&read), *b_.read_bypass(&read)));
+            }
+            found.sort_by_key(|t| t.1);
+            assert_eq!(found, vec![(a, 1, true), (b, 2, false)]);
+        }
+        crate::world::tests::cleanup(world);
+    }
+
+    #[test]
+    #[should_panic(expected = "GcWorld mutation attempted while a ReadWorld scope is active")]
+    fn read_world_blocks_spawn() {
+        let mut world = World::new();
+        {
+            let gc = GcWorld::new_scope(&mut world);
+            let _read = gc.read_only();
+            gc.spawn((1i32,));
+        }
+        crate::world::tests::cleanup(world);
+    }
+
+    #[test]
+    #[should_panic(expected = "GcWorld mutation attempted while a ReadWorld scope is active")]
+    fn read_world_blocks_despawn() {
+        let mut world = World::new();
+        {
+            let gc = GcWorld::new_scope(&mut world);
+            let e = gc.spawn((1i32,));
+            let _read = gc.read_only();
+            gc.despawn(e).unwrap();
+        }
+        crate::world::tests::cleanup(world);
+    }
+
+    #[test]
+    #[should_panic(expected = "CRef::write during ReadWorld scope")]
+    fn read_world_blocks_cref_write() {
+        let mut world = World::new();
+        {
+            let gc = GcWorld::new_scope(&mut world);
+            let e = gc.spawn((1i32,));
+            let c = gc.get::<i32>(e).unwrap();
+            let _read = gc.read_only();
+            let _w = c.write();
+        }
+        crate::world::tests::cleanup(world);
+    }
+
+    #[test]
+    #[should_panic(expected = "CRef::read_bypass while a mutable borrow is held")]
+    fn read_bypass_rejects_active_refmut() {
+        let mut world = World::new();
+        {
+            let gc = GcWorld::new_scope(&mut world);
+            let e = gc.spawn((1i32,));
+            let c = gc.get::<i32>(e).unwrap();
+            let _w = c.write(); // RefMut held across scope entry
+            let read = gc.read_only();
+            let _v: &i32 = c.read_bypass(&read);
+        }
+        crate::world::tests::cleanup(world);
+    }
+
+    #[test]
+    #[should_panic(expected = "CRef::write during ReadWorld scope")]
+    fn leaked_read_world_does_not_poison_next_scope() {
+        let mut world = World::new();
+        {
+            let gc = GcWorld::new_scope(&mut world);
+            let read = gc.read_only();
+            // Skip ReadWorld's Drop — depth would naively stay at 1 forever.
+            core::mem::forget(read);
+        }
+        // New GcWorld lifecycle on the same slot. enable_gc_borrows must reset depth
+        // so the next read_only() correctly transitions GcDynamic -> ReadOnly. If it
+        // doesn't, c.write() below would succeed and we'd silently have UB.
+        let gc = GcWorld::new_scope(&mut world);
+        let e = gc.spawn((1i32,));
+        let c = gc.get::<i32>(e).unwrap();
+        let _read = gc.read_only();
+        let _w = c.write();
+    }
+
+    #[test]
+    fn leaked_read_world_does_not_block_next_scope_mutation() {
+        // Symmetric positive check: after a forgotten ReadWorld, the next scope's
+        // GcDynamic operations (spawn / despawn) work normally.
+        let mut world = World::new();
+        {
+            let gc = GcWorld::new_scope(&mut world);
+            let read = gc.read_only();
+            core::mem::forget(read);
+        }
+        {
+            let gc = GcWorld::new_scope(&mut world);
+            let e = gc.spawn((1i32,));
+            gc.despawn(e).unwrap();
+        }
+        crate::world::tests::cleanup(world);
+    }
+
+    #[test]
+    #[should_panic(expected = "CRef belongs to a different World")]
+    fn read_bypass_rejects_foreign_world_scope() {
+        let mut world_a = World::new();
+        let mut world_b = World::new();
+        {
+            let gc_a = GcWorld::new_scope(&mut world_a);
+            let gc_b = GcWorld::new_scope(&mut world_b);
+            let e_a = gc_a.spawn((1i32,));
+            let c_a = gc_a.get::<i32>(e_a).unwrap();
+            let read_b = gc_b.read_only();
+            let _v: &i32 = c_a.read_bypass(&read_b);
+        }
+        crate::world::tests::cleanup(world_a);
+        crate::world::tests::cleanup(world_b);
     }
 }
