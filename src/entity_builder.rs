@@ -62,7 +62,7 @@ impl EntityBuilder {
 
     /// Construct a `Bundle` suitable for spawning
     pub fn build(&mut self) -> BuiltEntity<'_> {
-        self.inner.info.sort_unstable_by_key(|x| x.0.id());
+        self.inner.info.sort_unstable_by(|a, b| a.0.cmp(&b.0));
         self.inner
             .ids
             .extend(self.inner.info.iter().map(|x| x.0.id()));
@@ -264,7 +264,7 @@ unsafe impl DynamicBundleClone for &'_ BuiltEntityClone {
 
 impl From<EntityBuilderClone> for BuiltEntityClone {
     fn from(mut x: EntityBuilderClone) -> Self {
-        x.inner.info.sort_unstable_by_key(|y| y.0.id());
+        x.inner.info.sort_unstable_by(|a, b| a.0.cmp(&b.0));
         x.inner.ids.extend(x.inner.info.iter().map(|y| y.0.id()));
         Self(x.inner)
     }

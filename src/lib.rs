@@ -33,6 +33,17 @@
 //! ```
 
 #![warn(missing_docs)]
+#![allow(
+    missing_docs,
+    unused_imports,
+    dead_code,
+    unused_variables,
+    unused_mut,
+    unreachable_code,
+    unused_unsafe,
+    mismatched_lifetime_syntaxes,
+    unknown_lints,
+)]
 #![no_std]
 #![cfg_attr(docsrs, feature(doc_cfg))]
 

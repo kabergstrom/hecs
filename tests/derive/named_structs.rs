@@ -15,7 +15,7 @@ struct Bar {
 struct Baz {
     foo: i32,
     bar: String,
-    baz: &'static str,
+    baz: Vec<u8>,
 }
 
 #[derive(Query)]
