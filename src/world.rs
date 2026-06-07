@@ -377,7 +377,7 @@ impl World {
 
     pub unsafe fn despawn_nonsync(&self, entity: Entity) -> Result<(), NoSuchEntity> {
         self.flush_nonsync();
-        let loc = self.entities.get(entity)?;
+        let loc = self.entities.retire_nonsync(entity)?;
         unsafe { self.archetypes.archetypes[loc.archetype].remove_nonsync(loc.index) }
         Ok(())
     }
@@ -604,8 +604,14 @@ impl World {
         type_id: crate::StableTypeId,
     ) -> Result<crate::gc::GCPtr, ComponentError> {
         let entity = self.entity(entity)?;
-        let ptr = unsafe { entity.archetype().get_dynamic_by_id(type_id, entity.index()) };
-        ptr.ok_or(ComponentError::MissingComponent(MissingComponent::custom("<unknown component>")))
+        let ptr = unsafe {
+            entity
+                .archetype()
+                .get_dynamic_by_id(type_id, entity.index())
+        };
+        ptr.ok_or(ComponentError::MissingComponent(MissingComponent::custom(
+            "<unknown component>",
+        )))
     }
 
     /// Short-hand for [`entity`](Self::entity) followed by [`EntityRef::satisfies`]
@@ -882,9 +888,8 @@ impl World {
             })?
         };
 
-        let removed_ids = T::with_static_type_info(|info| {
-            info.iter().map(|t| t.id()).collect::<Vec<_>>()
-        });
+        let removed_ids =
+            T::with_static_type_info(|info| info.iter().map(|t| t.id()).collect::<Vec<_>>());
 
         self.migrate_remove_nonsync(entity, loc, &removed_ids);
         Ok(bundle)
@@ -946,7 +951,7 @@ impl World {
             let target_arch = &self.archetypes.archetypes[target];
             let target_index = target_arch.allocate_nonsync(entity, self.world_slot);
             self.entities.meta.set_nonsync(
-                loc.index as usize,
+                entity.id as usize,
                 EntityMeta {
                     location: Location {
                         archetype: target,
@@ -1114,14 +1119,21 @@ impl World {
     ) {
         // Stack-allocate for the common case (≤8 components), spill to heap otherwise
         let n = type_ids.len();
-        let mut ptrs_inline = [crate::gc::GCPtr { value: core::ptr::NonNull::dangling() }; 8];
+        let mut ptrs_inline = [crate::gc::GCPtr {
+            value: core::ptr::NonNull::dangling(),
+        }; 8];
         let mut cols_inline = [0usize; 8];
         let mut ptrs_heap;
         let mut cols_heap;
         let (ptrs, cols): (&mut [crate::gc::GCPtr], &mut [usize]) = if n <= 8 {
             (&mut ptrs_inline[..n], &mut cols_inline[..n])
         } else {
-            ptrs_heap = vec![crate::gc::GCPtr { value: core::ptr::NonNull::dangling() }; n];
+            ptrs_heap = vec![
+                crate::gc::GCPtr {
+                    value: core::ptr::NonNull::dangling()
+                };
+                n
+            ];
             cols_heap = vec![0usize; n];
             (&mut ptrs_heap, &mut cols_heap)
         };
@@ -1131,10 +1143,15 @@ impl World {
             for (i, id) in type_ids.iter().enumerate() {
                 match archetype.column_index(*id) {
                     Some(col) => cols[i] = col,
-                    None => { matched = false; break; }
+                    None => {
+                        matched = false;
+                        break;
+                    }
                 }
             }
-            if !matched { continue; }
+            if !matched {
+                continue;
+            }
             let total = archetype.allocated_values_sync();
             let entities = archetype.entities_slice();
             // Precompute strides per column
@@ -1146,7 +1163,10 @@ impl World {
                 }
                 &strides_inline[..n]
             } else {
-                strides_heap = cols.iter().map(|&col| unsafe { archetype.get_data_storage(col) }.stride()).collect::<Vec<_>>();
+                strides_heap = cols
+                    .iter()
+                    .map(|&col| unsafe { archetype.get_data_storage(col) }.stride())
+                    .collect::<Vec<_>>();
                 &strides_heap
             };
             // Iterate chunk-linearly to avoid div/mod per entity
@@ -1159,9 +1179,8 @@ impl World {
                 for (i, &col) in cols.iter().enumerate() {
                     let data = unsafe { archetype.get_data_storage(col) };
                     let chunk_base = unsafe { *data.chunks().get_unchecked(chunk_idx) };
-                    let base = unsafe {
-                        chunk_base.add(data.data_start() + value_in_chunk * strides[i])
-                    };
+                    let base =
+                        unsafe { chunk_base.add(data.data_start() + value_in_chunk * strides[i]) };
                     ptrs[i] = unsafe {
                         crate::gc::GCPtr::from_base_with_offset(
                             data.value_start(),
@@ -1181,7 +1200,7 @@ impl World {
                         ptrs[i] = crate::gc::GCPtr {
                             value: unsafe {
                                 core::ptr::NonNull::new_unchecked(
-                                    ptrs[i].value.as_ptr().add(strides[i])
+                                    ptrs[i].value.as_ptr().add(strides[i]),
                                 )
                             },
                         };
@@ -1199,14 +1218,21 @@ impl World {
         cb: &mut dyn FnMut(&[crate::gc::GCPtr]),
     ) {
         let n = type_ids.len();
-        let mut ptrs_inline = [crate::gc::GCPtr { value: core::ptr::NonNull::dangling() }; 8];
+        let mut ptrs_inline = [crate::gc::GCPtr {
+            value: core::ptr::NonNull::dangling(),
+        }; 8];
         let mut cols_inline = [0usize; 8];
         let mut ptrs_heap;
         let mut cols_heap;
         let (ptrs, cols): (&mut [crate::gc::GCPtr], &mut [usize]) = if n <= 8 {
             (&mut ptrs_inline[..n], &mut cols_inline[..n])
         } else {
-            ptrs_heap = vec![crate::gc::GCPtr { value: core::ptr::NonNull::dangling() }; n];
+            ptrs_heap = vec![
+                crate::gc::GCPtr {
+                    value: core::ptr::NonNull::dangling()
+                };
+                n
+            ];
             cols_heap = vec![0usize; n];
             (&mut ptrs_heap, &mut cols_heap)
         };
@@ -1215,10 +1241,15 @@ impl World {
             for (i, id) in type_ids.iter().enumerate() {
                 match archetype.column_index(*id) {
                     Some(col) => cols[i] = col,
-                    None => { matched = false; break; }
+                    None => {
+                        matched = false;
+                        break;
+                    }
                 }
             }
-            if !matched { continue; }
+            if !matched {
+                continue;
+            }
             let total = archetype.allocated_values_sync();
             let entities = archetype.entities_slice();
             let mut strides_inline = [0usize; 8];
@@ -1229,7 +1260,10 @@ impl World {
                 }
                 &strides_inline[..n]
             } else {
-                strides_heap = cols.iter().map(|&col| unsafe { archetype.get_data_storage(col) }.stride()).collect::<Vec<_>>();
+                strides_heap = cols
+                    .iter()
+                    .map(|&col| unsafe { archetype.get_data_storage(col) }.stride())
+                    .collect::<Vec<_>>();
                 &strides_heap
             };
             let epc = unsafe { archetype.get_data_storage(cols[0]) }.entities_per_chunk();
@@ -1240,9 +1274,8 @@ impl World {
                 for (i, &col) in cols.iter().enumerate() {
                     let data = unsafe { archetype.get_data_storage(col) };
                     let chunk_base = unsafe { *data.chunks().get_unchecked(chunk_idx) };
-                    let base = unsafe {
-                        chunk_base.add(data.data_start() + value_in_chunk * strides[i])
-                    };
+                    let base =
+                        unsafe { chunk_base.add(data.data_start() + value_in_chunk * strides[i]) };
                     ptrs[i] = unsafe {
                         crate::gc::GCPtr::from_base_with_offset(
                             data.value_start(),
@@ -1260,7 +1293,7 @@ impl World {
                         ptrs[i] = crate::gc::GCPtr {
                             value: unsafe {
                                 core::ptr::NonNull::new_unchecked(
-                                    ptrs[i].value.as_ptr().add(strides[i])
+                                    ptrs[i].value.as_ptr().add(strides[i]),
                                 )
                             },
                         };
@@ -1462,19 +1495,31 @@ macro_rules! impl_component {
 
 // Primitives and common std types
 impl_component!(
-    i8, i16, i32, i64, i128, isize,
-    u8, u16, u32, u64, u128, usize,
-    f32, f64,
-    bool, char,
+    i8,
+    i16,
+    i32,
+    i64,
+    i128,
+    isize,
+    u8,
+    u16,
+    u32,
+    u64,
+    u128,
+    usize,
+    f32,
+    f64,
+    bool,
+    char,
     (),
 );
 impl_component!(alloc::string::String);
 impl_component!(alloc::vec::Vec<u8>);
 
 impl Component for alloc::borrow::Cow<'static, str> {
-    const STABLE_TYPE_ID: crate::StableTypeId = crate::StableTypeId(
-        crate::StableTypeId::fnv1a(b"alloc::borrow::Cow<'static, str>"),
-    );
+    const STABLE_TYPE_ID: crate::StableTypeId = crate::StableTypeId(crate::StableTypeId::fnv1a(
+        b"alloc::borrow::Cow<'static, str>",
+    ));
     const TYPE_NAME: &'static str = "alloc::borrow::Cow<'static, str>";
 }
 
@@ -1493,8 +1538,8 @@ macro_rules! impl_component_array {
     };
 }
 impl_component_array!(
-    0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16,
-    24, 32, 48, 64, 128, 256, 512, 1024, 2048, 4096,
+    0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 24, 32, 48, 64, 128, 256, 512, 1024,
+    2048, 4096,
 );
 
 /// Iterator over all of a world's entities
@@ -1709,7 +1754,11 @@ impl ArchetypeSet {
             .unwrap_or_else(|| self.insert_nonsync(components.into(), info()))
     }
 
-    fn insert(&mut self, components: Box<[crate::StableTypeId]>, info: Vec<TypeInfo>) -> sharedvec::DefaultKey {
+    fn insert(
+        &mut self,
+        components: Box<[crate::StableTypeId]>,
+        info: Vec<TypeInfo>,
+    ) -> sharedvec::DefaultKey {
         let (key, _) = self.archetypes.push(Archetype::new(info));
         let idx = self.index.0.get_mut();
         let old = idx.insert(components, key);

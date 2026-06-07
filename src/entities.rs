@@ -468,6 +468,39 @@ impl Entities {
         Ok(loc)
     }
 
+    /// Destroy an entity in a nonsync context, allowing its ID to be reused.
+    ///
+    /// Must not be called while reserved entities are awaiting `flush()`.
+    pub unsafe fn retire_nonsync(&self, entity: Entity) -> Result<Location, NoSuchEntity> {
+        self.verify_flushed_nonsync();
+
+        let id = entity.id as usize;
+        if id >= self.meta.len_nonsync() {
+            return Err(NoSuchEntity);
+        }
+
+        let mut meta = *self.meta.get_unchecked(id);
+        if meta.generation != entity.generation || meta.location.index == u32::MAX {
+            return Err(NoSuchEntity);
+        }
+
+        meta.generation = NonZeroU32::new(u32::from(meta.generation).wrapping_add(1))
+            .unwrap_or_else(|| NonZeroU32::new(1).unwrap());
+
+        let loc = meta.location;
+        meta.location = EntityMeta::EMPTY.location;
+        self.meta.set_nonsync(id, meta);
+
+        self.pending.push_nonsync(entity.id);
+        let new_free_cursor = self.pending.len_nonsync() as isize;
+        self.free_cursor.write_nonsync(new_free_cursor);
+
+        let len = self.len.read_nonsync();
+        self.len.write_nonsync(len - 1);
+
+        Ok(loc)
+    }
+
     /// Ensure at least `n` allocations can succeed without reallocating
     pub fn reserve(&mut self, additional: u32) {
         self.verify_flushed();

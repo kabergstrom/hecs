@@ -378,10 +378,7 @@ impl<'a> EntityRef<'a> {
 
     /// Borrow the component of type `T`, if it exists
     pub fn get<T: Component>(&self) -> Result<CRef<T>, MissingComponent> {
-        let gc_ptr = unsafe {
-            self.archetype
-                .get_dynamic(&TypeInfo::of::<T>(), self.index)
-        };
+        let gc_ptr = unsafe { self.archetype.get_dynamic(&TypeInfo::of::<T>(), self.index) };
         gc_ptr
             .map(|ptr| CRef {
                 ptr,
@@ -400,7 +397,25 @@ impl<'a> EntityRef<'a> {
 
 #[cfg(test)]
 mod tests {
-    use crate::{World, GcWorld, QueryOneError};
+    use core::sync::atomic::{AtomicUsize, Ordering};
+    use std::panic::{catch_unwind, AssertUnwindSafe};
+
+    use crate::{Component, GcWorld, QueryOneError, StableTypeId, World};
+
+    struct DropCounter(&'static AtomicUsize);
+
+    impl Drop for DropCounter {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    struct DropPair(DropCounter, DropCounter);
+
+    impl Component for DropPair {
+        const STABLE_TYPE_ID: StableTypeId = StableTypeId(0x4b6f_3f8c_b167_d11a);
+        const TYPE_NAME: &'static str = "hecs::gc::gc_world::tests::DropPair";
+    }
 
     #[test]
     fn len_and_is_empty() {
@@ -431,6 +446,39 @@ mod tests {
             let val = entity_ref.get::<bool>().unwrap();
             assert_eq!(*val.read(), true);
             assert!(entity_ref.get::<f32>().is_err());
+        }
+        crate::world::tests::cleanup(world);
+    }
+
+    #[test]
+    fn insert_and_remove_zero_sized_component() {
+        let mut world = World::new();
+        {
+            let gc = GcWorld::new_scope(&mut world);
+            let e = gc.spawn(());
+
+            gc.insert_one(e, ()).unwrap();
+            assert!(gc.get::<()>(e).unwrap().try_read().is_some());
+
+            gc.remove_one::<()>(e).unwrap();
+            assert!(gc.get::<()>(e).is_err());
+        }
+        crate::world::tests::cleanup(world);
+    }
+
+    #[test]
+    fn remove_one_updates_removed_entity_location() {
+        let mut world = World::new();
+        {
+            let gc = GcWorld::new_scope(&mut world);
+            let first = gc.spawn((10i32,));
+            let second = gc.spawn((20i32, true));
+
+            assert!(gc.remove_one::<bool>(second).unwrap());
+
+            assert_eq!(*gc.get::<i32>(first).unwrap().read(), 10);
+            assert_eq!(*gc.get::<i32>(second).unwrap().read(), 20);
+            assert!(gc.get::<bool>(second).is_err());
         }
         crate::world::tests::cleanup(world);
     }
@@ -497,7 +545,212 @@ mod tests {
             gc.despawn(e).unwrap();
             assert!(!gc.contains(e));
             assert!(gc.entity(e).is_err());
+            assert!(gc.get::<i32>(e).is_err());
         }
+        crate::world::tests::cleanup(world);
+    }
+
+    #[test]
+    fn len_updates_after_nonsync_despawn() {
+        let mut world = World::new();
+        {
+            let gc = GcWorld::new_scope(&mut world);
+            let e = gc.spawn((42i32,));
+            assert_eq!(gc.len(), 1);
+            gc.despawn(e).unwrap();
+            assert_eq!(gc.len(), 0);
+            assert!(gc.is_empty());
+        }
+        crate::world::tests::cleanup(world);
+    }
+
+    #[test]
+    fn nonsync_despawn_reuses_entity_id_immediately_without_reviving_stale_cref() {
+        let mut world = World::new();
+        {
+            let gc = GcWorld::new_scope(&mut world);
+            let e = gc.spawn((42i32, true));
+            let stale = gc.get::<i32>(e).unwrap();
+            gc.despawn(e).unwrap();
+            let next = gc.spawn((7i32, false));
+
+            assert_eq!(next.id(), e.id());
+            assert_ne!(next, e);
+            assert_eq!(gc.len(), 1);
+            assert!(gc.get::<i32>(e).is_err());
+            assert!(stale.try_read().is_none());
+            assert!(stale.sibling::<bool>().is_none());
+            assert_eq!(*gc.get::<i32>(next).unwrap().read(), 7);
+        }
+        crate::world::tests::cleanup(world);
+    }
+
+    #[test]
+    fn nonsync_despawn_reuses_entity_id_under_churn() {
+        let mut world = World::new();
+        {
+            let gc = GcWorld::new_scope(&mut world);
+            let mut previous = gc.spawn((0i32,));
+            let reused_id = previous.id();
+
+            for generation in 1..16 {
+                gc.despawn(previous).unwrap();
+                let next = gc.spawn((generation,));
+
+                assert_eq!(next.id(), reused_id);
+                assert_ne!(next, previous);
+                assert!(gc.get::<i32>(previous).is_err());
+                assert_eq!(*gc.get::<i32>(next).unwrap().read(), generation);
+
+                previous = next;
+            }
+        }
+        crate::world::tests::cleanup(world);
+    }
+
+    #[test]
+    fn stale_cref_after_despawn_cannot_get_sibling() {
+        let mut world = World::new();
+        {
+            let gc = GcWorld::new_scope(&mut world);
+            let e = gc.spawn((42i32, true));
+            let stale = gc.get::<i32>(e).unwrap();
+
+            gc.despawn(e).unwrap();
+
+            assert!(stale.sibling::<bool>().is_none());
+            assert!(stale.sibling::<i32>().is_none());
+        }
+        crate::world::tests::cleanup(world);
+    }
+
+    #[test]
+    fn stale_cref_after_remove_cannot_get_sibling() {
+        let mut world = World::new();
+        {
+            let gc = GcWorld::new_scope(&mut world);
+            let e = gc.spawn((42i32, true));
+            let stale = gc.get::<bool>(e).unwrap();
+
+            assert!(gc.remove_one::<bool>(e).unwrap());
+
+            assert!(stale.try_read().is_none());
+            assert!(stale.sibling::<i32>().is_none());
+            assert!(stale.sibling::<bool>().is_none());
+            assert_eq!(*gc.get::<i32>(e).unwrap().read(), 42);
+        }
+        crate::world::tests::cleanup(world);
+    }
+
+    #[test]
+    fn stale_cref_after_despawn_cannot_report_entity() {
+        let mut world = World::new();
+        {
+            let gc = GcWorld::new_scope(&mut world);
+            let e = gc.spawn((42i32,));
+            let stale = gc.get::<i32>(e).unwrap();
+
+            gc.despawn(e).unwrap();
+
+            let result = catch_unwind(AssertUnwindSafe(|| stale.entity()));
+            assert!(result.is_err());
+        }
+        crate::world::tests::cleanup(world);
+    }
+
+    #[test]
+    fn stale_cref_after_remove_cannot_report_entity() {
+        let mut world = World::new();
+        {
+            let gc = GcWorld::new_scope(&mut world);
+            let e = gc.spawn((42i32, true));
+            let stale = gc.get::<bool>(e).unwrap();
+
+            assert!(gc.remove_one::<bool>(e).unwrap());
+
+            let result = catch_unwind(AssertUnwindSafe(|| stale.entity()));
+            assert!(result.is_err());
+            assert_eq!(*gc.get::<i32>(e).unwrap().read(), 42);
+        }
+        crate::world::tests::cleanup(world);
+    }
+
+    #[test]
+    fn mapped_read_defers_pending_dead_drop_until_sweep() {
+        static DROPS: AtomicUsize = AtomicUsize::new(0);
+        DROPS.store(0, Ordering::SeqCst);
+
+        let mut world = World::new();
+        {
+            let gc = GcWorld::new_scope(&mut world);
+            let e = gc.spawn((DropPair(DropCounter(&DROPS), DropCounter(&DROPS)),));
+            let cref = gc.get::<DropPair>(e).unwrap();
+            let field = crate::gc::borrow::Ref::map(cref.read(), |pair| &pair.0);
+
+            gc.despawn(e).unwrap();
+            assert_eq!(DROPS.load(Ordering::SeqCst), 0);
+
+            drop(field);
+            assert_eq!(DROPS.load(Ordering::SeqCst), 0);
+        }
+        unsafe { crate::gc::sweep(&world) };
+        assert_eq!(DROPS.load(Ordering::SeqCst), 2);
+        crate::world::tests::cleanup(world);
+    }
+
+    #[test]
+    fn cloned_read_borrows_survive_pending_dead_until_sweep() {
+        static DROPS: AtomicUsize = AtomicUsize::new(0);
+        DROPS.store(0, Ordering::SeqCst);
+
+        let mut world = World::new();
+        {
+            let gc = GcWorld::new_scope(&mut world);
+            let e = gc.spawn((DropPair(DropCounter(&DROPS), DropCounter(&DROPS)),));
+            let cref = gc.get::<DropPair>(e).unwrap();
+            let first = cref.read();
+            let second = crate::gc::borrow::Ref::clone(&first);
+
+            gc.despawn(e).unwrap();
+            assert_eq!(DROPS.load(Ordering::SeqCst), 0);
+
+            drop(first);
+            assert_eq!(DROPS.load(Ordering::SeqCst), 0);
+
+            drop(second);
+            assert_eq!(DROPS.load(Ordering::SeqCst), 0);
+        }
+
+        unsafe { crate::gc::sweep(&world) };
+        assert_eq!(DROPS.load(Ordering::SeqCst), 2);
+        crate::world::tests::cleanup(world);
+    }
+
+    #[test]
+    fn split_write_defers_pending_dead_drop_until_sweep() {
+        static DROPS: AtomicUsize = AtomicUsize::new(0);
+        DROPS.store(0, Ordering::SeqCst);
+
+        let mut world = World::new();
+        {
+            let gc = GcWorld::new_scope(&mut world);
+            let e = gc.spawn((DropPair(DropCounter(&DROPS), DropCounter(&DROPS)),));
+            let cref = gc.get::<DropPair>(e).unwrap();
+            let (left, right) = crate::gc::borrow::RefMut::map_split(cref.write(), |pair| {
+                (&mut pair.0, &mut pair.1)
+            });
+
+            gc.despawn(e).unwrap();
+            assert_eq!(DROPS.load(Ordering::SeqCst), 0);
+
+            drop(left);
+            assert_eq!(DROPS.load(Ordering::SeqCst), 0);
+
+            drop(right);
+            assert_eq!(DROPS.load(Ordering::SeqCst), 0);
+        }
+        unsafe { crate::gc::sweep(&world) };
+        assert_eq!(DROPS.load(Ordering::SeqCst), 2);
         crate::world::tests::cleanup(world);
     }
 

@@ -17,12 +17,12 @@ use core::{
 pub use gc_world::{GcWorld, GcWorldScope, ReadWorld};
 pub use query::*;
 
+use self::borrow::{BorrowFlag, BorrowRef, BorrowRefMut, Ref, RefMut};
 use crate::{
     archetype::{Archetype, StorageHeader, DATA_CHUNK_SIZE_BYTES},
     Component, Entity, StableTypeId, TypeInfo, World,
 };
 use alloc::vec::Vec;
-use self::borrow::{BorrowFlag, BorrowRef, BorrowRefMut, Ref, RefMut};
 
 #[derive(Debug, PartialEq, Eq, Clone, Copy, Hash)]
 #[repr(transparent)]
@@ -149,13 +149,17 @@ impl GCPtr {
         self.header_ptr().as_mut().referenced = true;
     }
     pub unsafe fn drop_value_and_tombstone(&mut self, ty: &TypeInfo) {
-        match self.header_ptr().as_ref().state {
-            State::Alive { ref borrow, .. } => {
+        let header = self.header_ptr().as_mut();
+        match &mut header.state {
+            State::Alive {
+                borrow,
+                pending_dead,
+            } => {
                 if borrow.get() == 0 {
                     ty.drop_value(self.value_ptr().as_ptr());
-                    self.header_ptr().as_mut().set_tombstone();
+                    header.set_tombstone();
                 } else {
-                    self.header_ptr().as_mut().state = State::PendingDead;
+                    *pending_dead = true;
                 }
             }
             ref state => {
@@ -179,11 +183,13 @@ impl GCPtr {
         assert!(
             src_header.state
                 == State::Alive {
-                    borrow: Cell::new(0)
+                    borrow: Cell::new(0),
+                    pending_dead: false,
                 }
         );
         dst_header.state = State::Alive {
             borrow: Cell::new(0),
+            pending_dead: false,
         };
         src_header.state = State::Moved { new_ptr: *self };
         core::ptr::copy_nonoverlapping(
@@ -206,7 +212,7 @@ impl GCPtr {
         match header.state {
             State::Dead => !header.referenced,
             State::Moved { .. } => !header.referenced,
-            State::Free { .. } | State::Alive { .. } | State::PendingDead => false,
+            State::Free { .. } | State::Alive { .. } => false,
         }
     }
 }
@@ -219,9 +225,12 @@ pub enum State {
     /// Slot has been moved elsewhere.
     Moved { new_ptr: GCPtr },
     /// Slot contains a valid value
-    Alive { borrow: Cell<BorrowFlag> },
-    /// Slot contains a valid value, but borrows exist so the value will be dropped when all active borrows expire
-    PendingDead,
+    Alive {
+        borrow: Cell<BorrowFlag>,
+        /// Borrows exist, and the value should be dropped when the last active
+        /// borrow expires.
+        pending_dead: bool,
+    },
     /// Slot does not contain a valid value, but references may exist to it so it cannot be reused.
     Dead,
 }
@@ -243,6 +252,7 @@ impl GCHeader {
         Self {
             state: State::Alive {
                 borrow: Cell::new(0),
+                pending_dead: false,
             },
             referenced: false,
         }
@@ -334,6 +344,21 @@ impl<T: core::fmt::Debug + Component> core::fmt::Debug for CRef<T> {
 }
 
 impl<T: Component> CRef<T> {
+    fn live_ptr(&self) -> Option<GCPtr> {
+        let ptr = self.ptr.resolve_moved();
+        let header = unsafe { ptr.header_ptr().as_ref() };
+        if !matches!(
+            header.state,
+            State::Alive {
+                pending_dead: false,
+                ..
+            }
+        ) {
+            return None;
+        }
+        Some(ptr)
+    }
+
     pub fn ptr_eq(&self, other: &Self) -> bool {
         let a = self.ptr.resolve_moved();
         let b = other.ptr.resolve_moved();
@@ -342,14 +367,16 @@ impl<T: Component> CRef<T> {
 
     /// Returns the [`Entity`] this component belongs to.
     pub fn entity(&self) -> Entity {
-        let ptr = self.ptr.resolve_moved();
+        let ptr = self
+            .live_ptr()
+            .expect("CRef::entity called on a deleted component");
         unsafe { ptr.entity() }
     }
 
     /// Returns a `CRef<U>` to a sibling component on the same entity, or
     /// `None` if the archetype does not contain `U`.
     pub fn sibling<U: Component>(&self) -> Option<CRef<U>> {
-        let ptr = self.ptr.resolve_moved();
+        let ptr = self.live_ptr()?;
         let sibling_ptr = unsafe { ptr.sibling::<U>()? };
         Some(CRef {
             ptr: sibling_ptr,
@@ -364,14 +391,15 @@ impl<T: Component> CRef<T> {
         }
         let ptr = self.ptr.resolve_moved();
         let header = unsafe { ptr.header_ptr().as_ref() };
-        if let State::Alive { borrow } = &header.state {
+        if let State::Alive {
+            borrow,
+            pending_dead: false,
+        } = &header.state
+        {
             let borrow = BorrowRef::new(borrow).expect("already mutably borrowed");
             Ref {
-                borrow,
-                state: unsafe {
-                    NonNull::new_unchecked(core::ptr::addr_of!(header.state).cast_mut())
-                },
                 value: ptr.value_ptr().cast(),
+                borrow,
             }
         } else {
             panic!("Borrowing a deleted component")
@@ -386,14 +414,15 @@ impl<T: Component> CRef<T> {
         }
         let ptr = self.ptr.resolve_moved();
         let header = unsafe { ptr.header_ptr().as_ref() };
-        if let State::Alive { borrow } = &header.state {
+        if let State::Alive {
+            borrow,
+            pending_dead: false,
+        } = &header.state
+        {
             let borrow = BorrowRef::new(borrow)?;
             Some(Ref {
-                borrow,
-                state: unsafe {
-                    NonNull::new_unchecked(core::ptr::addr_of!(header.state).cast_mut())
-                },
                 value: ptr.value_ptr().cast(),
+                borrow,
             })
         } else {
             None
@@ -408,14 +437,15 @@ impl<T: Component> CRef<T> {
         }
         let ptr = self.ptr.resolve_moved();
         let header = unsafe { ptr.header_ptr().as_ref() };
-        if let State::Alive { borrow } = &header.state {
+        if let State::Alive {
+            borrow,
+            pending_dead: false,
+        } = &header.state
+        {
             let borrow = BorrowRefMut::new(borrow).expect("already borrowed");
             RefMut {
-                borrow,
-                state: unsafe {
-                    NonNull::new_unchecked(core::ptr::addr_of!(header.state).cast_mut())
-                },
                 value: ptr.value_ptr().cast(),
+                borrow,
                 marker: Default::default(),
             }
         } else {
@@ -430,14 +460,15 @@ impl<T: Component> CRef<T> {
         }
         let ptr = self.ptr.resolve_moved();
         let header = unsafe { ptr.header_ptr().as_ref() };
-        if let State::Alive { borrow } = &header.state {
+        if let State::Alive {
+            borrow,
+            pending_dead: false,
+        } = &header.state
+        {
             let borrow = BorrowRefMut::new(borrow)?;
             Some(RefMut {
-                borrow,
-                state: unsafe {
-                    NonNull::new_unchecked(core::ptr::addr_of!(header.state).cast_mut())
-                },
                 value: ptr.value_ptr().cast(),
+                borrow,
                 marker: Default::default(),
             })
         } else {
@@ -453,7 +484,7 @@ impl<T: Component> CRef<T> {
     /// - an atomic load of the per-slot mode flag,
     /// - a load + branch + **store** on the per-component borrow counter (cell increment),
     /// - constructs a `Ref<'_, T>` whose `Drop` does another load + branch + store
-    ///   (cell decrement) and a `PendingDead` state check.
+    ///   (cell decrement) and a pending-dead state check.
     ///
     /// `read_bypass` does, on every call:
     /// - a load + branch on the borrow counter (to reject if a `RefMut` is held),
@@ -485,7 +516,11 @@ impl<T: Component> CRef<T> {
         );
         let ptr = self.ptr.resolve_moved();
         let header = unsafe { ptr.header_ptr().as_ref() };
-        let State::Alive { borrow } = &header.state else {
+        let State::Alive {
+            borrow,
+            pending_dead: false,
+        } = &header.state
+        else {
             panic!("Borrowing a deleted component")
         };
         assert!(
@@ -514,8 +549,8 @@ impl<T: Component> CRef<T> {
     ///    since the `CRef` was captured. This is automatic if the `CRef` was
     ///    obtained from a query *inside* this `ReadWorld` scope, since the
     ///    scope blocks archetype changes.
-    /// 3. The component has not been despawned (still in [`State::Alive`] or
-    ///    [`State::PendingDead`] with valid bytes).
+    /// 3. The component has not been despawned and is still in [`State::Alive`]
+    ///    with `pending_dead == false`.
     /// 4. No `RefMut<'_, T>` for this component is held anywhere, including
     ///    `RefMut`s acquired before the `ReadWorld` scope began and not yet
     ///    dropped.
@@ -528,7 +563,6 @@ impl<T: Component> CRef<T> {
         unsafe { self.ptr.value_ptr().cast::<T>().as_ref() }
     }
 }
-
 
 /// Sweep tombstones from the world, freeing slots where all components are
 /// Dead/Moved and not marked as referenced. Resets all `referenced` flags.
@@ -550,28 +584,35 @@ pub unsafe fn sweep(world: &World) -> u32 {
     for (_, archetype) in world.archetypes() {
         let count = archetype.allocated_values_nonsync();
         archetype_iter_set.clear();
-        for (idx, _) in archetype.types().iter().enumerate() {
+        for (idx, ty) in archetype.types().iter().enumerate() {
             let storage = archetype.get_data_storage(idx);
-            archetype_iter_set.push(
-                storage
-                    .iter_gc_ptr(count)
-                    .into_iter(),
-            );
+            archetype_iter_set.push((ty, storage.iter_gc_ptr(count).into_iter()));
         }
         for slot in 0..count {
             let mut can_free = true;
-            for iter in &mut archetype_iter_set {
+            for (ty, iter) in &mut archetype_iter_set {
                 let gc_ptr = iter.next().unwrap();
                 let header = &mut *gc_ptr.header_ptr().as_ptr();
-                if can_free {
+                let freeable = match &mut header.state {
+                    State::Alive {
+                        borrow,
+                        pending_dead: true,
+                    } => {
+                        if borrow.get() == 0 {
+                            ty.drop_value(gc_ptr.value_ptr().as_ptr());
+                            header.set_tombstone();
+                            !header.referenced
+                        } else {
+                            false
+                        }
+                    }
                     // Inline can_free logic — header already dereferenced
-                    can_free = match header.state {
-                        State::Dead | State::Moved { .. } => !header.referenced,
-                        _ => false,
-                    };
-                }
+                    State::Dead | State::Moved { .. } => !header.referenced,
+                    _ => false,
+                };
                 // Reset referenced flag in the same pass
                 header.referenced = false;
+                can_free &= freeable;
             }
             if can_free {
                 archetype.free_slot(slot);

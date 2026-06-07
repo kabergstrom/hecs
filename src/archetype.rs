@@ -126,7 +126,8 @@ impl Archetype {
                         debug_assert!(
                             removed.header_ptr().as_ref().state
                                 == crate::gc::State::Alive {
-                                    borrow: core::cell::Cell::new(0)
+                                    borrow: core::cell::Cell::new(0),
+                                    pending_dead: false,
                                 }
                         );
                         removed.drop_value_and_tombstone(ty);
@@ -361,24 +362,23 @@ impl Archetype {
         // Double capacity or increase it by `min_increment`, whichever is larger.
         let additional = self.capacity().max(min_increment) as usize;
         let new_cap = self.entities.len() + additional;
-        self.entities.extend_with_sync(additional, EntityCell::free());
+        self.entities
+            .extend_with_sync(additional, EntityCell::free());
 
-        for (info, data) in self.types.iter().zip(&*self.data) {
-            if info.value_layout.size() != 0 {
-                let entities_per_chunk = data.entities_per_chunk;
-                let num_chunks_required = new_cap / entities_per_chunk + 1;
-                let new_chunks = num_chunks_required.saturating_sub(data.storage.len());
-                for _ in 0..new_chunks {
-                    unsafe {
-                        let mem = alloc_zeroed(data.storage_layout);
-                        assert!(!mem.is_null(), "allocation failed");
-                        mem.cast::<StorageHeader>().write(data.new_storage_header(
-                            archetype_ptr,
-                            world_slot,
-                            data.storage.len(),
-                        ));
-                        data.storage.push_sync(mem);
-                    }
+        for data in &*self.data {
+            let entities_per_chunk = data.entities_per_chunk;
+            let num_chunks_required = new_cap / entities_per_chunk + 1;
+            let new_chunks = num_chunks_required.saturating_sub(data.storage.len());
+            for _ in 0..new_chunks {
+                unsafe {
+                    let mem = alloc_zeroed(data.storage_layout);
+                    assert!(!mem.is_null(), "allocation failed");
+                    mem.cast::<StorageHeader>().write(data.new_storage_header(
+                        archetype_ptr,
+                        world_slot,
+                        data.storage.len(),
+                    ));
+                    data.storage.push_sync(mem);
                 }
             }
         }
@@ -393,23 +393,20 @@ impl Archetype {
         self.entities
             .extend_with_nonsync(additional, EntityCell::free());
 
-        for (info, data) in self.types.iter().zip(&*self.data) {
-            if info.value_layout.size() != 0 {
-                let entities_per_chunk =
-                    (DATA_CHUNK_SIZE_BYTES - data.data_start) / info.gc_layout.size();
-                let num_chunks_required = new_cap / entities_per_chunk + 1;
-                let new_chunks = num_chunks_required.saturating_sub(data.storage.len());
-                for _ in 0..new_chunks {
-                    unsafe {
-                        let mem = alloc_zeroed(data.storage_layout);
-                        assert!(!mem.is_null(), "allocation failed");
-                        mem.cast::<StorageHeader>().write(data.new_storage_header(
-                            archetype_ptr,
-                            world_slot,
-                            data.storage.len(),
-                        ));
-                        data.storage.push_nonsync(mem);
-                    }
+        for data in &*self.data {
+            let entities_per_chunk = data.entities_per_chunk;
+            let num_chunks_required = new_cap / entities_per_chunk + 1;
+            let new_chunks = num_chunks_required.saturating_sub(data.storage.len());
+            for _ in 0..new_chunks {
+                unsafe {
+                    let mem = alloc_zeroed(data.storage_layout);
+                    assert!(!mem.is_null(), "allocation failed");
+                    mem.cast::<StorageHeader>().write(data.new_storage_header(
+                        archetype_ptr,
+                        world_slot,
+                        data.storage.len(),
+                    ));
+                    data.storage.push_nonsync(mem);
                 }
             }
         }
@@ -423,23 +420,20 @@ impl Archetype {
         let new_cap = self.entities.len() + additional;
         self.entities.extend_with(additional, EntityCell::free());
 
-        for (info, data) in self.types.iter().zip(self.data.iter_mut()) {
-            if info.value_layout.size() != 0 {
-                let entities_per_chunk =
-                    (DATA_CHUNK_SIZE_BYTES - data.data_start) / info.gc_layout.size();
-                let num_chunks_required = new_cap / entities_per_chunk + 1;
-                let new_chunks = num_chunks_required.saturating_sub(data.storage.len());
-                for _ in 0..new_chunks {
-                    unsafe {
-                        let mem = alloc_zeroed(data.storage_layout);
-                        assert!(!mem.is_null(), "allocation failed");
-                        mem.cast::<StorageHeader>().write(data.new_storage_header(
-                            archetype_ptr,
-                            world_slot,
-                            data.storage.len(),
-                        ));
-                        data.storage.push(mem);
-                    }
+        for data in self.data.iter_mut() {
+            let entities_per_chunk = data.entities_per_chunk;
+            let num_chunks_required = new_cap / entities_per_chunk + 1;
+            let new_chunks = num_chunks_required.saturating_sub(data.storage.len());
+            for _ in 0..new_chunks {
+                unsafe {
+                    let mem = alloc_zeroed(data.storage_layout);
+                    assert!(!mem.is_null(), "allocation failed");
+                    mem.cast::<StorageHeader>().write(data.new_storage_header(
+                        archetype_ptr,
+                        world_slot,
+                        data.storage.len(),
+                    ));
+                    data.storage.push(mem);
                 }
             }
         }
@@ -589,7 +583,7 @@ impl Drop for Archetype {
                     needs_leak |= !is_free;
                 }
             }
-            if info.value_layout.size() != 0 && !needs_leak {
+            if !needs_leak {
                 for chunk in data.chunks() {
                     assert!(!chunk.is_null());
                     unsafe {
@@ -858,11 +852,7 @@ impl TypeInfo {
     /// some kind of pointer to raw bytes/erased memory holding a component type, coming from a
     /// source unrelated to hecs, and you want to treat it as an insertable component by
     /// implementing the `DynamicBundle` API.
-    pub fn from_parts(
-        id: StableTypeId,
-        layout: Layout,
-        drop: unsafe fn(*mut u8),
-    ) -> Self {
+    pub fn from_parts(id: StableTypeId, layout: Layout, drop: unsafe fn(*mut u8)) -> Self {
         let (gc_layout, data_start) = Layout::new::<GCHeader>().extend(layout).unwrap();
         let gc_layout = gc_layout.pad_to_align();
 
