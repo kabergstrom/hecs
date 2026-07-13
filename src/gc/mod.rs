@@ -264,6 +264,17 @@ impl GCHeader {
     pub fn is_alive(&self) -> bool {
         matches!(self.state, State::Alive { .. })
     }
+    /// Returns true if this slot is Alive and not pending-dead — the same
+    /// liveness predicate `CRef` uses before dereferencing.
+    pub fn is_live(&self) -> bool {
+        matches!(
+            self.state,
+            State::Alive {
+                pending_dead: false,
+                ..
+            }
+        )
+    }
 }
 impl<T: Component + core::fmt::Debug> core::fmt::Debug for GC<T> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
