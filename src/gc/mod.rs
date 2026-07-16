@@ -145,8 +145,19 @@ impl GCPtr {
         f(self.value_ptr().as_ptr(), ty.clone());
         self.header_ptr().as_mut().set_tombstone();
     }
+    /// Mark this slot referenced so tombstone sweep spares it. Propagates
+    /// along the `Moved` forwarding chain: a referenced tombstone is only
+    /// resolvable if every intermediate hop survives the sweep too.
     pub unsafe fn mark_referenced(&mut self) {
-        self.header_ptr().as_mut().referenced = true;
+        let mut ptr = *self;
+        loop {
+            let header = ptr.header_ptr().as_mut();
+            header.referenced = true;
+            match header.state {
+                State::Moved { new_ptr } => ptr = new_ptr,
+                _ => break,
+            }
+        }
     }
     pub unsafe fn drop_value_and_tombstone(&mut self, ty: &TypeInfo) {
         let header = self.header_ptr().as_mut();
@@ -274,6 +285,19 @@ impl GCHeader {
                 ..
             }
         )
+    }
+    /// Diagnostic name of the slot state, for resolve-failure logging.
+    pub fn state_name(&self) -> &'static str {
+        match self.state {
+            State::Free { .. } => "Free",
+            State::Moved { .. } => "Moved",
+            State::Alive {
+                pending_dead: false,
+                ..
+            } => "Alive",
+            State::Alive { .. } => "AlivePendingDead",
+            State::Dead => "Dead",
+        }
     }
 }
 impl<T: Component + core::fmt::Debug> core::fmt::Debug for GC<T> {

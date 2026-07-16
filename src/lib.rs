@@ -42,7 +42,7 @@
     unreachable_code,
     unused_unsafe,
     mismatched_lifetime_syntaxes,
-    unknown_lints,
+    unknown_lints
 )]
 #![no_std]
 #![cfg_attr(docsrs, feature(doc_cfg))]
@@ -101,8 +101,8 @@ pub use query::{
     With, Without,
 };
 pub use query_one::QueryOne;
-pub use take::TakenEntity;
 pub use stable_type_id::StableTypeId;
+pub use take::TakenEntity;
 pub use world::{
     ArchetypesGeneration, Component, ComponentError, Iter, QueryOneError, SpawnBatchIter,
     SpawnColumnBatchIter, World,

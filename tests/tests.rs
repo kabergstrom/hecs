@@ -1005,7 +1005,9 @@ fn sync_world() {
 fn gc_ptr_back_pointer_entity() {
     let mut world = World::new();
     let e = world.spawn((123_i32, "abc".to_string()));
-    let ptr = world.get_gc_ptr_by_id(e, <i32 as Component>::STABLE_TYPE_ID).unwrap();
+    let ptr = world
+        .get_gc_ptr_by_id(e, <i32 as Component>::STABLE_TYPE_ID)
+        .unwrap();
     unsafe {
         assert_eq!(ptr.entity(), e);
         let arch = &*ptr.archetype();
@@ -1021,7 +1023,9 @@ fn gc_ptr_back_pointer_entity() {
 fn gc_ptr_sibling_lookup() {
     let mut world = World::new();
     let e = world.spawn((123_i32, "abc".to_string()));
-    let ptr_i32 = world.get_gc_ptr_by_id(e, <i32 as Component>::STABLE_TYPE_ID).unwrap();
+    let ptr_i32 = world
+        .get_gc_ptr_by_id(e, <i32 as Component>::STABLE_TYPE_ID)
+        .unwrap();
     unsafe {
         // Sibling by type.
         let string_ptr = ptr_i32.sibling::<String>().unwrap();
@@ -1097,6 +1101,34 @@ fn cref_sibling_after_archetype_move() {
 }
 
 #[test]
+fn cref_survives_sweep_after_multi_hop_move() {
+    // Two inserts move the entity through two archetypes, leaving a chain
+    // Moved -> Moved -> Alive behind the original CRef. mark_referenced on
+    // the chain head must propagate to every hop: sweep may only free
+    // unreferenced tombstones, and freeing an intermediate hop would strand
+    // the head's forwarding pointer on a Free slot.
+    let mut world = World::new();
+    let e = world.spawn((123_i32, "abc".to_string()));
+    let cref = world.new_cref::<i32>(e).unwrap();
+    let mut head = world
+        .get_gc_ptr_by_id(e, <i32 as Component>::STABLE_TYPE_ID)
+        .unwrap();
+    world.insert_one(e, true).unwrap();
+    world.insert_one(e, 1.5_f64).unwrap();
+    unsafe {
+        head.mark_referenced();
+        hecs::gc::sweep(&world);
+        assert!(
+            head.resolve_moved().header_ptr().as_ref().is_live(),
+            "forwarding chain broken: head resolves to a non-live slot"
+        );
+    }
+    assert_eq!(cref.entity(), e);
+    assert_eq!(cref.sibling::<String>().unwrap().entity(), e);
+    cleanup(world);
+}
+
+#[test]
 fn gc_ptr_back_pointer_across_chunks() {
     // Spawn enough entities to span multiple chunks so we exercise the
     // chunk_idx + offset arithmetic inside archetype_slot().
@@ -1108,7 +1140,9 @@ fn gc_ptr_back_pointer_across_chunks() {
     // Verify the back-pointer round-trip for the first, middle, and last entities.
     for &idx in &[0usize, 2500, 4999] {
         let e = entities[idx];
-        let ptr = world.get_gc_ptr_by_id(e, <i32 as Component>::STABLE_TYPE_ID).unwrap();
+        let ptr = world
+            .get_gc_ptr_by_id(e, <i32 as Component>::STABLE_TYPE_ID)
+            .unwrap();
         unsafe {
             assert_eq!(ptr.entity(), e, "entity mismatch at idx {}", idx);
             let val_i32 = *ptr.value_ptr().as_ptr().cast::<i32>();
