@@ -110,7 +110,7 @@ pub use world::{
 
 // Unstable implementation details needed by the macros
 #[doc(hidden)]
-pub use archetype::TypeInfo;
+pub use archetype::{DropFn, TypeInfo};
 #[doc(hidden)]
 pub use bundle::DynamicClone;
 #[cfg(feature = "macros")]

@@ -819,7 +819,7 @@ pub struct TypeInfo {
     pub(crate) id: StableTypeId,
     value_layout: Layout,
     gc_layout: Layout,
-    drop: unsafe fn(*mut u8),
+    drop: DropFn,
     data_start: usize,
     #[cfg(debug_assertions)]
     pub(crate) type_name: &'static str,
@@ -842,7 +842,7 @@ impl TypeInfo {
             gc_layout,
             value_layout: type_layout,
             data_start,
-            drop: drop_ptr::<T>,
+            drop: DropFn::Typed(drop_ptr::<T>),
             #[cfg(debug_assertions)]
             type_name: core::any::type_name::<T>(),
         }
@@ -853,6 +853,22 @@ impl TypeInfo {
     /// source unrelated to hecs, and you want to treat it as an insertable component by
     /// implementing the `DynamicBundle` API.
     pub fn from_parts(id: StableTypeId, layout: Layout, drop: unsafe fn(*mut u8)) -> Self {
+        Self::from_parts_with(id, layout, DropFn::Typed(drop))
+    }
+
+    /// Like [`TypeInfo::from_parts`], but the destructor receives the component's
+    /// [`StableTypeId`] and resolves the real drop at call time. For component types whose
+    /// code can be unloaded and reloaded (hot-reloaded modules), where a per-type function
+    /// pointer captured at insert time would dangle.
+    pub fn from_parts_by_id(
+        id: StableTypeId,
+        layout: Layout,
+        drop: unsafe fn(StableTypeId, *mut u8),
+    ) -> Self {
+        Self::from_parts_with(id, layout, DropFn::ById(drop))
+    }
+
+    fn from_parts_with(id: StableTypeId, layout: Layout, drop: DropFn) -> Self {
         let (gc_layout, data_start) = Layout::new::<GCHeader>().extend(layout).unwrap();
         let gc_layout = gc_layout.pad_to_align();
 
@@ -894,14 +910,24 @@ impl TypeInfo {
     /// All of the caveats of [`core::ptr::drop_in_place`] apply, with the additional requirement
     /// that this method is being called on a pointer to an object of the correct component type.
     pub unsafe fn drop_value(&self, data: *mut u8) {
-        (self.drop)(data);
+        match self.drop {
+            DropFn::Typed(f) => f(data),
+            DropFn::ById(f) => f(self.id, data),
+        }
     }
 
-    /// Get the function pointer encoding the destructor for the component type this `TypeInfo`
-    /// represents.
-    pub fn drop_shim(&self) -> unsafe fn(*mut u8) {
+    /// The destructor for the component type this `TypeInfo` represents.
+    pub fn drop_shim(&self) -> DropFn {
         self.drop
     }
+}
+
+/// A component destructor: either a per-type function, or one shared function that dispatches
+/// on the [`StableTypeId`] at call time.
+#[derive(Debug, Clone, Copy)]
+pub enum DropFn {
+    Typed(unsafe fn(*mut u8)),
+    ById(unsafe fn(StableTypeId, *mut u8)),
 }
 
 impl PartialOrd for TypeInfo {
@@ -1018,3 +1044,23 @@ impl Eq for TypeInfo {}
 //         self.column.fmt(f)
 //     }
 // }
+
+#[cfg(test)]
+mod drop_fn_tests {
+    use super::*;
+    use core::sync::atomic::{AtomicU64, Ordering};
+
+    static SEEN: AtomicU64 = AtomicU64::new(0);
+
+    unsafe fn record(id: StableTypeId, _data: *mut u8) {
+        SEEN.store(id.0, Ordering::SeqCst);
+    }
+
+    #[test]
+    fn by_id_drop_receives_type_id() {
+        let ty = TypeInfo::from_parts_by_id(StableTypeId(42), Layout::new::<u32>(), record);
+        let mut value = 7u32;
+        unsafe { ty.drop_value((&mut value as *mut u32).cast()) };
+        assert_eq!(SEEN.load(Ordering::SeqCst), 42);
+    }
+}
