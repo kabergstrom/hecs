@@ -210,6 +210,29 @@ impl GCPtr {
         );
     }
 
+    /// Like `move_from`, but `f(src_value, dst_value)` builds the destination
+    /// value (a layout change) instead of a bitwise copy. `f` consumes the
+    /// source value; it is never dropped.
+    pub(crate) unsafe fn migrate_from(&mut self, src: GCPtr, f: impl FnOnce(*mut u8, *mut u8)) {
+        assert!(src != *self);
+        let dst_header = self.header_ptr().as_mut();
+        assert!(matches!(dst_header.state, State::Free { .. }));
+        let src_header = src.header_ptr().as_mut();
+        assert!(
+            src_header.state
+                == State::Alive {
+                    borrow: Cell::new(0),
+                    pending_dead: false,
+                }
+        );
+        dst_header.state = State::Alive {
+            borrow: Cell::new(0),
+            pending_dead: false,
+        };
+        src_header.state = State::Moved { new_ptr: *self };
+        f(src.value_ptr().as_ptr(), self.value_ptr().as_ptr());
+    }
+
     pub fn resolve_moved(&self) -> Self {
         let mut ptr = *self;
         while let State::Moved { new_ptr } = unsafe { ptr.header_ptr().as_ref() }.state {

@@ -418,6 +418,84 @@ impl World {
         self.entities.clear();
     }
 
+    /// Rewrite component columns into new layouts (a module reload changed the types).
+    ///
+    /// Every archetype holding one of the `changes` ids is replaced by a fresh archetype built
+    /// with the new `TypeInfo`s, which takes over the type-set index entry. Each live entity moves
+    /// over in slot order: unchanged components bitwise, changed ones through
+    /// `migrate(id, old_value, new_value)`, which must initialize the new value and consume the
+    /// old one (no drop runs on it). Old slots become `Moved` tombstones, so outstanding GC
+    /// references resolve to the new values until the sweep frees them. The replaced archetype
+    /// stays allocated, since archetype keys are stable. Cached insert/remove edges are cleared.
+    pub fn migrate_components(
+        &mut self,
+        changes: &[TypeInfo],
+        mut migrate: impl FnMut(crate::StableTypeId, *mut u8, *mut u8),
+    ) {
+        self.flush();
+        let changed = |id: crate::StableTypeId| changes.iter().find(|c| c.id() == id);
+        let affected: Vec<sharedvec::DefaultKey> = self
+            .archetypes
+            .archetypes
+            .iter()
+            .filter(|(_, a)| a.type_ids().iter().any(|&id| changed(id).is_some()))
+            .map(|(key, _)| key)
+            .collect();
+        for old_key in affected {
+            let old = &self.archetypes.archetypes[old_key];
+            let mut types: Vec<TypeInfo> = old
+                .types()
+                .iter()
+                .map(|ty| changed(ty.id()).unwrap_or(ty).clone())
+                .collect();
+            // A changed alignment can reorder the columns.
+            types.sort_unstable();
+            let (new_key, _) = self.archetypes.archetypes.push(Archetype::new(types));
+            // Index keys are ordered by the value types' alignment, which can
+            // differ from the column order; re-point by value.
+            for key in self.archetypes.index.0.get_mut().values_mut() {
+                if *key == old_key {
+                    *key = new_key;
+                }
+            }
+            let old = &self.archetypes.archetypes[old_key];
+            let new = &self.archetypes.archetypes[new_key];
+            // SAFETY: we have &mut self; every live slot of `old` is Alive and unborrowed.
+            unsafe {
+                for index in 0..old.allocated_values_nonsync() {
+                    let entity = old.entity(index);
+                    if entity.id == u32::MAX {
+                        continue;
+                    }
+                    let target = new.allocate_nonsync(entity, self.world_slot);
+                    self.entities.meta.set_nonsync(
+                        entity.id as usize,
+                        EntityMeta {
+                            generation: entity.generation,
+                            location: Location {
+                                archetype: new_key,
+                                index: target,
+                            },
+                        },
+                    );
+                    for (col, ty) in old.types().iter().enumerate() {
+                        let src = old.get_gc_ptr_by_column(col, index);
+                        let mut dst = new.get_dynamic_by_id(ty.id(), target).unwrap();
+                        if changed(ty.id()).is_some() {
+                            dst.migrate_from(src, |s, d| migrate(ty.id(), s, d));
+                        } else {
+                            dst.move_from(ty, src);
+                        }
+                    }
+                    old.set_entity_free_nonsync(index as usize);
+                }
+            }
+        }
+        self.insert_edges.0.get_mut().clear();
+        self.remove_edges.0.get_mut().clear();
+        self.bundle_to_archetype.0.get_mut().clear();
+    }
+
     /// Whether `entity` still exists
     pub fn contains(&self, entity: Entity) -> bool {
         self.entities.contains(entity)
@@ -1897,6 +1975,47 @@ pub(crate) mod tests {
         world.clear();
         unsafe { crate::gc::sweep(&world) };
     }
+
+    #[test]
+    fn migrate_components_rewrites_columns_and_forwards_old_slots() {
+        unsafe fn noop(_: *mut u8) {}
+        let mut world = World::new();
+        let e = world.spawn((7u8, "abc".to_string()));
+        let f = world.spawn((9u8, "d".to_string()));
+        let g = world.spawn(("g".to_string(),));
+        let id = <u8 as Component>::STABLE_TYPE_ID;
+        let value = |world: &World, e: Entity| unsafe {
+            let loc = world.entities.get(e).unwrap();
+            world.archetypes.archetypes[loc.archetype]
+                .get_dynamic_by_id(id, loc.index)
+                .unwrap()
+        };
+        let old_e = value(&world, e);
+        let old_archetype = world.entities.get(e).unwrap().archetype;
+
+        let wide = TypeInfo::from_parts(id, core::alloc::Layout::new::<u64>(), noop);
+        world.migrate_components(&[wide], |ty, src, dst| unsafe {
+            assert_eq!(ty, id);
+            dst.cast::<u64>().write(u64::from(*src) * 10);
+        });
+
+        assert_ne!(world.entities.get(e).unwrap().archetype, old_archetype);
+        let new_e = value(&world, e);
+        assert_eq!(unsafe { *new_e.value_ptr().as_ptr().cast::<u64>() }, 70);
+        assert_eq!(unsafe { *value(&world, f).value_ptr().as_ptr().cast::<u64>() }, 90);
+        assert!(old_e.resolve_moved() == new_e);
+        assert_eq!(*world.get::<&String>(e).unwrap(), "abc");
+        assert_eq!(*world.get::<&String>(f).unwrap(), "d");
+        assert_eq!(*world.get::<&String>(g).unwrap(), "g");
+        assert_eq!(world.query::<&String>().iter().count(), 3);
+        // A later spawn of the same type set lands in the migrated archetype.
+        let loc_e = world.entities.get(e).unwrap().archetype;
+        let h = world.spawn((1u8, "h".to_string()));
+        assert_eq!(world.entities.get(h).unwrap().archetype, loc_e);
+        world.despawn(h).unwrap();
+        cleanup(world);
+    }
+
     #[test]
     fn reuse_empty() {
         let mut world = World::new();
