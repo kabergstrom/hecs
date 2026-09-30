@@ -340,6 +340,16 @@ impl Archetype {
         new_slot
     }
 
+    /// Make room for `additional` more slots (free-listed slots count) with
+    /// at most one growth.
+    pub(crate) unsafe fn reserve_nonsync(&self, additional: u32, world_slot: NonZeroU32) {
+        let needed = additional.saturating_sub(self.num_free.read_nonsync());
+        let spare = self.entities.len_nonsync() as u32 - self.len.read_nonsync();
+        if needed > spare {
+            self.grow_nonsync(needed - spare, world_slot);
+        }
+    }
+
     // pub(crate) unsafe fn set_len(&mut self, len: u32) {
     //     debug_assert!(len <= self.capacity());
     //     self.len.store(len);

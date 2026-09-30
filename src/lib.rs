@@ -104,7 +104,7 @@ pub use query_one::QueryOne;
 pub use stable_type_id::StableTypeId;
 pub use take::TakenEntity;
 pub use world::{
-    ArchetypesGeneration, Component, ComponentError, Iter, QueryOneError, SpawnBatchIter,
+    ArchetypeHandle, ArchetypesGeneration, SpawnColumn, SpawnRows, Component, ComponentError, Iter, QueryOneError, SpawnBatchIter,
     SpawnColumnBatchIter, World,
 };
 

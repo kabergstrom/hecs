@@ -65,10 +65,76 @@ pub struct World {
     remove_edges: NonSyncCell<IndexTypeIdMap<sharedvec::DefaultKey>>,
     id: u64,
     world_slot: NonZeroU32,
+    /// Bumped whenever archetype keys stop naming the archetype their type
+    /// set resolves to (`migrate_components`); stales `ArchetypeHandle`s.
+    archetype_epoch: u32,
 }
 impl Drop for World {
     fn drop(&mut self) {
         unsafe { free_world_slot(self.world_slot) };
+    }
+}
+
+/// An archetype resolved ahead of time for [`World::spawn_into_nonsync`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ArchetypeHandle {
+    world: u64,
+    epoch: u32,
+    key: sharedvec::DefaultKey,
+}
+
+/// Rows just allocated by [`World::spawn_into_nonsync`]. Columns are in the order of the
+/// sorted `TypeInfo`s the archetype was resolved from.
+pub struct SpawnRows<'a> {
+    archetype: &'a Archetype,
+    slots: &'a [u32],
+    entities: &'a [Entity],
+}
+
+impl<'a> SpawnRows<'a> {
+    /// Number of rows (entities) spawned.
+    pub fn len(&self) -> usize {
+        self.slots.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.slots.is_empty()
+    }
+
+    /// The spawned entities, parallel to the rows.
+    pub fn entities(&self) -> &'a [Entity] {
+        self.entities
+    }
+
+    pub fn types(&self) -> &'a [TypeInfo] {
+        self.archetype.types()
+    }
+
+    pub fn column(&self, col: usize) -> SpawnColumn<'a> {
+        assert!(col < self.archetype.types().len());
+        SpawnColumn {
+            data: unsafe { self.archetype.get_data_storage(col) },
+            slots: self.slots,
+        }
+    }
+}
+
+/// One column of [`SpawnRows`].
+#[derive(Clone, Copy)]
+pub struct SpawnColumn<'a> {
+    data: &'a crate::Data,
+    slots: &'a [u32],
+}
+
+impl SpawnColumn<'_> {
+    /// Value pointer of `row`, aligned for the column's type.
+    pub fn value(&self, row: usize) -> *mut u8 {
+        unsafe { self.data.get_value(self.slots[row]).as_ptr() }
+    }
+
+    /// GC pointer of `row`, e.g. for a `CRef` to it.
+    pub fn gc_ptr(&self, row: usize) -> crate::gc::GCPtr {
+        unsafe { self.data.get_gc_ptr(self.slots[row]) }
     }
 }
 
@@ -95,6 +161,7 @@ impl World {
             remove_edges: NonSyncCell(UnsafeCell::new(HashMap::default())),
             id,
             world_slot: alloc_world_slot(),
+            archetype_epoch: 0,
         }
     }
 
@@ -139,6 +206,89 @@ impl World {
         self.spawn_inner_nonsync(entity, components);
 
         entity
+    }
+
+    /// Resolve (creating it if needed) the archetype holding exactly `types`, for
+    /// [`spawn_into_nonsync`](Self::spawn_into_nonsync).
+    ///
+    /// `types` must be sorted by `TypeInfo`'s `Ord` and free of duplicates. The handle stays
+    /// valid until [`migrate_components`](Self::migrate_components) replaces archetypes; check
+    /// [`is_archetype_current`](Self::is_archetype_current) before reusing a cached one.
+    ///
+    /// # Safety
+    /// No concurrent access to this world (as [`spawn_nonsync`](Self::spawn_nonsync)).
+    pub unsafe fn resolve_archetype_nonsync(&self, types: &[TypeInfo]) -> ArchetypeHandle {
+        debug_assert!(
+            types.windows(2).all(|w| w[0] < w[1]),
+            "types must be sorted and unique"
+        );
+        let ids: Vec<crate::StableTypeId> = types.iter().map(|ty| ty.id()).collect();
+        let key = self.archetypes.get_nonsync(ids, || types.to_vec());
+        ArchetypeHandle {
+            world: self.id,
+            epoch: self.archetype_epoch,
+            key,
+        }
+    }
+
+    /// Whether `handle` was resolved in this world and still names the archetype its type set
+    /// resolves to.
+    pub fn is_archetype_current(&self, handle: ArchetypeHandle) -> bool {
+        handle.world == self.id && handle.epoch == self.archetype_epoch
+    }
+
+    /// Spawn `out.len()` entities into a pre-resolved archetype, writing their handles to `out`.
+    ///
+    /// Entities, rows and entity locations are committed before `init` runs and every row's GC
+    /// header is `Alive`, so the entities can already be looked up from inside `init`. `init`
+    /// receives the rows' column pointers and must initialize every component value of every
+    /// row: the memory holds zeroed or stale bytes.
+    ///
+    /// # Safety
+    /// No concurrent access to this world (as [`spawn_nonsync`](Self::spawn_nonsync)). `init`
+    /// must write a valid value of the column's type to every row of every column.
+    pub unsafe fn spawn_into_nonsync(
+        &self,
+        archetype: ArchetypeHandle,
+        out: &mut [Entity],
+        init: impl FnOnce(&SpawnRows<'_>),
+    ) {
+        assert!(self.is_archetype_current(archetype), "stale ArchetypeHandle");
+        self.flush_nonsync();
+        let key = archetype.key;
+        let arch = &self.archetypes.archetypes[key];
+        let count = u32::try_from(out.len()).expect("too many entities");
+        arch.reserve_nonsync(count, self.world_slot);
+        let mut slots = Vec::with_capacity(out.len());
+        for e in out.iter_mut() {
+            let entity = self.entities.alloc_nonsync();
+            let index = arch.allocate_nonsync(entity, self.world_slot);
+            self.entities.meta.set_nonsync(
+                entity.id as usize,
+                EntityMeta {
+                    generation: entity.generation,
+                    location: Location {
+                        archetype: key,
+                        index,
+                    },
+                },
+            );
+            slots.push(index);
+            *e = entity;
+        }
+        for col in 0..arch.types().len() {
+            let data = arch.get_data_storage(col);
+            for &slot in &slots {
+                let header = data.get_gc_ptr(slot).header_ptr().as_ptr();
+                debug_assert!(matches!((*header).state, crate::gc::State::Free { .. }));
+                header.write(crate::gc::GCHeader::new_alive());
+            }
+        }
+        init(&SpawnRows {
+            archetype: arch,
+            slots: &slots,
+            entities: out,
+        });
     }
 
     /// Create an entity with certain components and a specific [`Entity`] handle.
@@ -494,6 +644,7 @@ impl World {
         self.insert_edges.0.get_mut().clear();
         self.remove_edges.0.get_mut().clear();
         self.bundle_to_archetype.0.get_mut().clear();
+        self.archetype_epoch += 1;
     }
 
     /// Whether `entity` still exists
@@ -2013,6 +2164,98 @@ pub(crate) mod tests {
         let h = world.spawn((1u8, "h".to_string()));
         assert_eq!(world.entities.get(h).unwrap().archetype, loc_e);
         world.despawn(h).unwrap();
+        cleanup(world);
+    }
+
+    #[test]
+    fn spawn_into_writes_rows_of_a_resolved_archetype() {
+        use core::sync::atomic::{AtomicUsize, Ordering};
+        static DROPS: AtomicUsize = AtomicUsize::new(0);
+        struct Counted(u32);
+        impl Drop for Counted {
+            fn drop(&mut self) {
+                DROPS.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        impl Component for Counted {
+            const STABLE_TYPE_ID: crate::StableTypeId = crate::StableTypeId(0x5a17_c0de);
+        }
+
+        let mut world = World::new();
+        // Free-listed slots from swept despawns are reused first.
+        let old: Vec<Entity> = (0..3)
+            .map(|i| world.spawn((Counted(i), i.to_string())))
+            .collect();
+        world.despawn(old[0]).unwrap();
+        world.despawn(old[1]).unwrap();
+        unsafe { crate::gc::sweep(&world) };
+        let drops = DROPS.load(Ordering::SeqCst);
+
+        let mut types = vec![TypeInfo::of::<Counted>(), TypeInfo::of::<String>()];
+        types.sort_unstable();
+        let handle = unsafe { world.resolve_archetype_nonsync(&types) };
+        assert_eq!(
+            unsafe { world.resolve_archetype_nonsync(&types) },
+            handle,
+            "the type set resolves to the existing archetype"
+        );
+        let count_col = types.iter().position(|t| t.id() == Counted::STABLE_TYPE_ID).unwrap();
+        let mut out = vec![Entity::DANGLING; 300];
+        unsafe {
+            world.spawn_into_nonsync(handle, &mut out, |rows| {
+                assert_eq!(rows.len(), 300);
+                assert!(rows.entities().iter().all(|&e| world.contains(e)));
+                for (col, ty) in rows.types().iter().enumerate() {
+                    let column = rows.column(col);
+                    for row in 0..rows.len() {
+                        if col == count_col {
+                            column.value(row).cast::<Counted>().write(Counted(row as u32));
+                        } else {
+                            assert_eq!(ty.id(), <String as Component>::STABLE_TYPE_ID);
+                            column.value(row).cast::<String>().write(row.to_string());
+                        }
+                    }
+                }
+            });
+        }
+        assert!(out.iter().any(|e| e.id == old[0].id || e.id == old[1].id));
+        for (i, &e) in out.iter().enumerate() {
+            assert_eq!(world.get::<&Counted>(e).unwrap().0, i as u32);
+            assert_eq!(*world.get::<&String>(e).unwrap(), i.to_string());
+        }
+        assert_eq!(world.query::<(&Counted, &String)>().iter().count(), 301);
+        let loc = |world: &World, e: Entity| world.entities.get(e).unwrap().archetype;
+        // GC pointers into batch-spawned rows map back to their entity.
+        let p = world.get_gc_ptr_by_id(out[7], Counted::STABLE_TYPE_ID).unwrap();
+        assert_eq!(unsafe { world.entity_from_gc_ptr(p) }, Some(out[7]));
+
+        world.despawn(out[5]).unwrap();
+        assert_eq!(DROPS.load(Ordering::SeqCst), drops + 1, "rows drop like spawned ones");
+
+        // Replacing archetypes stales the handle.
+        assert!(world.is_archetype_current(handle));
+        world.migrate_components(&[TypeInfo::of::<Counted>()], |_, src, dst| unsafe {
+            core::ptr::copy_nonoverlapping(src, dst, core::mem::size_of::<Counted>())
+        });
+        assert!(!world.is_archetype_current(handle));
+        assert!(!World::new().is_archetype_current(handle), "other worlds reject it");
+        let handle = unsafe { world.resolve_archetype_nonsync(&types) };
+        let mut more = [Entity::DANGLING; 2];
+        unsafe {
+            world.spawn_into_nonsync(handle, &mut more, |rows| {
+                for (col, _) in rows.types().iter().enumerate() {
+                    for row in 0..rows.len() {
+                        if col == count_col {
+                            rows.column(col).value(row).cast::<Counted>().write(Counted(1000));
+                        } else {
+                            rows.column(col).value(row).cast::<String>().write(String::new());
+                        }
+                    }
+                }
+            })
+        };
+        assert_eq!(loc(&world, more[0]), loc(&world, out[0]));
+        assert_eq!(world.get::<&Counted>(more[1]).unwrap().0, 1000);
         cleanup(world);
     }
 
