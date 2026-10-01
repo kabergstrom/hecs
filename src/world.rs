@@ -600,14 +600,12 @@ impl World {
                 .collect();
             // A changed alignment can reorder the columns.
             types.sort_unstable();
+            let new_ids: Box<[crate::StableTypeId]> = types.iter().map(|ty| ty.id()).collect();
             let (new_key, _) = self.archetypes.archetypes.push(Archetype::new(types));
-            // Index keys are ordered by the value types' alignment, which can
-            // differ from the column order; re-point by value.
-            for key in self.archetypes.index.0.get_mut().values_mut() {
-                if *key == old_key {
-                    *key = new_key;
-                }
-            }
+            // Index keys follow column order, which a changed alignment reorders: re-key.
+            let index = self.archetypes.index.0.get_mut();
+            index.retain(|_, key| *key != old_key);
+            index.insert(new_ids, new_key);
             let old = &self.archetypes.archetypes[old_key];
             let new = &self.archetypes.archetypes[new_key];
             // SAFETY: we have &mut self; every live slot of `old` is Alive and unborrowed.
@@ -2164,6 +2162,60 @@ pub(crate) mod tests {
         let h = world.spawn((1u8, "h".to_string()));
         assert_eq!(world.entities.get(h).unwrap().archetype, loc_e);
         world.despawn(h).unwrap();
+        cleanup(world);
+    }
+
+    #[test]
+    fn every_spawn_path_shares_one_archetype_per_type_set() {
+        // Value alignment orders these (Wide, Narrow); id orders them (Narrow, Wide).
+        struct Narrow(u8);
+        impl Component for Narrow {
+            const STABLE_TYPE_ID: crate::StableTypeId = crate::StableTypeId(1);
+        }
+        struct Wide(u64);
+        impl Component for Wide {
+            const STABLE_TYPE_ID: crate::StableTypeId = crate::StableTypeId(2);
+        }
+
+        let mut world = World::new();
+        let arch = |world: &World, e: Entity| world.entities.get(e).unwrap().archetype;
+        let tuple = world.spawn((Narrow(1), Wide(1)));
+        let reversed = world.spawn((Wide(2), Narrow(2)));
+        let mut builder = crate::EntityBuilder::new();
+        builder.add(Wide(3)).add(Narrow(3));
+        let built = world.spawn(builder.build());
+        let inserted = world.spawn((Narrow(4),));
+        world.insert_one(inserted, Wide(4)).unwrap();
+
+        let mut types = vec![TypeInfo::of::<Wide>(), TypeInfo::of::<Narrow>()];
+        types.sort_unstable();
+        let handle = unsafe { world.resolve_archetype_nonsync(&types) };
+        let mut batch = [Entity::DANGLING; 2];
+        unsafe {
+            world.spawn_into_nonsync(handle, &mut batch, |rows| {
+                for (col, ty) in rows.types().iter().enumerate() {
+                    for row in 0..rows.len() {
+                        let ptr = rows.column(col).value(row);
+                        if ty.id() == Narrow::STABLE_TYPE_ID {
+                            ptr.cast::<Narrow>().write(Narrow(5));
+                        } else {
+                            ptr.cast::<Wide>().write(Wide(5));
+                        }
+                    }
+                }
+            });
+        }
+
+        let key = arch(&world, tuple);
+        for e in [reversed, built, inserted, batch[0], batch[1]] {
+            assert_eq!(arch(&world, e), key);
+        }
+        let holding = world
+            .archetypes()
+            .filter(|(_, a)| a.has::<Narrow>() && a.has::<Wide>())
+            .count();
+        assert_eq!(holding, 1);
+        assert_eq!(world.query::<(&Narrow, &Wide)>().iter().count(), 6);
         cleanup(world);
     }
 

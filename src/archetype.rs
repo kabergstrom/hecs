@@ -845,7 +845,7 @@ impl TypeInfo {
         let type_layout = Layout::new::<T>();
         let (gc_layout, data_start) = Layout::new::<GCHeader>().extend(type_layout).unwrap();
         let gc_layout = gc_layout.pad_to_align();
-        assert!(gc_layout.size() == Layout::new::<GC<T>>().size());
+        assert!(gc_layout == Layout::new::<GC<T>>());
 
         Self {
             id: T::STABLE_TYPE_ID,
@@ -938,6 +938,13 @@ impl TypeInfo {
 pub enum DropFn {
     Typed(unsafe fn(*mut u8)),
     ById(unsafe fn(StableTypeId, *mut u8)),
+}
+
+/// The `(alignment, id)` key that `TypeInfo`'s `Ord` sorts `T` by, without building a `TypeInfo`.
+/// Static bundles sort their ids with it so every spawn path keys a type set in one order.
+#[doc(hidden)]
+pub fn type_sort_key<T: Component>() -> (usize, StableTypeId) {
+    (core::mem::align_of::<GC<T>>(), T::STABLE_TYPE_ID)
 }
 
 impl PartialOrd for TypeInfo {

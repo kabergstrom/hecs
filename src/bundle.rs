@@ -10,7 +10,7 @@ use core::any::{type_name, TypeId};
 use core::ptr::NonNull;
 use core::{fmt, mem};
 
-use crate::archetype::TypeInfo;
+use crate::archetype::{type_sort_key, TypeInfo};
 use crate::{Component, StableTypeId};
 
 /// A dynamically typed collection of components
@@ -168,7 +168,7 @@ macro_rules! tuple_impl {
         unsafe impl<$($name: Component),*> Bundle for ($($name,)*) {
             fn with_static_ids<T>(f: impl FnOnce(&[StableTypeId]) -> T) -> T {
                 const N: usize = count!($($name),*);
-                let mut xs: [(usize, StableTypeId); N] = [$((mem::align_of::<$name>(), $name::STABLE_TYPE_ID)),*];
+                let mut xs: [(usize, StableTypeId); N] = [$(type_sort_key::<$name>()),*];
                 xs.sort_unstable_by(|x, y| x.0.cmp(&y.0).reverse().then(x.1.cmp(&y.1)));
                 let mut ids = [StableTypeId(0); N];
                 for (slot, &(_, id)) in ids.iter_mut().zip(xs.iter()) {

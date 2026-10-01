@@ -75,7 +75,7 @@ fn gen_bundle_impl(
     let (impl_generics, ty_generics, where_clause) = generics.split_for_impl();
     let with_static_ids_inner = quote! {
         {
-            let mut tys = [#((::std::mem::align_of::<#tys>(), <#tys as ::hecs::Component>::STABLE_TYPE_ID)),*];
+            let mut tys = [#(::hecs::type_sort_key::<#tys>()),*];
             tys.sort_unstable_by(|x, y| {
                 ::std::cmp::Ord::cmp(&x.0, &y.0)
                     .reverse()
