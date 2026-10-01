@@ -1154,3 +1154,47 @@ fn gc_ptr_back_pointer_across_chunks() {
     }
     cleanup(world);
 }
+
+/// Columns of very different strides hold different slot counts per chunk:
+/// a dynamic query must walk each column by its own chunks.
+#[test]
+fn query_dynamic_walks_each_column_by_its_own_chunks() {
+    const N: u32 = 10_000;
+    let mut world = World::new();
+    let mut entities = Vec::new();
+    for i in 0..N {
+        let mut big = [0u8; 256];
+        big[..4].copy_from_slice(&i.to_le_bytes());
+        big[255] = (i % 251) as u8;
+        entities.push(world.spawn(((i % 251) as u8, big)));
+    }
+    // Free slots in the middle of runs.
+    for (i, e) in entities.iter().enumerate() {
+        if i % 7 == 3 {
+            world.despawn(*e).unwrap();
+        }
+    }
+    let live = (0..N).filter(|i| i % 7 != 3).count();
+    let ids = [<u8 as Component>::STABLE_TYPE_ID, <[u8; 256] as Component>::STABLE_TYPE_ID];
+    use std::convert::TryInto;
+    let check = |small: &hecs::gc::GCPtr, big: &hecs::gc::GCPtr| unsafe {
+        let small = *small.value.as_ptr();
+        let big = &*(big.value.as_ptr() as *const [u8; 256]);
+        let i = u32::from_le_bytes(big[..4].try_into().unwrap());
+        i < N && i % 7 != 3 && small == (i % 251) as u8 && big[255] == small
+    };
+    let (mut rows, mut wrong) = (0, 0);
+    world.query_dynamic(&ids, &mut |e, p| {
+        rows += 1;
+        let i = u32::from_le_bytes(unsafe { &*(p[1].value.as_ptr() as *const [u8; 256]) }[..4].try_into().unwrap());
+        wrong += (!check(&p[0], &p[1]) || entities.get(i as usize) != Some(&e)) as u32;
+    });
+    assert_eq!((rows, wrong), (live, 0));
+    let (mut rows, mut wrong) = (0, 0);
+    // Reversed column order: the first column is the big one.
+    world.query_dynamic_values(&[ids[1], ids[0]], &mut |p| {
+        rows += 1;
+        wrong += !check(&p[1], &p[0]) as u32;
+    });
+    assert_eq!((rows, wrong), (live, 0));
+}
