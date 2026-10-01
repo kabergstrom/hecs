@@ -602,8 +602,11 @@ impl World {
     /// - insert/remove moves: journaled, [`VacateKind::Moved`].
     /// - [`spawn_at`](Self::spawn_at) / [`spawn_column_batch_at`](Self::spawn_column_batch_at)
     ///   replacing a live entity, or allocating a held ID: panic.
-    /// - [`clear`](Self::clear), [`migrate_components`](Self::migrate_components): drop the
-    ///   journal and quarantines wholesale and bump [`history_epoch`](Self::history_epoch).
+    /// - [`clear`](Self::clear): drops the journal and every slot, and bumps
+    ///   [`history_epoch`](Self::history_epoch).
+    /// - [`migrate_components`](Self::migrate_components): bumps the epoch only; journal entries
+    ///   and quarantine bits of the replaced archetypes stay. Release the history first
+    ///   (newgameplus `EcsRollback::invalidate`).
     pub fn set_quarantine_marker(&mut self, marker: Option<crate::StableTypeId>) {
         self.quarantine_marker = marker;
     }
