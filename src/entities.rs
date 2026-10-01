@@ -501,6 +501,71 @@ impl Entities {
         Ok(loc)
     }
 
+    /// Destroy an entity but hold its ID: the generation is kept and the ID stays off the
+    /// freelist, so the same `Entity` bits can be revived ([`revive_nonsync`](Self::revive_nonsync))
+    /// until [`release_held_nonsync`](Self::release_held_nonsync).
+    pub unsafe fn hold_nonsync(&self, entity: Entity) -> Result<Location, NoSuchEntity> {
+        self.verify_flushed_nonsync();
+        let id = entity.id as usize;
+        if id >= self.meta.len_nonsync() {
+            return Err(NoSuchEntity);
+        }
+        let mut meta = *self.meta.get_unchecked(id);
+        if meta.generation != entity.generation || meta.location.index == u32::MAX {
+            return Err(NoSuchEntity);
+        }
+        let loc = meta.location;
+        meta.location = EntityMeta::EMPTY.location;
+        self.meta.set_nonsync(id, meta);
+        let len = self.len.read_nonsync();
+        self.len.write_nonsync(len - 1);
+        Ok(loc)
+    }
+
+    /// Whether `entity`'s ID is held: destroyed by [`hold_nonsync`](Self::hold_nonsync) and not
+    /// yet revived or released.
+    pub unsafe fn is_held_nonsync(&self, entity: Entity) -> bool {
+        let id = entity.id as usize;
+        id < self.meta.len_nonsync() && {
+            let meta = *self.meta.get_unchecked(id);
+            meta.generation == entity.generation && meta.location.index == u32::MAX
+        }
+    }
+
+    /// Make a held `entity` live again at `location`. False when its ID is not held.
+    pub unsafe fn revive_nonsync(&self, entity: Entity, location: Location) -> bool {
+        if !self.is_held_nonsync(entity) {
+            return false;
+        }
+        self.meta.set_nonsync(
+            entity.id as usize,
+            EntityMeta {
+                generation: entity.generation,
+                location,
+            },
+        );
+        let len = self.len.read_nonsync();
+        self.len.write_nonsync(len + 1);
+        true
+    }
+
+    /// Return a held ID to the freelist (bumping its generation). False when it is not held.
+    pub unsafe fn release_held_nonsync(&self, entity: Entity) -> bool {
+        self.verify_flushed_nonsync();
+        if !self.is_held_nonsync(entity) {
+            return false;
+        }
+        let id = entity.id as usize;
+        let mut meta = *self.meta.get_unchecked(id);
+        meta.generation = NonZeroU32::new(u32::from(meta.generation).wrapping_add(1))
+            .unwrap_or_else(|| NonZeroU32::new(1).unwrap());
+        self.meta.set_nonsync(id, meta);
+        self.pending.push_nonsync(entity.id);
+        let new_free_cursor = self.pending.len_nonsync() as isize;
+        self.free_cursor.write_nonsync(new_free_cursor);
+        true
+    }
+
     /// Ensure at least `n` allocations can succeed without reallocating
     pub fn reserve(&mut self, additional: u32) {
         self.verify_flushed();

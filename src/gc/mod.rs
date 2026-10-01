@@ -623,7 +623,7 @@ impl<T: Component> CRef<T> {
 }
 
 /// Sweep tombstones from the world, freeing slots where all components are
-/// Dead/Moved and not marked as referenced. Resets all `referenced` flags.
+/// Dead/Moved and not marked as referenced or quarantined. Resets all `referenced` flags.
 ///
 /// Call this after marking live slots with `GCPtr::mark_referenced()`.
 /// Returns the number of entity slots freed.
@@ -672,7 +672,7 @@ pub unsafe fn sweep(world: &World) -> u32 {
                 header.referenced = false;
                 can_free &= freeable;
             }
-            if can_free {
+            if can_free && !archetype.is_quarantined(slot) {
                 archetype.free_slot(slot);
                 freed += 1;
             }

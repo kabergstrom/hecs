@@ -46,7 +46,14 @@ pub struct Archetype {
     /// One allocation per type, in the same order as `types`
     data: Box<[Data]>,
     first_free: PtrCell<u8>,
+    /// One bit per slot: a vacated slot the sweep must not free until released
+    /// ([`World::set_quarantine_marker`](crate::World::set_quarantine_marker)).
+    quarantined: QuarantineBits,
 }
+
+#[derive(Default)]
+struct QuarantineBits(UnsafeCell<Vec<u64>>);
+unsafe impl Sync for QuarantineBits {}
 
 impl Archetype {
     fn assert_type_info(types: &[TypeInfo]) {
@@ -109,6 +116,7 @@ impl Archetype {
                 .collect(),
             types,
             first_free: PtrCell::new(null_mut()),
+            quarantined: QuarantineBits::default(),
         }
     }
 
@@ -136,6 +144,7 @@ impl Archetype {
             }
         }
         self.entities.fill(EntityCell::free());
+        self.quarantined.0.get_mut().clear();
     }
 
     /// Whether this archetype contains `T` components
@@ -526,6 +535,34 @@ impl Archetype {
         other.len.set(0);
     }
 
+    /// Whether `slot` is quarantined: vacated (despawned or moved out) and kept from the sweep
+    /// until [`World::release_quarantine_nonsync`](crate::World::release_quarantine_nonsync) or a
+    /// revive.
+    ///
+    /// # Safety
+    /// No concurrent structural change of this archetype.
+    pub unsafe fn is_quarantined(&self, slot: u32) -> bool {
+        let bits = &*self.quarantined.0.get();
+        bits.get(slot as usize / 64)
+            .is_some_and(|w| w & (1 << (slot % 64)) != 0)
+    }
+
+    pub(crate) unsafe fn set_quarantined_nonsync(&self, slot: u32, on: bool) {
+        let bits = &mut *self.quarantined.0.get();
+        let word = slot as usize / 64;
+        if word >= bits.len() {
+            if !on {
+                return;
+            }
+            bits.resize(word + 1, 0);
+        }
+        if on {
+            bits[word] |= 1 << (slot % 64);
+        } else {
+            bits[word] &= !(1 << (slot % 64));
+        }
+    }
+
     pub(crate) unsafe fn free_slot(&self, slot: u32) {
         let current_num_free = self.num_free.read_nonsync();
         self.num_free.write_nonsync(current_num_free + 1);
@@ -653,21 +690,37 @@ impl Data {
     pub fn chunks(&self) -> &[*mut u8] {
         &self.storage
     }
+    /// Bytes per slot (`[GCHeader | value]`, padded to the value's alignment).
     #[inline(always)]
-    pub(crate) fn stride(&self) -> usize {
+    pub fn stride(&self) -> usize {
         self.stride
     }
+    /// Offset of the value within a slot (header size plus alignment padding).
     #[inline(always)]
-    pub(crate) fn value_start(&self) -> usize {
+    pub fn value_start(&self) -> usize {
         self.value_start
     }
+    /// Offset of slot 0 from the start of each chunk (past the chunk's `StorageHeader`).
     #[inline(always)]
-    pub(crate) fn data_start(&self) -> usize {
+    pub fn data_start(&self) -> usize {
         self.data_start
     }
+    /// Slots per chunk; slot `i` lives in chunk `i / entities_per_chunk`.
     #[inline(always)]
-    pub(crate) fn entities_per_chunk(&self) -> usize {
+    pub fn entities_per_chunk(&self) -> usize {
         self.entities_per_chunk
+    }
+    /// Address of slot `idx`'s first byte (its header). Chunk pointers come from
+    /// [`chunks`](Self::chunks).
+    ///
+    /// # Safety
+    /// `idx` is below the archetype's allocated slot count.
+    #[inline(always)]
+    pub unsafe fn slot_ptr(&self, idx: u32) -> *mut u8 {
+        let idx = idx as usize;
+        self.storage
+            .get_unchecked(idx / self.entities_per_chunk)
+            .add(self.data_start + (idx % self.entities_per_chunk) * self.stride)
     }
 
     pub unsafe fn get_gc_ptr(&self, idx: u32) -> GCPtr {
