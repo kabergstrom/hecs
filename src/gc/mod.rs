@@ -20,7 +20,7 @@ pub use query::*;
 use self::borrow::{BorrowFlag, BorrowRef, BorrowRefMut, Ref, RefMut};
 use crate::{
     archetype::{Archetype, StorageHeader, DATA_CHUNK_SIZE_BYTES},
-    Component, Entity, StableTypeId, TypeInfo, World,
+    Component, Entity, StableTypeId, TypeInfo, VacateKind, World,
 };
 use alloc::vec::Vec;
 
@@ -625,6 +625,10 @@ impl<T: Component> CRef<T> {
 /// Sweep tombstones from the world, freeing slots where all components are
 /// Dead/Moved and not marked as referenced or quarantined. Resets all `referenced` flags.
 ///
+/// In a [quarantining](World::set_quarantine_marker) archetype such a slot is quarantined and
+/// journaled as [`VacateKind::Swept`] instead; once that entry is released, the next sweep
+/// frees it if it is still unreferenced. Journals into the world, so no concurrent access.
+///
 /// Call this after marking live slots with `GCPtr::mark_referenced()`.
 /// Returns the number of entity slots freed.
 ///
@@ -639,7 +643,8 @@ pub unsafe fn sweep(world: &World) -> u32 {
     );
     let mut freed = 0u32;
     let mut archetype_iter_set = Vec::new();
-    for (_, archetype) in world.archetypes() {
+    for (key, archetype) in world.archetypes() {
+        let quarantines = world.quarantines(key);
         let count = archetype.allocated_values_nonsync();
         archetype_iter_set.clear();
         for (idx, ty) in archetype.types().iter().enumerate() {
@@ -672,7 +677,17 @@ pub unsafe fn sweep(world: &World) -> u32 {
                 header.referenced = false;
                 can_free &= freeable;
             }
-            if can_free && !archetype.is_quarantined(slot) {
+            if !can_free {
+                // Live memory references it again: a later sweep defers anew.
+                archetype.set_sweep_released_nonsync(slot, false);
+            } else if archetype.is_quarantined(slot) {
+            } else if quarantines && !archetype.is_sweep_released(slot) {
+                // History copies may still point here: free after the window
+                // (`VacateKind::Swept`).
+                archetype.set_quarantined_nonsync(slot, true);
+                world.journal_vacate(key, slot, Entity::DANGLING, VacateKind::Swept);
+            } else {
+                archetype.set_sweep_released_nonsync(slot, false);
                 archetype.free_slot(slot);
                 freed += 1;
             }

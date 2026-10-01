@@ -11,6 +11,8 @@ pub struct TakenEntity<'a> {
     archetype: &'a mut Archetype,
     index: u32,
     drop: bool,
+    /// Hold the ID instead of freeing it (a quarantining archetype).
+    hold: bool,
 }
 
 impl<'a> TakenEntity<'a> {
@@ -21,6 +23,7 @@ impl<'a> TakenEntity<'a> {
         entity: Entity,
         archetype: &'a mut Archetype,
         index: u32,
+        hold: bool,
     ) -> Self {
         Self {
             entities,
@@ -28,6 +31,15 @@ impl<'a> TakenEntity<'a> {
             archetype,
             index,
             drop: true,
+            hold,
+        }
+    }
+
+    fn retire(&mut self) {
+        if self.hold {
+            unsafe { self.entities.hold_nonsync(self.entity).unwrap() };
+        } else {
+            self.entities.free(self.entity).unwrap();
         }
     }
 }
@@ -44,7 +56,7 @@ unsafe impl<'a> DynamicBundle for TakenEntity<'a> {
     unsafe fn put(mut self, mut f: impl FnMut(*mut u8, TypeInfo)) {
         // Suppress dropping of moved components
         self.drop = false;
-        self.entities.free(self.entity).unwrap();
+        self.retire();
         for ty in self.archetype.types() {
             let mut ptr = self.archetype.get_dynamic(ty, self.index).unwrap();
             ptr.move_value_and_tombstone(ty, &mut f);
@@ -56,7 +68,7 @@ unsafe impl<'a> DynamicBundle for TakenEntity<'a> {
 impl Drop for TakenEntity<'_> {
     fn drop(&mut self) {
         if self.drop {
-            self.entities.free(self.entity).unwrap();
+            self.retire();
             for ty in self.archetype.types() {
                 unsafe {
                     let mut ptr = self.archetype.get_dynamic(ty, self.index).unwrap();

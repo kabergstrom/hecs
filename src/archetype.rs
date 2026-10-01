@@ -48,12 +48,43 @@ pub struct Archetype {
     first_free: PtrCell<u8>,
     /// One bit per slot: a vacated slot the sweep must not free until released
     /// ([`World::set_quarantine_marker`](crate::World::set_quarantine_marker)).
-    quarantined: QuarantineBits,
+    quarantined: SlotBits,
+    /// One bit per slot: a swept slot whose deferral ended; the next sweep frees it if it is
+    /// still unreferenced ([`VacateKind::Swept`](crate::VacateKind::Swept)).
+    sweep_released: SlotBits,
 }
 
 #[derive(Default)]
-struct QuarantineBits(UnsafeCell<Vec<u64>>);
-unsafe impl Sync for QuarantineBits {}
+struct SlotBits(UnsafeCell<Vec<u64>>);
+unsafe impl Sync for SlotBits {}
+
+impl SlotBits {
+    unsafe fn get(&self, slot: u32) -> bool {
+        let bits = &*self.0.get();
+        bits.get(slot as usize / 64)
+            .is_some_and(|w| w & (1 << (slot % 64)) != 0)
+    }
+
+    unsafe fn set(&self, slot: u32, on: bool) {
+        let bits = &mut *self.0.get();
+        let word = slot as usize / 64;
+        if word >= bits.len() {
+            if !on {
+                return;
+            }
+            bits.resize(word + 1, 0);
+        }
+        if on {
+            bits[word] |= 1 << (slot % 64);
+        } else {
+            bits[word] &= !(1 << (slot % 64));
+        }
+    }
+
+    fn clear(&mut self) {
+        self.0.get_mut().clear();
+    }
+}
 
 impl Archetype {
     fn assert_type_info(types: &[TypeInfo]) {
@@ -116,7 +147,8 @@ impl Archetype {
                 .collect(),
             types,
             first_free: PtrCell::new(null_mut()),
-            quarantined: QuarantineBits::default(),
+            quarantined: SlotBits::default(),
+            sweep_released: SlotBits::default(),
         }
     }
 
@@ -144,7 +176,8 @@ impl Archetype {
             }
         }
         self.entities.fill(EntityCell::free());
-        self.quarantined.0.get_mut().clear();
+        self.quarantined.clear();
+        self.sweep_released.clear();
     }
 
     /// Whether this archetype contains `T` components
@@ -536,31 +569,28 @@ impl Archetype {
     }
 
     /// Whether `slot` is quarantined: vacated (despawned or moved out) and kept from the sweep
-    /// until [`World::release_quarantine_nonsync`](crate::World::release_quarantine_nonsync) or a
+    /// until [`World::release_vacated_nonsync`](crate::World::release_vacated_nonsync) or a
     /// revive.
     ///
     /// # Safety
     /// No concurrent structural change of this archetype.
     pub unsafe fn is_quarantined(&self, slot: u32) -> bool {
-        let bits = &*self.quarantined.0.get();
-        bits.get(slot as usize / 64)
-            .is_some_and(|w| w & (1 << (slot % 64)) != 0)
+        self.quarantined.get(slot)
     }
 
     pub(crate) unsafe fn set_quarantined_nonsync(&self, slot: u32, on: bool) {
-        let bits = &mut *self.quarantined.0.get();
-        let word = slot as usize / 64;
-        if word >= bits.len() {
-            if !on {
-                return;
-            }
-            bits.resize(word + 1, 0);
-        }
+        self.quarantined.set(slot, on);
         if on {
-            bits[word] |= 1 << (slot % 64);
-        } else {
-            bits[word] &= !(1 << (slot % 64));
+            self.sweep_released.set(slot, false);
         }
+    }
+
+    pub(crate) unsafe fn is_sweep_released(&self, slot: u32) -> bool {
+        self.sweep_released.get(slot)
+    }
+
+    pub(crate) unsafe fn set_sweep_released_nonsync(&self, slot: u32, on: bool) {
+        self.sweep_released.set(slot, on);
     }
 
     pub(crate) unsafe fn free_slot(&self, slot: u32) {

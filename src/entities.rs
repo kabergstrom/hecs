@@ -398,6 +398,10 @@ impl Entities {
             self.len.set(len + 1);
             None
         } else {
+            assert!(
+                self.meta[entity.id as usize].location.index != u32::MAX,
+                "alloc_at on a held entity ID (World::set_quarantine_marker); release it first"
+            );
             Some(mem::replace(
                 &mut self.meta[entity.id as usize].location,
                 EntityMeta::EMPTY.location,
