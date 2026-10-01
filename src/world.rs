@@ -1681,98 +1681,12 @@ impl World {
         type_ids: &[crate::StableTypeId],
         cb: &mut dyn FnMut(Entity, &[crate::gc::GCPtr]),
     ) {
-        // Stack-allocate for the common case (≤8 components), spill to heap otherwise
-        let n = type_ids.len();
-        let mut ptrs_inline = [crate::gc::GCPtr {
-            value: core::ptr::NonNull::dangling(),
-        }; 8];
-        let mut cols_inline = [0usize; 8];
-        let mut ptrs_heap;
-        let mut cols_heap;
-        let (ptrs, cols): (&mut [crate::gc::GCPtr], &mut [usize]) = if n <= 8 {
-            (&mut ptrs_inline[..n], &mut cols_inline[..n])
-        } else {
-            ptrs_heap = vec![
-                crate::gc::GCPtr {
-                    value: core::ptr::NonNull::dangling()
-                };
-                n
-            ];
-            cols_heap = vec![0usize; n];
-            (&mut ptrs_heap, &mut cols_heap)
-        };
-        for (_, archetype) in self.archetypes() {
-            // Resolve column indices once per archetype
-            let mut matched = true;
-            for (i, id) in type_ids.iter().enumerate() {
-                match archetype.column_index(*id) {
-                    Some(col) => cols[i] = col,
-                    None => {
-                        matched = false;
-                        break;
-                    }
-                }
+        self.walk_dynamic(type_ids, |cell, ptrs| {
+            let entity = unsafe { cell.read_nonsync() };
+            if entity.id != u32::MAX {
+                cb(entity, ptrs);
             }
-            if !matched {
-                continue;
-            }
-            let total = archetype.allocated_values_sync();
-            let entities = archetype.entities_slice();
-            // Precompute strides per column
-            let mut strides_inline = [0usize; 8];
-            let mut strides_heap;
-            let strides: &[usize] = if n <= 8 {
-                for (i, &col) in cols.iter().enumerate() {
-                    strides_inline[i] = unsafe { archetype.get_data_storage(col) }.stride();
-                }
-                &strides_inline[..n]
-            } else {
-                strides_heap = cols
-                    .iter()
-                    .map(|&col| unsafe { archetype.get_data_storage(col) }.stride())
-                    .collect::<Vec<_>>();
-                &strides_heap
-            };
-            // Iterate chunk-linearly to avoid div/mod per entity
-            let epc = unsafe { archetype.get_data_storage(cols[0]) }.entities_per_chunk();
-            let mut slot = 0u32;
-            while slot < total {
-                let chunk_idx = slot as usize / epc;
-                let value_in_chunk = slot as usize % epc;
-                // Set up pointers to start of this chunk run
-                for (i, &col) in cols.iter().enumerate() {
-                    let data = unsafe { archetype.get_data_storage(col) };
-                    let chunk_base = unsafe { *data.chunks().get_unchecked(chunk_idx) };
-                    let base =
-                        unsafe { chunk_base.add(data.data_start() + value_in_chunk * strides[i]) };
-                    ptrs[i] = unsafe {
-                        crate::gc::GCPtr::from_base_with_offset(
-                            data.value_start(),
-                            core::ptr::NonNull::new_unchecked(base),
-                        )
-                    };
-                }
-                let run_end = (((chunk_idx + 1) * epc) as u32).min(total);
-                // Linear scan: bump pointers by stride instead of recomputing
-                for s in slot..run_end {
-                    let entity = unsafe { entities[s as usize].read_nonsync() };
-                    if entity.id != u32::MAX {
-                        cb(entity, ptrs);
-                    }
-                    // Bump all column pointers by their stride
-                    for i in 0..n {
-                        ptrs[i] = crate::gc::GCPtr {
-                            value: unsafe {
-                                core::ptr::NonNull::new_unchecked(
-                                    ptrs[i].value.as_ptr().add(strides[i]),
-                                )
-                            },
-                        };
-                    }
-                }
-                slot = run_end;
-            }
-        }
+        });
     }
 
     /// Like `query_dynamic`, but skips entity resolution — only passes component pointers.
@@ -1781,30 +1695,61 @@ impl World {
         type_ids: &[crate::StableTypeId],
         cb: &mut dyn FnMut(&[crate::gc::GCPtr]),
     ) {
+        self.walk_dynamic(type_ids, |cell, ptrs| {
+            if unsafe { cell.read_id_nonsync() } != u32::MAX {
+                cb(ptrs);
+            }
+        });
+    }
+
+    /// Every allocated slot (free ones included) of every archetype with all
+    /// of `type_ids`, chunk-linearly: `row` gets the slot's entity cell and
+    /// its column pointers in `type_ids` order.
+    ///
+    /// Each column has its own slots per chunk (`Data::entities_per_chunk`
+    /// depends on the stride), so a run of slots ends at the first chunk
+    /// boundary of any column; within a run every pointer advances by its
+    /// column's stride.
+    #[inline(always)]
+    fn walk_dynamic(
+        &self,
+        type_ids: &[crate::StableTypeId],
+        mut row: impl FnMut(&crate::gc::cells::EntityCell, &[crate::gc::GCPtr]),
+    ) {
+        const INLINE: usize = 8;
         let n = type_ids.len();
-        let mut ptrs_inline = [crate::gc::GCPtr {
+        if n == 0 {
+            return;
+        }
+        let dangling = crate::gc::GCPtr {
             value: core::ptr::NonNull::dangling(),
-        }; 8];
-        let mut cols_inline = [0usize; 8];
-        let mut ptrs_heap;
-        let mut cols_heap;
-        let (ptrs, cols): (&mut [crate::gc::GCPtr], &mut [usize]) = if n <= 8 {
-            (&mut ptrs_inline[..n], &mut cols_inline[..n])
-        } else {
-            ptrs_heap = vec![
-                crate::gc::GCPtr {
-                    value: core::ptr::NonNull::dangling()
-                };
-                n
-            ];
-            cols_heap = vec![0usize; n];
-            (&mut ptrs_heap, &mut cols_heap)
         };
+        let mut data_inline: [*const crate::Data; INLINE] = [core::ptr::null(); INLINE];
+        let mut strides_inline = [0usize; INLINE];
+        let mut ptrs_inline = [dangling; INLINE];
+        let (mut data_heap, mut strides_heap, mut ptrs_heap);
+        let (data, strides, ptrs): (&mut [*const crate::Data], &mut [usize], &mut [crate::gc::GCPtr]) =
+            if n <= INLINE {
+                (
+                    &mut data_inline[..n],
+                    &mut strides_inline[..n],
+                    &mut ptrs_inline[..n],
+                )
+            } else {
+                data_heap = vec![core::ptr::null(); n];
+                strides_heap = vec![0usize; n];
+                ptrs_heap = vec![dangling; n];
+                (&mut data_heap, &mut strides_heap, &mut ptrs_heap)
+            };
         for (_, archetype) in self.archetypes() {
             let mut matched = true;
             for (i, id) in type_ids.iter().enumerate() {
                 match archetype.column_index(*id) {
-                    Some(col) => cols[i] = col,
+                    Some(col) => {
+                        let d = unsafe { archetype.get_data_storage(col) };
+                        data[i] = d;
+                        strides[i] = d.stride();
+                    }
                     None => {
                         matched = false;
                         break;
@@ -1816,51 +1761,29 @@ impl World {
             }
             let total = archetype.allocated_values_sync();
             let entities = archetype.entities_slice();
-            let mut strides_inline = [0usize; 8];
-            let mut strides_heap;
-            let strides: &[usize] = if n <= 8 {
-                for (i, &col) in cols.iter().enumerate() {
-                    strides_inline[i] = unsafe { archetype.get_data_storage(col) }.stride();
-                }
-                &strides_inline[..n]
-            } else {
-                strides_heap = cols
-                    .iter()
-                    .map(|&col| unsafe { archetype.get_data_storage(col) }.stride())
-                    .collect::<Vec<_>>();
-                &strides_heap
-            };
-            let epc = unsafe { archetype.get_data_storage(cols[0]) }.entities_per_chunk();
             let mut slot = 0u32;
             while slot < total {
-                let chunk_idx = slot as usize / epc;
-                let value_in_chunk = slot as usize % epc;
-                for (i, &col) in cols.iter().enumerate() {
-                    let data = unsafe { archetype.get_data_storage(col) };
-                    let chunk_base = unsafe { *data.chunks().get_unchecked(chunk_idx) };
-                    let base =
-                        unsafe { chunk_base.add(data.data_start() + value_in_chunk * strides[i]) };
+                let mut run_end = total;
+                for i in 0..n {
+                    let d = unsafe { &*data[i] };
                     ptrs[i] = unsafe {
                         crate::gc::GCPtr::from_base_with_offset(
-                            data.value_start(),
-                            core::ptr::NonNull::new_unchecked(base),
+                            d.value_start(),
+                            core::ptr::NonNull::new_unchecked(d.slot_ptr(slot)),
                         )
                     };
+                    let epc = d.entities_per_chunk() as u32;
+                    run_end = run_end.min((slot / epc + 1) * epc);
                 }
-                let run_end = (((chunk_idx + 1) * epc) as u32).min(total);
                 for s in slot..run_end {
-                    let entity_id = unsafe { entities[s as usize].read_id_nonsync() };
-                    if entity_id != u32::MAX {
-                        cb(ptrs);
-                    }
+                    row(unsafe { entities.get_unchecked(s as usize) }, ptrs);
                     for i in 0..n {
-                        ptrs[i] = crate::gc::GCPtr {
-                            value: unsafe {
-                                core::ptr::NonNull::new_unchecked(
-                                    ptrs[i].value.as_ptr().add(strides[i]),
-                                )
-                            },
-                        };
+                        unsafe {
+                            let p = ptrs.get_unchecked_mut(i);
+                            p.value = core::ptr::NonNull::new_unchecked(
+                                p.value.as_ptr().add(*strides.get_unchecked(i)),
+                            );
+                        }
                     }
                 }
                 slot = run_end;
