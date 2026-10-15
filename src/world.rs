@@ -1310,15 +1310,15 @@ impl World {
                 ptr.drop_value_and_tombstone(&ty);
             }
 
-            if target.index == loc.archetype {
-                // Update components in the current archetype
-                let arch = &self.archetypes.archetypes[loc.archetype];
-                components.put(|ptr, ty| {
-                    // SAFETY: we have &mut self
-                    arch.put_new_dynamic_nonsync(ptr, &ty, loc.index);
-                });
+            if target.index == loc.archetype && target.replaced.is_empty() {
+                // Nothing to insert.
                 return;
             }
+            // Replacing within the same archetype goes through a fresh row too:
+            // a replaced slot is tombstoned above (references may still reach
+            // it, and a borrowed one is dropped later), so it can't take the
+            // new value. The entity moves to a new row of its own archetype,
+            // exactly as it would to another archetype.
 
             let source_arch = &self.archetypes.archetypes[loc.archetype];
             let target_arch = &self.archetypes.archetypes[target.index];
