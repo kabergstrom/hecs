@@ -84,7 +84,7 @@ impl GcWorld {
         &self,
         entity: Entity,
         component: impl Component,
-    ) -> Result<(), NoSuchEntity> {
+    ) -> Result<(), ComponentError> {
         self.insert(entity, (component,))
     }
 
@@ -95,7 +95,7 @@ impl GcWorld {
         &self,
         entity: Entity,
         components: impl DynamicBundle,
-    ) -> Result<(), NoSuchEntity> {
+    ) -> Result<(), ComponentError> {
         assert_writable(self.world.world_slot());
         unsafe { self.world.insert_nonsync(entity, components) }
     }

@@ -16,6 +16,9 @@ pub struct EntityRef<'a> {
 }
 
 impl<'a> EntityRef<'a> {
+    /// # Safety
+    /// `index` is `entity`'s occupied row in `archetype`, and stays so (STRUCT) while the
+    /// `EntityRef` is used.
     pub(crate) unsafe fn new(archetype: &'a Archetype, entity: Entity, index: u32) -> Self {
         Self {
             archetype,
@@ -123,6 +126,12 @@ pub struct Ref<'a, T: Component> {
 }
 
 impl<'a, T: Component> Ref<'a, T> {
+    /// Borrow `T` of row `index` (a shared column borrow, released on drop).
+    ///
+    /// # Safety
+    /// `index` is an occupied row of `archetype` (below its allocated slots), STRUCT while the
+    /// `Ref` lives, and no gc write guard (`CRef::write`) on the slot meanwhile: column borrows
+    /// do not see gc guards.
     pub(crate) unsafe fn new(
         archetype: &'a Archetype,
         index: u32,
@@ -165,6 +174,10 @@ pub struct RefMut<'a, T: Component> {
 }
 
 impl<'a, T: Component> RefMut<'a, T> {
+    /// Borrow `T` of row `index` uniquely (a unique column borrow, released on drop).
+    ///
+    /// # Safety
+    /// As [`Ref::new`], and no gc guard of either kind on the slot while the `RefMut` lives.
     pub(crate) unsafe fn new(
         archetype: &'a Archetype,
         index: u32,
@@ -228,7 +241,9 @@ pub trait ComponentRef<'a> {
     ///
     /// # Safety
     ///
-    /// Dereferencing `raw` for lifetime `'a` must be sound
+    /// Dereferencing `raw` for lifetime `'a` must be sound: it points to a valid
+    /// `Self::Component`, and for `'a` nothing else writes it (for `&'a T`), or nothing else
+    /// reads or writes it at all (for `&'a mut T`), including gc guards and column borrows.
     #[doc(hidden)]
     unsafe fn from_raw(raw: *mut Self::Component) -> Self;
 
@@ -236,7 +251,9 @@ pub trait ComponentRef<'a> {
     ///
     /// # Safety
     ///
-    /// Dereferencing `raw` for lifetime `'a` must be sound
+    /// Dereferencing `raw` for lifetime `'a` must be sound: it points to a valid
+    /// `Self::Component`, and for `'a` nothing else writes it (for `&'a T`), or nothing else
+    /// reads or writes it at all (for `&'a mut T`), including gc guards and column borrows.
     #[doc(hidden)]
     unsafe fn from_raw_gc(raw: *mut GC<Self::Component>) -> Self;
 

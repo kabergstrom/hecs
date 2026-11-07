@@ -16,7 +16,8 @@ impl<'a, Q: Query> QueryOne<'a, Q> {
     ///
     /// # Safety
     ///
-    /// `index` must be in-bounds for `archetype`
+    /// `index` must be an occupied row of `archetype` (in bounds), and stay so (STRUCT) while
+    /// the `QueryOne` and its results live.
     pub(crate) unsafe fn new(archetype: &'a Archetype, index: u32) -> Self {
         Self {
             archetype,

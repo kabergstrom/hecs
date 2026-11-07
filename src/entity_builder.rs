@@ -300,7 +300,7 @@ impl<M> Common<M> {
         }
     }
 
-    fn get_mut<'a, T: ComponentRef<'a>>(&'a self) -> Option<T> {
+    fn get_mut<'a, T: ComponentRef<'a>>(&'a mut self) -> Option<T> {
         let index = self.indices.get(&T::Component::STABLE_TYPE_ID)?;
         let (_, offset, _) = self.info[*index];
         unsafe {
@@ -313,6 +313,11 @@ impl<M> Common<M> {
         self.info.iter().map(|(info, _, _)| info.id())
     }
 
+    /// A fresh allocation of at least `min_size` bytes aligned to `align`, holding the first
+    /// `cursor` bytes of `storage`. The caller frees the old one.
+    ///
+    /// # Safety
+    /// `storage` is valid for `cursor` bytes of reads; `align` is a power of two.
     unsafe fn grow(
         min_size: usize,
         cursor: usize,
@@ -336,6 +341,10 @@ impl<M> Common<M> {
         }
     }
 
+    /// Take ownership of the `ty` at `ptr` (bitwise), replacing any earlier one of that type.
+    ///
+    /// # Safety
+    /// `ptr` points to a valid `ty` that the caller then forgets (never uses or drops).
     unsafe fn add(&mut self, ptr: *mut u8, ty: TypeInfo, meta: M) {
         match self.indices.entry(ty.id()) {
             Entry::Occupied(occupied) => {

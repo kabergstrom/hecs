@@ -177,6 +177,10 @@ unsafe impl<'a, T: Component> Fetch<'a> for FetchRead<T> {
     unsafe fn get(&self, n: usize) -> Self::Item {
         let mut chunk = self.current_chunk.get();
         #[cold]
+        /// Point the cache at the chunk holding slot `n`.
+        ///
+        /// # Safety
+        /// As [`Fetch::get`]: `n` is below the allocated slots, so its chunk exists.
         unsafe fn change_chunk<T>(
             this: &FetchRead<T>,
             mut chunk: CachedChunk,
@@ -283,6 +287,10 @@ unsafe impl<'a, T: Component> Fetch<'a> for FetchWrite<T> {
     unsafe fn get(&self, n: usize) -> Self::Item {
         let mut chunk = self.current_chunk.get();
         #[cold]
+        /// Point the cache at the chunk holding slot `n`.
+        ///
+        /// # Safety
+        /// As [`Fetch::get`]: `n` is below the allocated slots, so its chunk exists.
         unsafe fn change_chunk<T>(
             this: &FetchWrite<T>,
             mut chunk: CachedChunk,
@@ -995,6 +1003,12 @@ impl<Q: Query> ChunkIter<Q> {
     }
 
     #[inline]
+    /// Yield the next occupied row's entity and fetched item.
+    ///
+    /// # Safety
+    /// The fetch was prepared for this chunk run and is borrowed (see `Fetch::get`); `entities`
+    /// and `len` describe the same archetype rows, unchanged since (STRUCT); no concurrent NS
+    /// writer of the entity column.
     unsafe fn next<'a>(&mut self) -> Option<(Entity, <Q::Fetch as Fetch<'a>>::Item)> {
         while self.position < self.len {
             let cell = &*self.entities.as_ptr().add(self.position);

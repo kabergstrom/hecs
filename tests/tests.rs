@@ -1178,15 +1178,15 @@ fn query_dynamic_walks_each_column_by_its_own_chunks() {
     let ids = [<u8 as Component>::STABLE_TYPE_ID, <[u8; 256] as Component>::STABLE_TYPE_ID];
     use std::convert::TryInto;
     let check = |small: &hecs::gc::GCPtr, big: &hecs::gc::GCPtr| unsafe {
-        let small = *small.value.as_ptr();
-        let big = &*(big.value.as_ptr() as *const [u8; 256]);
+        let small = *small.value().as_ptr();
+        let big = &*(big.value().as_ptr() as *const [u8; 256]);
         let i = u32::from_le_bytes(big[..4].try_into().unwrap());
         i < N && i % 7 != 3 && small == (i % 251) as u8 && big[255] == small
     };
     let (mut rows, mut wrong) = (0, 0);
     world.query_dynamic(&ids, &mut |e, p| {
         rows += 1;
-        let i = u32::from_le_bytes(unsafe { &*(p[1].value.as_ptr() as *const [u8; 256]) }[..4].try_into().unwrap());
+        let i = u32::from_le_bytes(unsafe { &*(p[1].value().as_ptr() as *const [u8; 256]) }[..4].try_into().unwrap());
         wrong += (!check(&p[0], &p[1]) || entities.get(i as usize) != Some(&e)) as u32;
     });
     assert_eq!((rows, wrong), (live, 0));

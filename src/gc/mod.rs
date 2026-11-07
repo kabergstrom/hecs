@@ -24,28 +24,61 @@ use crate::{
 };
 use alloc::vec::Vec;
 
+/// A pointer to the value of one component slot in a [`World`]'s column storage.
+///
+/// The slot's [`GCHeader`] sits immediately before the value, and the chunk's storage header
+/// at the start of the `DATA_CHUNK_SIZE_BYTES`-aligned chunk the value lives in. The safe
+/// methods (`header_ptr`, `world_slot`, `archetype_slot`, `archetype`, `resolve_moved`) read
+/// those headers. They are sound because a `GCPtr` is only ever made by hecs from a slot of a
+/// live chunk, or through [`GCPtr::from_raw`], whose contract requires the same.
 #[derive(Debug, PartialEq, Eq, Clone, Copy, Hash)]
 #[repr(transparent)]
 pub struct GCPtr {
-    pub value: NonNull<u8>,
+    value: NonNull<u8>,
 }
+// SAFETY: a `GCPtr` is `Send + Sync` so that `CRef<T>`, and the components holding one, meet
+// `Component: Send + Sync`. Nothing reachable through it is synchronized: the slot header's
+// borrow flag is a `Cell`, and its state and `referenced` fields are written without atomics.
+// It is sound only under the engine's invariant that module code, and every touch of a slot
+// (deref, `CRef::read`/`write`, `mark_referenced`, `resolve_moved`, `gc::sweep`), runs on the
+// thread that owns the `World`. Modules are `no_std` and cannot spawn threads. What would
+// break the invariant, and must not be added without first making the headers atomic: running
+// module type-op or VFX thunks on worker threads, or parallel physics with module callbacks.
 unsafe impl Send for GCPtr {}
+// SAFETY: see the `Send` impl above.
 unsafe impl Sync for GCPtr {}
 impl GCPtr {
+    /// Wrap a slot's value pointer.
+    ///
+    /// # Safety
+    /// `value` must be the value pointer of a slot in a still-allocated chunk of a live
+    /// [`World`] (any [`State`]; the world's [dead slot](World::dead_gc_ptr) counts), and that
+    /// `World` must outlive every use of the returned `GCPtr` and of its copies: the safe
+    /// methods dereference the slot and chunk headers through it. A placeholder that breaks
+    /// this is allowed only if no method is called on it and it is never turned into a `CRef`.
+    #[inline]
+    pub const unsafe fn from_raw(value: NonNull<u8>) -> Self {
+        Self { value }
+    }
+
+    /// The slot's value pointer (same as [`value_ptr`](Self::value_ptr)).
+    #[inline]
+    pub const fn value(&self) -> NonNull<u8> {
+        self.value
+    }
+
     pub fn header_ptr(&self) -> NonNull<GCHeader> {
-        unsafe {
-            assert!(
-                self.value.as_ptr().sub(core::mem::size_of::<GCHeader>()) as usize
-                    % (core::alloc::Layout::new::<GCHeader>().align())
-                    == 0
-            );
-            NonNull::new_unchecked(
-                self.value
-                    .as_ptr()
-                    .sub(core::mem::size_of::<GCHeader>())
-                    .cast(),
-            )
-        }
+        // The header precedes the value inside the chunk, so this stays in bounds for any
+        // `GCPtr` that meets `from_raw`'s contract. `wrapping_sub` keeps computing the address
+        // free of UB even for a misused placeholder.
+        let header = self
+            .value
+            .as_ptr()
+            .wrapping_sub(core::mem::size_of::<GCHeader>());
+        assert!(header as usize % core::mem::align_of::<GCHeader>() == 0);
+        // SAFETY: the value lies at least `size_of::<GCHeader>()` past its chunk's start, so
+        // the header address is non-null.
+        unsafe { NonNull::new_unchecked(header.cast()) }
     }
     pub(crate) fn storage_header(&self) -> *const StorageHeader {
         let storage_header_addr = self.value.as_ptr() as usize;
@@ -91,10 +124,14 @@ impl GCPtr {
         unsafe { (*self.storage_header()).archetype }
     }
 
-    /// Returns the [`Entity`] associated with this slot.
+    /// Returns the [`Entity`] associated with this slot. Its id is `u32::MAX` when the row is
+    /// free.
     ///
     /// # Safety
-    /// The owning `World` must still be alive.
+    /// - The slot belongs to an archetype: it is not the world's
+    ///   [dead slot](World::dead_gc_ptr), whose archetype pointer is null.
+    /// - No NS writer on another thread is changing the archetype's entity column (the
+    ///   lookup reads it through a shared slice that a concurrent grow could free).
     pub unsafe fn entity(&self) -> Entity {
         (*self.archetype()).entity(self.archetype_slot())
     }
@@ -104,7 +141,14 @@ impl GCPtr {
     /// component.
     ///
     /// # Safety
-    /// The owning `World` must still be alive.
+    /// - The slot belongs to an archetype (not the world's [dead slot](World::dead_gc_ptr)).
+    /// - The slot's row is occupied by an entity (see
+    ///   [`Archetype::get_dynamic_by_id`]): a row that was vacated by a move, despawn or sweep
+    ///   may since have been reused by another entity, whose sibling this would return.
+    /// - No concurrent NS writer on another thread.
+    ///
+    /// Dereferencing the returned pointer later needs STRUCT, a gc borrow and the matching
+    /// type, as for any `GCPtr`.
     pub unsafe fn sibling_by_id(&self, id: StableTypeId) -> Option<GCPtr> {
         (*self.archetype()).get_dynamic_by_id(id, self.archetype_slot())
     }
@@ -113,7 +157,7 @@ impl GCPtr {
     /// the same entity, or `None` if the archetype does not contain `T`.
     ///
     /// # Safety
-    /// The owning `World` must still be alive.
+    /// As [`sibling_by_id`](Self::sibling_by_id).
     pub unsafe fn sibling<T: Component>(&self) -> Option<GCPtr> {
         self.sibling_by_id(T::STABLE_TYPE_ID)
     }
@@ -122,87 +166,165 @@ impl GCPtr {
     //     self.header_ptr().as_ptr().drop_in_place();
     //     ty.drop_value(self.value_ptr().as_ptr());
     // }
+    /// The `GCPtr` of the slot that starts at `base`, whose value lies `data_start` bytes in.
+    ///
+    /// # Safety
+    /// `base` is the start of a slot (where its [`GCHeader`] storage begins) in a
+    /// still-allocated chunk of a live `World`, and `data_start` is that column's value offset
+    /// ([`Data::value_start`](crate::Data::value_start), i.e. [`TypeInfo::data_start`]). The
+    /// result must then meet [`from_raw`](Self::from_raw)'s contract.
     pub unsafe fn from_base_with_offset(data_start: usize, base: NonNull<u8>) -> Self {
         Self {
             value: NonNull::new_unchecked(base.as_ptr().add(data_start)),
         }
     }
+    /// The `GCPtr` of the slot of a `ty` column that starts at `base`.
+    ///
+    /// # Safety
+    /// As [`from_base_with_offset`](Self::from_base_with_offset), with `ty` the column's type.
     pub unsafe fn from_base(ty: &TypeInfo, base: NonNull<u8>) -> Self {
         Self {
             value: NonNull::new_unchecked(base.as_ptr().add(ty.data_start())),
         }
     }
 
-    pub unsafe fn mark_tombstone(&mut self) {
-        self.header_ptr().as_mut().set_tombstone();
+    /// The slot header's `state`, projected through raw pointers. Header writes go through
+    /// this (and [`referenced_ptr`](Self::referenced_ptr)) rather than a `&mut GCHeader`,
+    /// because a gc borrow guard holds a `&Cell` to the borrow flag inside `state`, which a
+    /// `&mut GCHeader` would alias.
+    #[inline]
+    fn state_ptr(&self) -> *mut State {
+        // SAFETY: the header is in bounds of the slot (from_raw's contract); `addr_of_mut!`
+        // makes no reference.
+        unsafe { core::ptr::addr_of_mut!((*self.header_ptr().as_ptr()).state) }
     }
 
+    /// The slot header's `referenced` flag; see [`state_ptr`](Self::state_ptr).
+    #[inline]
+    fn referenced_ptr(&self) -> *mut bool {
+        // SAFETY: as `state_ptr`.
+        unsafe { core::ptr::addr_of_mut!((*self.header_ptr().as_ptr()).referenced) }
+    }
+
+    /// Whether the slot is `Alive`, not pending dead, and free of gc borrow guards: the only
+    /// state in which its value may be moved out (`move_from`, `migrate_from`,
+    /// `mark_tombstone`). Insert and remove check every slot they would move with this before
+    /// changing anything.
+    #[inline]
+    pub(crate) fn is_movable(&self) -> bool {
+        // SAFETY: a short shared `&State` may coexist with a guard's `&Cell` (the flag is
+        // interior-mutable); the slot is valid by from_raw's contract.
+        matches!(
+            unsafe { &*self.state_ptr() },
+            State::Alive { borrow, pending_dead: false } if borrow.get() == 0
+        )
+    }
+
+    /// Set the slot's state to `Dead` without dropping its value; the caller has taken (or
+    /// will take) ownership of the value.
+    ///
+    /// # Safety
+    /// - NS.
+    /// - The slot is movable: `Alive`, not pending dead, with no gc borrow guard (`CRef`
+    ///   `Ref`/`RefMut`) held on it. A guard keeps a `&Cell` to the borrow flag, which this
+    ///   overwrites. Only debug-checked: callers refuse the operation beforehand.
+    /// - No column borrows on it, and no `&T`/`&mut T` into the value used afterwards.
+    /// - The value is moved out exactly once (or deliberately leaked), never dropped in place.
+    pub unsafe fn mark_tombstone(&mut self) {
+        debug_assert!(self.is_movable(), "tombstoning a borrowed or dead slot");
+        self.state_ptr().write(State::Dead);
+    }
+
+    /// Hand the value to `f` (pointer plus type, for it to move out) and set the slot `Dead`.
+    ///
+    /// # Safety
+    /// As [`mark_tombstone`](Self::mark_tombstone) (the slot is movable: its only caller,
+    /// [`TakenEntity`](crate::TakenEntity), comes from [`World::take`](crate::World::take),
+    /// which refuses a row with a borrowed slot), and `ty` is the slot's column type. `f` must
+    /// move the value out (or leak it); the slot never drops it.
     pub unsafe fn move_value_and_tombstone(
         &mut self,
         ty: &TypeInfo,
         mut f: impl FnMut(*mut u8, TypeInfo),
     ) {
         f(self.value_ptr().as_ptr(), ty.clone());
-        self.header_ptr().as_mut().set_tombstone();
+        self.state_ptr().write(State::Dead);
     }
     /// Mark this slot referenced so tombstone sweep spares it. Propagates
     /// along the `Moved` forwarding chain: a referenced tombstone is only
     /// resolvable if every intermediate hop survives the sweep too.
+    ///
+    /// # Safety
+    /// - NS, and no `gc::sweep` runs concurrently.
+    /// - Every slot on the `Moved` chain is in a still-allocated chunk: no sweep has freed a
+    ///   hop since this `GCPtr` was last known to reach a referenced slot. (Callers mark from
+    ///   roots during a mark phase, before the sweep that would free unmarked hops.)
     pub unsafe fn mark_referenced(&mut self) {
         let mut ptr = *self;
         loop {
-            let header = ptr.header_ptr().as_mut();
-            header.referenced = true;
-            match header.state {
-                State::Moved { new_ptr } => ptr = new_ptr,
+            ptr.referenced_ptr().write(true);
+            match &*ptr.state_ptr() {
+                State::Moved { new_ptr } => ptr = *new_ptr,
                 _ => break,
             }
         }
     }
+    /// Drop the slot's value and set it `Dead`, or, if a gc borrow guard is held on it, set
+    /// `pending_dead` so the first `gc::sweep` after the last guard goes drops it.
+    ///
+    /// # Safety
+    /// - NS.
+    /// - The slot is `Alive` (else this panics), and `ty` is its column type.
+    /// - No column borrows on it, and no `&T`/`&mut T` into the value (other than through a
+    ///   gc guard, which the `pending_dead` path keeps valid) is used afterwards.
     pub unsafe fn drop_value_and_tombstone(&mut self, ty: &TypeInfo) {
-        let header = self.header_ptr().as_mut();
-        match &mut header.state {
-            State::Alive {
-                borrow,
-                pending_dead,
-            } => {
-                if borrow.get() == 0 {
-                    ty.drop_value(self.value_ptr().as_ptr());
-                    header.set_tombstone();
-                } else {
-                    *pending_dead = true;
-                }
-            }
-            ref state => {
-                panic!("unexpected state when dropping value: {:?}", state)
-            }
+        let state = self.state_ptr();
+        let borrowed = match &*state {
+            State::Alive { borrow, .. } => borrow.get() != 0,
+            other => panic!("unexpected state when dropping value: {:?}", other),
+        };
+        if !borrowed {
+            ty.drop_value(self.value_ptr().as_ptr());
+            state.write(State::Dead);
+        } else {
+            // Write only the flag's byte: the guard's `&Cell` covers the borrow flag next to it.
+            state
+                .cast::<u8>()
+                .add(core::mem::offset_of!(AliveRepr, pending_dead))
+                .cast::<bool>()
+                .write(true);
         }
     }
+    /// Move `value` (a `ty`, bitwise) into this free slot and make it `Alive`. The caller must
+    /// not use or drop `value` afterwards.
+    ///
+    /// # Safety
+    /// NS; the slot is `Free` (asserted) and of a `ty` column; `value` points to a valid `ty`
+    /// that does not overlap the slot.
     pub unsafe fn move_from_value(&mut self, ty: &TypeInfo, value: *mut u8) {
         let dst_header = self.header_ptr().as_ptr();
-        assert!(matches!(dst_header.read().state, State::Free { .. }));
+        assert!(matches!(&*self.state_ptr(), State::Free { .. }));
         dst_header.write(GCHeader::new_alive());
         core::ptr::copy_nonoverlapping(value, self.value_ptr().as_ptr(), ty.value_layout().size());
     }
 
+    /// Move `src`'s value (a `ty`, bitwise) into this free slot; `src` becomes a `Moved`
+    /// tombstone forwarding here.
+    ///
+    /// # Safety
+    /// NS; this slot is `Free` and of a `ty` column; `src` is a different, movable slot
+    /// ([`is_movable`](Self::is_movable)) of a `ty` column, checked by the caller before the
+    /// operation began (only debug-asserted here); no column borrows on `src`.
     pub(crate) unsafe fn move_from(&mut self, ty: &TypeInfo, src: GCPtr) {
-        assert!(src != *self);
-        let dst_header = self.header_ptr().as_mut();
-        assert!(matches!(dst_header.state, State::Free { .. }));
-        let src_header = src.header_ptr().as_mut();
-        // Need source to be alive with no active borrows
-        assert!(
-            src_header.state
-                == State::Alive {
-                    borrow: Cell::new(0),
-                    pending_dead: false,
-                }
-        );
-        dst_header.state = State::Alive {
+        debug_assert!(src != *self);
+        debug_assert!(matches!(&*self.state_ptr(), State::Free { .. }));
+        // Need source to be alive with no active borrows: callers check before they start.
+        debug_assert!(src.is_movable(), "moving a borrowed or dead slot");
+        self.state_ptr().write(State::Alive {
             borrow: Cell::new(0),
             pending_dead: false,
-        };
-        src_header.state = State::Moved { new_ptr: *self };
+        });
+        src.state_ptr().write(State::Moved { new_ptr: *self });
         core::ptr::copy_nonoverlapping(
             src.value_ptr().as_ptr(),
             self.value_ptr().as_ptr(),
@@ -213,23 +335,19 @@ impl GCPtr {
     /// Like `move_from`, but `f(src_value, dst_value)` builds the destination
     /// value (a layout change) instead of a bitwise copy. `f` consumes the
     /// source value; it is never dropped.
+    ///
+    /// # Safety
+    /// As [`move_from`](Self::move_from), with `f` initializing a valid value of this slot's
+    /// column type from `src`'s.
     pub(crate) unsafe fn migrate_from(&mut self, src: GCPtr, f: impl FnOnce(*mut u8, *mut u8)) {
-        assert!(src != *self);
-        let dst_header = self.header_ptr().as_mut();
-        assert!(matches!(dst_header.state, State::Free { .. }));
-        let src_header = src.header_ptr().as_mut();
-        assert!(
-            src_header.state
-                == State::Alive {
-                    borrow: Cell::new(0),
-                    pending_dead: false,
-                }
-        );
-        dst_header.state = State::Alive {
+        debug_assert!(src != *self);
+        debug_assert!(matches!(&*self.state_ptr(), State::Free { .. }));
+        debug_assert!(src.is_movable(), "migrating a borrowed or dead slot");
+        self.state_ptr().write(State::Alive {
             borrow: Cell::new(0),
             pending_dead: false,
-        };
-        src_header.state = State::Moved { new_ptr: *self };
+        });
+        src.state_ptr().write(State::Moved { new_ptr: *self });
         f(src.value_ptr().as_ptr(), self.value_ptr().as_ptr());
     }
 
@@ -249,6 +367,16 @@ impl GCPtr {
             State::Free { .. } | State::Alive { .. } => false,
         }
     }
+}
+
+/// The layout of [`State::Alive`]: `#[repr(u8)]` lays each variant out as a `#[repr(C)]`
+/// struct led by the `u8` tag (RFC 2195). Lets `drop_value_and_tombstone` write the
+/// `pending_dead` byte alone, beside a guard's `&Cell` to `borrow`.
+#[repr(C)]
+struct AliveRepr {
+    tag: u8,
+    borrow: Cell<BorrowFlag>,
+    pending_dead: bool,
 }
 
 #[derive(PartialEq, Debug)]
@@ -655,26 +783,29 @@ pub unsafe fn sweep(world: &World) -> u32 {
             let mut can_free = true;
             for (ty, iter) in &mut archetype_iter_set {
                 let gc_ptr = iter.next().unwrap();
-                let header = &mut *gc_ptr.header_ptr().as_ptr();
-                let freeable = match &mut header.state {
+                // Raw projections, not `&mut GCHeader`: a guard may still hold a `&Cell` into
+                // a pending-dead slot's header.
+                let state = gc_ptr.state_ptr();
+                let referenced = gc_ptr.referenced_ptr();
+                let freeable = match &*state {
                     State::Alive {
                         borrow,
                         pending_dead: true,
                     } => {
                         if borrow.get() == 0 {
                             ty.drop_value(gc_ptr.value_ptr().as_ptr());
-                            header.set_tombstone();
-                            !header.referenced
+                            state.write(State::Dead);
+                            !referenced.read()
                         } else {
                             false
                         }
                     }
                     // Inline can_free logic — header already dereferenced
-                    State::Dead | State::Moved { .. } => !header.referenced,
+                    State::Dead | State::Moved { .. } => !referenced.read(),
                     _ => false,
                 };
                 // Reset referenced flag in the same pass
-                header.referenced = false;
+                referenced.write(false);
                 can_free &= freeable;
             }
             if !can_free {
@@ -732,6 +863,12 @@ pub(crate) fn alloc_world_slot() -> NonZeroU32 {
     panic!("max 256 worlds active concurrently")
 }
 
+/// Release a world slot for reuse.
+///
+/// # Safety
+/// `slot` was allocated by `alloc_world_slot` for a `World` being dropped: no `GCPtr`, `CRef`
+/// or guard of that world is used afterwards (a reused slot would make them look like
+/// another world's).
 pub(crate) unsafe fn free_world_slot(slot: NonZeroU32) {
     // Defensive: ensure a freed slot can't leak GcDynamic/ReadOnly into its next user.
     SLOT_MODE[slot.get() as usize].store(SlotMode::Off as u8, Ordering::Relaxed);
@@ -739,6 +876,9 @@ pub(crate) unsafe fn free_world_slot(slot: NonZeroU32) {
     WORLD_SLOT_ALLOCATED[slot.get() as usize].store(0, Ordering::Relaxed);
 }
 
+/// # Safety
+/// `slot` is the world slot of the `World` a `GcWorld` scope is opening on, with `&mut` access
+/// to it.
 pub(crate) unsafe fn enable_gc_borrows(slot: NonZeroU32) {
     // Reset depth before flipping mode so that any leaked ReadWorld depth from a prior
     // GcWorld lifecycle (e.g. via `mem::forget`) cannot poison this fresh slot — otherwise
@@ -747,6 +887,8 @@ pub(crate) unsafe fn enable_gc_borrows(slot: NonZeroU32) {
     SLOT_MODE[slot.get() as usize].store(SlotMode::GcDynamic as u8, Ordering::Relaxed);
 }
 
+/// # Safety
+/// As [`enable_gc_borrows`], at the close of that scope.
 pub(crate) unsafe fn disable_gc_borrows(slot: NonZeroU32) {
     // Reset depth as well so a leaked ReadWorld cannot survive past its parent GcWorld.
     READ_ONLY_DEPTH[slot.get() as usize].store(0, Ordering::Relaxed);
@@ -755,6 +897,10 @@ pub(crate) unsafe fn disable_gc_borrows(slot: NonZeroU32) {
 
 /// Enter a nested ReadOnly scope on `slot`. Returns the new depth.
 /// If the depth transitions from 0 to 1, the slot mode flips to ReadOnly.
+///
+/// # Safety
+/// `slot` belongs to a `World` in a `GcWorld` scope; each call is paired with one
+/// [`exit_read_only`] when the `ReadWorld` ends.
 pub(crate) unsafe fn enter_read_only(slot: NonZeroU32) -> u32 {
     let prev = READ_ONLY_DEPTH[slot.get() as usize].fetch_add(1, Ordering::Relaxed);
     // Catch silent wrap. With AtomicU32 this is effectively unreachable, but if we ever
@@ -767,6 +913,9 @@ pub(crate) unsafe fn enter_read_only(slot: NonZeroU32) -> u32 {
 }
 
 /// Leave a ReadOnly scope on `slot`. When depth returns to 0, mode flips back to GcDynamic.
+///
+/// # Safety
+/// Pairs with an earlier [`enter_read_only`] on the same `slot`.
 pub(crate) unsafe fn exit_read_only(slot: NonZeroU32) {
     let prev = READ_ONLY_DEPTH[slot.get() as usize].fetch_sub(1, Ordering::Relaxed);
     debug_assert!(prev > 0, "exit_read_only without matching enter");

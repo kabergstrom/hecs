@@ -44,6 +44,11 @@ impl CommandBuffer {
         Self::default()
     }
 
+    /// A fresh allocation of at least `min_size` bytes aligned to `align`, holding the first
+    /// `cursor` bytes of `storage`. The caller frees the old one.
+    ///
+    /// # Safety
+    /// `storage` is valid for `cursor` bytes of reads; `align` is a power of two.
     unsafe fn grow(
         min_size: usize,
         cursor: usize,
@@ -56,6 +61,10 @@ impl CommandBuffer {
         (new_storage, layout)
     }
 
+    /// Take ownership of the `ty` at `ptr` (bitwise).
+    ///
+    /// # Safety
+    /// `ptr` points to a valid `ty` that the caller then forgets (never uses or drops).
     unsafe fn add_inner(&mut self, ptr: *mut u8, ty: TypeInfo) {
         let offset = align(self.cursor, ty.value_layout().align());
         let end = offset + ty.value_layout().size();

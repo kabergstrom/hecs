@@ -26,6 +26,8 @@ impl From<ComponentError> for FetchError {
         match e {
             ComponentError::NoSuchEntity => Self::NoSuchEntity,
             ComponentError::MissingComponent(c) => Self::MissingComponent(c),
+            // Only insert and remove refuse with `Borrowed`; no fetch produces it.
+            ComponentError::Borrowed => Self::InvalidMatch,
         }
     }
 }
@@ -586,6 +588,12 @@ impl<Q: Query> ChunkIter<Q> {
     }
 
     #[inline]
+    /// Yield the next occupied row's entity and fetched item.
+    ///
+    /// # Safety
+    /// The fetch was prepared for this chunk run and is borrowed (see `Fetch::get`); `entities`
+    /// and `len` describe the same archetype rows, unchanged since (STRUCT); no concurrent NS
+    /// writer of the entity column.
     unsafe fn next<'a>(&mut self) -> Option<(Entity, <Q::Fetch as Fetch<'a>>::Item)> {
         while self.position < self.len {
             let cell = &*self.entities.as_ptr().add(self.position);

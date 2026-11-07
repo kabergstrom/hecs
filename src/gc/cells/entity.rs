@@ -14,6 +14,11 @@ use crate::Entity;
 /// "free" value used for reset/fill is [`Entity::DANGLING`]'s bit pattern.
 #[repr(transparent)]
 pub struct EntityCell(UnsafeCell<u64>);
+// SAFETY: the safe `&self` methods are atomic (the value is accessed as the matching atomic,
+// which has the same layout); the `*_nonsync` methods are `unsafe` with an NS contract. The
+// `Into` impl for `&Self` (where there is one) is a plain read: it is crate-internal and only
+// used under NS. Cross-thread use beyond the atomics relies on the engine's invariant that the
+// `World` is only touched from its owning thread (see the `Send` impl of `gc::GCPtr`).
 unsafe impl Sync for EntityCell {}
 unsafe impl Send for EntityCell {}
 
@@ -55,15 +60,31 @@ impl EntityCell {
     pub fn store_free_atomic(&self, ordering: Ordering) {
         unsafe { (&*self.0.get().cast::<AtomicU64>()).store(FREE_BITS, ordering) }
     }
+    /// Plain (non-atomic) write.
+    ///
+    /// # Safety
+    /// NS: no other thread reads or writes this cell concurrently.
     pub unsafe fn write_nonsync(&self, entity: Entity) {
         self.0.get().write(pack(entity))
     }
+    /// Plain (non-atomic) write of the free pattern.
+    ///
+    /// # Safety
+    /// As [`write_nonsync`](Self::write_nonsync).
     pub unsafe fn write_free_nonsync(&self) {
         self.0.get().write(FREE_BITS)
     }
+    /// Plain (non-atomic) read.
+    ///
+    /// # Safety
+    /// NS: no other thread writes this cell concurrently.
     pub unsafe fn read_nonsync(&self) -> Entity {
         unpack(*self.0.get())
     }
+    /// Plain (non-atomic) read of the id half.
+    ///
+    /// # Safety
+    /// As [`read_nonsync`](Self::read_nonsync).
     pub unsafe fn read_id_nonsync(&self) -> u32 {
         *self.0.get() as u32
     }

@@ -152,7 +152,15 @@ impl SpawnColumn<'_> {
     }
 }
 
+/// World-private state written through `&self` by the `*_nonsync` paths (archetype edge
+/// caches, the vacate journal). A plain `UnsafeCell` with no synchronization at all.
 struct NonSyncCell<T>(UnsafeCell<T>);
+// SAFETY: only `World` touches the contents: its `&mut self` methods through `get_mut`, and its
+// `unsafe` `*_nonsync` methods, whose NS contract rules out any other thread touching the
+// `World` during the call. Safe `&self` methods never read it. So sharing `&World` across
+// threads is sound as long as the engine's invariant holds that nothing runs `*_nonsync` (or
+// module code, which reaches them) off the world's thread; see the `Send` impl of `gc::GCPtr`
+// for what would break it. `T` holds only plain data (`HashMap`s of keys, `Vec<Vacated>`).
 unsafe impl<T> Sync for NonSyncCell<T> {}
 
 impl World {
@@ -214,6 +222,11 @@ impl World {
         entity
     }
 
+    /// [`spawn`](Self::spawn) through `&self`.
+    ///
+    /// # Safety
+    /// NS (`components.put` must not re-enter this `World`). It may create an archetype, so no
+    /// [`archetypes`](Self::archetypes) or [`iter`](Self::iter) iterator may span the call.
     pub unsafe fn spawn_nonsync(&self, components: impl DynamicBundle) -> Entity {
         // Ensure all entity allocations are accounted for so `self.entities` can realloc if
         // necessary
@@ -379,6 +392,8 @@ impl World {
             };
         }
     }
+    /// # Safety
+    /// As [`spawn_nonsync`](Self::spawn_nonsync), with `entity` freshly allocated and unplaced.
     unsafe fn spawn_inner_nonsync(&self, entity: Entity, components: impl DynamicBundle) {
         let archetype_id = match components.key() {
             Some(k) => {
@@ -562,6 +577,12 @@ impl World {
         Ok(())
     }
 
+    /// [`despawn`](Self::despawn) through `&self`. A borrowed component is dropped by the first
+    /// [`gc::sweep`](crate::gc::sweep) after its last gc guard goes.
+    ///
+    /// # Safety
+    /// NS. No column borrows on the entity's components, and no [`EntityRef`] of it used
+    /// afterwards.
     pub unsafe fn despawn_nonsync(&self, entity: Entity) -> Result<(), NoSuchEntity> {
         self.flush_nonsync();
         let loc = self.entities.get(entity)?;
@@ -573,6 +594,8 @@ impl World {
         Ok(())
     }
 
+    /// # Safety
+    /// As [`despawn_nonsync`](Self::despawn_nonsync).
     unsafe fn despawn_held_nonsync(&self, entity: Entity) -> Result<(), NoSuchEntity> {
         let loc = self.entities.hold_nonsync(entity)?;
         let arch = &self.archetypes.archetypes[loc.archetype];
@@ -653,6 +676,9 @@ impl World {
     }
 
     /// After a move out of `archetype`'s slot `index`.
+    ///
+    /// # Safety
+    /// NS; `index` is a slot of `archetype` that was just vacated by `entity`.
     unsafe fn quarantine_vacated(&self, archetype: sharedvec::DefaultKey, index: u32, entity: Entity) {
         if self.quarantines(archetype) {
             self.archetypes.archetypes[archetype].set_quarantined_nonsync(index, true);
@@ -660,6 +686,11 @@ impl World {
         }
     }
 
+    /// Append to the vacate journal.
+    ///
+    /// # Safety
+    /// NS, and no slice from [`vacated_nonsync`](Self::vacated_nonsync) is alive (the push
+    /// may reallocate it).
     pub(crate) unsafe fn journal_vacate(
         &self,
         archetype: sharedvec::DefaultKey,
@@ -679,7 +710,8 @@ impl World {
     /// oldest first. Read-only, so a capture can consume it with a cursor.
     ///
     /// # Safety
-    /// No concurrent structural change of this world while the slice is alive.
+    /// STRUCT while the slice is alive (anything that vacates a slot journals into it, which may
+    /// reallocate it), and no concurrent NS writer.
     pub unsafe fn vacated_nonsync(&self) -> &[Vacated] {
         &*self.vacated.0.get()
     }
@@ -852,9 +884,8 @@ impl World {
         let value = unsafe {
             chunk.add(dead_slot_data_start() + core::mem::size_of::<crate::gc::GCHeader>())
         };
-        crate::gc::GCPtr {
-            value: unsafe { ptr::NonNull::new_unchecked(value) },
-        }
+        // SAFETY: the value pointer of the dead slot, in a chunk the world frees on drop.
+        unsafe { crate::gc::GCPtr::from_raw(ptr::NonNull::new_unchecked(value)) }
     }
 
     /// A `CRef<T>` to the [always-dead slot](Self::dead_gc_ptr).
@@ -926,6 +957,20 @@ impl World {
             .filter(|(_, a)| a.type_ids().iter().any(|&id| changed(id).is_some()))
             .map(|(key, _)| key)
             .collect();
+        // Every live slot moves. A gc borrow guard can outlive its `GcWorld` scope, so check all
+        // of them before changing anything: a panic here leaves the world as it was.
+        for &key in &affected {
+            let old = &self.archetypes.archetypes[key];
+            // SAFETY: we have &mut self; the rows are below the allocated slots.
+            unsafe {
+                for index in 0..old.allocated_values_nonsync() {
+                    assert!(
+                        old.entity(index).id == u32::MAX || old.row_movable(index, |_| false),
+                        "migrate_components: a component is borrowed"
+                    );
+                }
+            }
+        }
         for old_key in affected {
             let old = &self.archetypes.archetypes[old_key];
             let mut types: Vec<TypeInfo> = old
@@ -1067,7 +1112,11 @@ impl World {
     /// is not alive.
     ///
     /// # Safety
-    /// `ptr` must be a valid GCPtr originating from this World.
+    /// - `ptr` points into a still-allocated chunk of a live `World` (this one or another, which
+    ///   is rejected by its world slot).
+    /// - No sweep has freed a slot of its `Moved` chain since `ptr` was last known to resolve:
+    ///   [`resolve_moved`](crate::gc::GCPtr::resolve_moved) follows the chain.
+    /// - No concurrent NS writer on another thread.
     pub unsafe fn entity_from_gc_ptr(&self, ptr: crate::gc::GCPtr) -> Option<Entity> {
         if ptr.world_slot() != self.world_slot {
             return None;
@@ -1200,8 +1249,10 @@ impl World {
     ///
     /// # Safety
     ///
-    /// `id` must correspond to a currently live [`Entity`]. A despawned or never-allocated `id`
-    /// will produce undefined behavior.
+    /// No concurrent NS writer on another thread (it reads the entity metadata). That
+    /// is the only requirement, so this could be made safe: an `id` that is not live gives an
+    /// `Entity` that resolves to nothing or to the id's current occupant (panics if out of
+    /// range), never undefined behavior.
     pub unsafe fn find_entity_from_id(&self, id: u32) -> Entity {
         self.entities.resolve_unknown_gen(id)
     }
@@ -1233,6 +1284,11 @@ impl World {
     ///
     /// When inserting a single component, see [`insert_one`](Self::insert_one) for convenience.
     ///
+    /// Fails with [`ComponentError::Borrowed`], changing nothing and dropping `components`
+    /// unused, when a component the entity keeps is held by a gc borrow guard (`CRef::read`
+    /// or `write`): the insert moves the entity to a new row, and a borrowed value can't move.
+    /// A replaced component may be borrowed; the first sweep after its last guard goes drops it.
+    ///
     /// # Example
     /// ```
     /// # use hecs::*;
@@ -1246,26 +1302,33 @@ impl World {
         &mut self,
         entity: Entity,
         components: impl DynamicBundle,
-    ) -> Result<(), NoSuchEntity> {
+    ) -> Result<(), ComponentError> {
         self.flush();
 
         let loc = self.entities.get(entity)?;
         // SAFETY: we have &mut self
-        unsafe { self.insert_inner_nonsync(entity, components, loc.archetype, loc) };
-        Ok(())
+        unsafe { self.insert_inner_nonsync(entity, components, loc.archetype, loc) }
     }
 
+    /// [`insert`](Self::insert) through `&self`. Fails, changing nothing and without calling
+    /// [`DynamicBundle::put`], on a missing entity or a borrowed retained component.
+    ///
+    /// # Safety
+    /// - NS (`components.put` must not re-enter this `World`).
+    /// - No column borrows on the entity's components.
+    /// - STRUCT for any earlier `&T` into the entity's components: they move to a new row.
+    ///   (A gc borrow guard on a retained component is refused with
+    ///   [`ComponentError::Borrowed`]; one on a replaced component is allowed.)
     pub unsafe fn insert_nonsync(
         &self,
         entity: Entity,
         components: impl DynamicBundle,
-    ) -> Result<(), NoSuchEntity> {
+    ) -> Result<(), ComponentError> {
         self.flush_nonsync();
 
         let loc = self.entities.get(entity)?;
-        // SAFETY: we have are in !Sync context
-        unsafe { self.insert_inner_nonsync(entity, components, loc.archetype, loc) };
-        Ok(())
+        // SAFETY: NS by the caller's contract.
+        unsafe { self.insert_inner_nonsync(entity, components, loc.archetype, loc) }
     }
 
     /// The implementation backing [`insert`](Self::insert) exposed so that it can also be used by [`exchange`](Self::exchange).
@@ -1273,13 +1336,16 @@ impl World {
     /// Note that `graph_origin` is always equal to `loc.archetype` during insertion. Only for exchange, `graph_origin` identifies
     /// the intermediate archetype which would be reached after removal and before insertion even though
     /// the actual component data still resides in `loc.archetype`.
+    ///
+    /// # Safety
+    /// As [`insert_nonsync`](Self::insert_nonsync), with `loc` the entity's current location.
     unsafe fn insert_inner_nonsync(
         &self,
         entity: Entity,
         components: impl DynamicBundle,
         graph_origin: sharedvec::DefaultKey,
         loc: Location,
-    ) {
+    ) -> Result<(), ComponentError> {
         let target_storage;
         let target = match components.key() {
             None => {
@@ -1302,18 +1368,27 @@ impl World {
             }
         };
 
+        if target.index == loc.archetype && target.replaced.is_empty() {
+            // Nothing to insert.
+            return Ok(());
+        }
+
         let source_arch = &self.archetypes.archetypes[loc.archetype];
         unsafe {
+            // Refuse before changing anything: the retained components move to the new row,
+            // and a borrowed one can't. Nothing has been dropped, allocated or `put` yet.
+            for ty in &target.retained {
+                if !source_arch.get_dynamic(ty, loc.index).unwrap().is_movable() {
+                    return Err(ComponentError::Borrowed);
+                }
+            }
+
             // Drop the components we're overwriting
             for ty in &target.replaced {
                 let mut ptr = source_arch.get_dynamic(ty, loc.index).unwrap();
                 ptr.drop_value_and_tombstone(&ty);
             }
 
-            if target.index == loc.archetype && target.replaced.is_empty() {
-                // Nothing to insert.
-                return;
-            }
             // Replacing within the same archetype goes through a fresh row too:
             // a replaced slot is tombstoned above (references may still reach
             // it, and a borrowed one is dropped later), so it can't take the
@@ -1349,6 +1424,7 @@ impl World {
             source_arch.set_entity_free_nonsync(loc.index as usize);
             self.quarantine_vacated(loc.archetype, loc.index, entity);
         }
+        Ok(())
     }
 
     /// Add `component` to `entity`
@@ -1358,7 +1434,7 @@ impl World {
         &mut self,
         entity: Entity,
         component: impl Component,
-    ) -> Result<(), NoSuchEntity> {
+    ) -> Result<(), ComponentError> {
         self.insert(entity, (component,))
     }
 
@@ -1389,17 +1465,9 @@ impl World {
         let old_index = loc.index;
         let source_arch = &self.archetypes.archetypes[loc.archetype];
 
-        // Move out of the source archetype, or bail out if a component is missing
-        let bundle = unsafe {
-            T::get(|ty| {
-                // SAFETY: We have &mut self
-                let gc_ptr = source_arch.get_dynamic(&ty, old_index);
-                if let Some(mut gc_ptr) = gc_ptr {
-                    gc_ptr.mark_tombstone();
-                }
-                gc_ptr.map(|p| p.value_ptr())
-            })?
-        };
+        // Move out of the source archetype, or bail out (changing nothing) if a component is
+        // missing or borrowed. SAFETY: we have &mut self.
+        let bundle = unsafe { Self::take_bundle::<T>(source_arch, old_index)? };
 
         // Find the target archetype ID
         let target = Self::remove_target::<T>(
@@ -1434,6 +1502,47 @@ impl World {
         Ok(bundle)
     }
 
+    /// Move `T` out of row `index` of `arch`, tombstoning its slots. Refuses, reading and
+    /// changing nothing, when a component of `T` is missing ([`ComponentError::MissingComponent`])
+    /// or when any component of the row is not movable ([`ComponentError::Borrowed`]): a
+    /// remove moves every one, `T`'s out to the caller and the rest to a new row.
+    ///
+    /// # Safety
+    /// NS; `index` is an occupied row of `arch`; no column borrows on it.
+    unsafe fn take_bundle<T: Bundle>(arch: &Archetype, index: u32) -> Result<T, ComponentError> {
+        let movable = arch.row_movable(index, |_| false);
+        let mut borrowed = false;
+        // `Bundle::get` reads nothing unless `f` finds every component.
+        let bundle = T::get(|ty| {
+            let ptr = arch.get_dynamic(&ty, index)?;
+            if !movable {
+                borrowed = true;
+                return None;
+            }
+            Some(ptr.value_ptr())
+        });
+        if borrowed {
+            return Err(ComponentError::Borrowed);
+        }
+        let bundle = bundle?;
+        // The caller owns the values now: tombstone without dropping.
+        T::with_static_type_info(|info| {
+            for ty in info {
+                arch.get_dynamic(ty, index).unwrap().mark_tombstone();
+            }
+        });
+        Ok(bundle)
+    }
+
+    /// [`remove`](Self::remove) through `&self`. Fails, changing nothing, on a missing entity
+    /// or component, or with [`ComponentError::Borrowed`] when any component of the entity is
+    /// held by a gc borrow guard (all of them move).
+    ///
+    /// # Safety
+    /// - NS.
+    /// - No column borrows on the entity's components.
+    /// - STRUCT for any earlier `&T` into the entity's components: the removed ones are moved
+    ///   out and the rest move to a new row. (Gc borrow guards are refused.)
     pub unsafe fn remove_nonsync<T: Bundle + 'static>(
         &self,
         entity: Entity,
@@ -1443,16 +1552,9 @@ impl World {
         let loc = self.entities.get(entity)?;
         let source_arch = &self.archetypes.archetypes[loc.archetype];
 
-        // Extract values + mark tombstone (caller takes ownership, so no drop)
-        let bundle = unsafe {
-            T::get(|ty| {
-                let gc_ptr = source_arch.get_dynamic(&ty, loc.index);
-                if let Some(mut gc_ptr) = gc_ptr {
-                    gc_ptr.mark_tombstone();
-                }
-                gc_ptr.map(|p| p.value_ptr())
-            })?
-        };
+        // Extract values + mark tombstone (caller takes ownership, so no drop), or bail out
+        // changing nothing.
+        let bundle = unsafe { Self::take_bundle::<T>(source_arch, loc.index)? };
 
         let removed_ids =
             T::with_static_type_info(|info| info.iter().map(|t| t.id()).collect::<Vec<_>>());
@@ -1463,7 +1565,15 @@ impl World {
 
     /// Remove components identified by `StableTypeId`s from `entity`.
     ///
-    /// Drops removed values and migrates the entity to a smaller archetype.
+    /// Drops removed values and migrates the entity to a smaller archetype. Fails, changing
+    /// nothing, on a missing entity, an id the entity has no column for, or with
+    /// [`ComponentError::Borrowed`] when a component the entity keeps is held by a gc borrow
+    /// guard (it would move). A removed component may be borrowed; the first sweep after its
+    /// last guard goes drops it. A repeated id is removed once.
+    ///
+    /// # Safety
+    /// As [`remove_nonsync`](Self::remove_nonsync), except that guards on removed components
+    /// are allowed. The `type_ids` should name the entity's own columns (others are refused).
     pub unsafe fn remove_by_ids_nonsync(
         &self,
         entity: Entity,
@@ -1474,19 +1584,25 @@ impl World {
         let loc = self.entities.get(entity)?;
         let source_arch = &self.archetypes.archetypes[loc.archetype];
 
+        // Refuse before changing anything.
+        if type_ids.iter().any(|&id| source_arch.column_index(id).is_none()) {
+            return Err(ComponentError::MissingComponent(MissingComponent::custom(
+                "unknown (by StableTypeId)",
+            )));
+        }
+        if !type_ids.is_empty() && !source_arch.row_movable(loc.index, |id| type_ids.contains(&id))
+        {
+            return Err(ComponentError::Borrowed);
+        }
+
         // Drop values and tombstone the removed components
-        for &id in type_ids {
-            let ty = source_arch
-                .types()
-                .iter()
-                .find(|t| t.id() == id)
-                .ok_or_else(|| {
-                    ComponentError::MissingComponent(MissingComponent::custom(
-                        "unknown (by StableTypeId)",
-                    ))
-                })?;
-            let mut gc_ptr = source_arch.get_dynamic_by_id(id, loc.index).unwrap();
-            gc_ptr.drop_value_and_tombstone(ty);
+        for (i, &id) in type_ids.iter().enumerate() {
+            if type_ids[..i].contains(&id) {
+                continue;
+            }
+            let col = source_arch.column_index(id).unwrap();
+            let mut gc_ptr = source_arch.get_gc_ptr_by_column(col, loc.index);
+            gc_ptr.drop_value_and_tombstone(&source_arch.types()[col]);
         }
 
         self.migrate_remove_nonsync(entity, loc, type_ids);
@@ -1496,6 +1612,10 @@ impl World {
     /// Migrate entity to archetype without the given component types.
     ///
     /// Caller must have already tombstoned/dropped the removed components.
+    ///
+    /// # Safety
+    /// NS; `loc` is `entity`'s location; every kept component of the row is movable (checked
+    /// by the caller before it changed anything); no column borrows on the row.
     unsafe fn migrate_remove_nonsync(
         &self,
         entity: Entity,
@@ -1571,8 +1691,15 @@ impl World {
     pub fn remove_one<T: Component>(&mut self, entity: Entity) -> Result<T, ComponentError> {
         self.remove::<(T,)>(entity).map(|(x,)| x)
     }
-    pub fn remove_one_nonsync<T: Component>(&self, entity: Entity) -> Result<T, ComponentError> {
-        unsafe { self.remove_nonsync::<(T,)>(entity).map(|(x,)| x) }
+    /// [`remove_one`](Self::remove_one) through `&self`.
+    ///
+    /// # Safety
+    /// As [`remove_nonsync`](Self::remove_nonsync).
+    pub unsafe fn remove_one_nonsync<T: Component>(
+        &self,
+        entity: Entity,
+    ) -> Result<T, ComponentError> {
+        self.remove_nonsync::<(T,)>(entity).map(|(x,)| x)
     }
 
     /// Remove `S` components from `entity` and then add `components`
@@ -1629,8 +1756,12 @@ impl World {
     ///
     /// # Safety
     ///
-    /// `entity` must have been previously obtained from this [`World`], and no unique borrow of the
-    /// same component of `entity` may be live simultaneous to the returned reference.
+    /// - No unique borrow of the same component of `entity` (a `&mut` from this call, a query,
+    ///   a [`RefMut`](crate::RefMut) or a gc `RefMut` guard) may be live simultaneous to the returned reference;
+    ///   for `&mut T`, no borrow of it at all.
+    /// - STRUCT while the result is alive: it points at the component's current row, which a
+    ///   move or despawn through `&self` (`*_nonsync`) would vacate.
+    /// - No concurrent NS writer on another thread.
     pub unsafe fn get_unchecked<'a, T: ComponentRef<'a>>(
         &'a self,
         entity: Entity,
@@ -1664,6 +1795,11 @@ impl World {
         });
     }
 
+    /// [`flush`](Self::flush) through `&self`.
+    ///
+    /// # Safety
+    /// NS. No live `&[EntityMeta]`, query, `View` or [`iter`](Self::iter) over this world: the
+    /// flush writes entity locations (and, with pending reserves, allocates rows).
     pub unsafe fn flush_nonsync(&self) {
         let arch =
             &self.archetypes.archetypes[self.archetypes.archetypes.key_from_index(0).unwrap()];
@@ -1724,9 +1860,8 @@ impl World {
         if n == 0 {
             return;
         }
-        let dangling = crate::gc::GCPtr {
-            value: core::ptr::NonNull::dangling(),
-        };
+        // SAFETY: a placeholder, overwritten for every column before `row` sees it.
+        let dangling = unsafe { crate::gc::GCPtr::from_raw(core::ptr::NonNull::dangling()) };
         let mut data_inline: [*const crate::Data; INLINE] = [core::ptr::null(); INLINE];
         let mut strides_inline = [0usize; INLINE];
         let mut ptrs_inline = [dangling; INLINE];
@@ -1783,9 +1918,11 @@ impl World {
                     for i in 0..n {
                         unsafe {
                             let p = ptrs.get_unchecked_mut(i);
-                            p.value = core::ptr::NonNull::new_unchecked(
-                                p.value.as_ptr().add(*strides.get_unchecked(i)),
-                            );
+                            // SAFETY: the next slot of the same chunk. Past the run's last
+                            // slot this is a placeholder that is never used: `wrapping_add`.
+                            *p = crate::gc::GCPtr::from_raw(core::ptr::NonNull::new_unchecked(
+                                p.value().as_ptr().wrapping_add(*strides.get_unchecked(i)),
+                            ));
                         }
                     }
                 }
@@ -1808,9 +1945,20 @@ impl World {
     ///
     /// In a [quarantining](Self::set_quarantine_marker) archetype the entity's ID is held and
     /// the slot quarantined, as for [`despawn`](Self::despawn).
-    pub fn take(&mut self, entity: Entity) -> Result<TakenEntity<'_>, NoSuchEntity> {
+    ///
+    /// Fails, changing nothing, with [`TakeError::NoSuchEntity`] for a dead entity, or with
+    /// [`TakeError::Borrowed`] when any component of the entity is held by a gc borrow guard
+    /// (`CRef::read`/`write`, which can outlive its [`GcWorld`](crate::GcWorld) scope): every
+    /// component moves out, as for [`remove`](Self::remove).
+    pub fn take(&mut self, entity: Entity) -> Result<TakenEntity<'_>, TakeError> {
         self.flush();
         let loc = self.entities.get(entity)?;
+        // Before anything is quarantined, journaled or moved. While the `TakenEntity` lives it
+        // holds `&mut self`, so no new guard (which needs a `GcWorld` scope) can be taken.
+        // SAFETY: `loc` is the entity's occupied row; NS through `&mut self`.
+        if !unsafe { self.archetypes.archetypes[loc.archetype].row_movable(loc.index, |_| false) } {
+            return Err(TakeError::Borrowed);
+        }
         let hold = self.quarantines(loc.archetype);
         if hold {
             unsafe {
@@ -1904,6 +2052,9 @@ pub enum ComponentError {
     NoSuchEntity,
     /// The entity did not have a requested component
     MissingComponent(MissingComponent),
+    /// A component that would have to move is held by a gc borrow guard (`CRef::read` or
+    /// `write`); the operation was refused and changed nothing
+    Borrowed,
 }
 
 #[cfg(feature = "std")]
@@ -1915,6 +2066,7 @@ impl fmt::Display for ComponentError {
         match *self {
             NoSuchEntity => f.write_str("no such entity"),
             MissingComponent(ref x) => x.fmt(f),
+            Borrowed => f.write_str("a component that would move is borrowed"),
         }
     }
 }
@@ -1928,6 +2080,34 @@ impl From<NoSuchEntity> for ComponentError {
 impl From<MissingComponent> for ComponentError {
     fn from(x: MissingComponent) -> Self {
         ComponentError::MissingComponent(x)
+    }
+}
+
+/// Errors that arise from [`World::take`]
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Hash)]
+pub enum TakeError {
+    /// The entity was already despawned
+    NoSuchEntity,
+    /// A component of the entity is held by a gc borrow guard (`CRef::read` or `write`); the
+    /// take was refused and changed nothing
+    Borrowed,
+}
+
+#[cfg(feature = "std")]
+impl Error for TakeError {}
+
+impl fmt::Display for TakeError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match *self {
+            TakeError::NoSuchEntity => f.write_str("no such entity"),
+            TakeError::Borrowed => f.write_str("a component of the entity is borrowed"),
+        }
+    }
+}
+
+impl From<NoSuchEntity> for TakeError {
+    fn from(NoSuchEntity: NoSuchEntity) -> Self {
+        TakeError::NoSuchEntity
     }
 }
 
@@ -2244,6 +2424,10 @@ impl ArchetypeSet {
             .copied()
             .unwrap_or_else(|| self.insert(components.into(), info()))
     }
+    /// [`get`](Self::get) through `&self`: may create the archetype.
+    ///
+    /// # Safety
+    /// NS. No `&` into the type-set index alive, and no archetype iterator spans the call.
     unsafe fn get_nonsync<T: Borrow<[crate::StableTypeId]> + Into<Box<[crate::StableTypeId]>>>(
         &self,
         components: T,
@@ -2266,6 +2450,8 @@ impl ArchetypeSet {
         debug_assert!(old.is_none(), "inserted duplicate archetype");
         key
     }
+    /// # Safety
+    /// As [`get_nonsync`](Self::get_nonsync), and `components` is not in the index yet.
     unsafe fn insert_nonsync(
         &self,
         components: Box<[crate::StableTypeId]>,
@@ -2312,6 +2498,11 @@ impl ArchetypeSet {
         self.archetypes.len() as u32
     }
 
+    /// The archetype `components` moves an entity of `src` to, and which of its columns are
+    /// replaced or retained. May create the archetype.
+    ///
+    /// # Safety
+    /// As [`get_nonsync`](Self::get_nonsync).
     unsafe fn get_insert_target_nonsync(
         &self,
         src: sharedvec::DefaultKey,

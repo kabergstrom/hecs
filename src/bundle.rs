@@ -35,6 +35,12 @@ pub unsafe trait DynamicBundle {
     /// Allow a callback to move all components out of the bundle
     ///
     /// Must invoke `f` only with a valid pointer and the pointee's type and size.
+    ///
+    /// # Safety
+    /// The caller takes ownership of every value `f` is given: `f` must move it out (copy
+    /// its bytes) before returning and never drop it through the pointer, since the bundle
+    /// forgets it. (Implementations must not touch the `World` the bundle is put into: hecs
+    /// calls `put` in the middle of a spawn or insert.)
     #[doc(hidden)]
     unsafe fn put(self, f: impl FnMut(*mut u8, TypeInfo));
 }
@@ -71,6 +77,9 @@ pub unsafe trait DynamicBundleClone: DynamicBundle {
     ///
     /// Must invoke `f` only with a valid pointer, the pointee's type and size, and a `DynamicClone`
     /// constructed for the pointee's type.
+    ///
+    /// # Safety
+    /// As [`DynamicBundle::put`].
     #[doc(hidden)]
     unsafe fn put_with_clone(self, f: impl FnMut(*mut u8, TypeInfo, DynamicClone));
 }

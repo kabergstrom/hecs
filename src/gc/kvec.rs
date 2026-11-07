@@ -28,6 +28,17 @@ struct AllocHeader {
 
 #[doc(hidden)]
 impl<T> SizedTypeProperties for T {}
+// SAFETY: `KVec` owns its `T`s yet is `Send + Sync` for any `T: Clone`, with no `T: Send` /
+// `T: Sync` bound. A bound is not added because one of its four uses, the chunk table
+// `Data::storage: KVec<*mut u8>`, holds raw pointers, which are neither; the other uses
+// (`EntityCell`, `EntityMeta`, `u32`) are plain data. It is sound for those uses because
+// (1) the chunk pointers are owned by the archetype, whose components are `Send + Sync`
+// (`Component`), and (2) the safe `&self` API is `Deref` and `len_sync`, which read with
+// acquire loads; every unsynchronized `&self` mutation is an `unsafe` `*_nonsync` method with
+// an NS contract, which the engine meets by touching a `World` only on its owning thread (see
+// the `Send` impl of `gc::GCPtr`). `KVec` is public but nothing outside hecs uses it; a new
+// use with a non-thread-safe `T` must not rely on these impls.
+// (The synchronized `*_sync` writers that once existed were broken and unused, and are gone.)
 unsafe impl<T: Clone> Send for KVec<T> {}
 unsafe impl<T: Clone> Sync for KVec<T> {}
 pub struct KVec<T: Clone> {
@@ -88,6 +99,10 @@ impl<T: Clone> KVec<T> {
     }
 
     #[inline(always)]
+    /// The data and header pointers of the current allocation (raw, with write permission).
+    ///
+    /// # Safety
+    /// NS: no concurrent growth.
     unsafe fn current_memory_nonsync(&self) -> Option<(NonNull<T>, NonNull<AllocHeader>)> {
         if T::IS_ZST {
             None
@@ -125,40 +140,10 @@ impl<T: Clone> KVec<T> {
         }
     }
 
-    #[inline(always)]
-    fn reserve_slots_sync(
-        current: Option<NonNull<AllocHeader>>,
-        additional: usize,
-    ) -> Option<Range<usize>> {
-        if T::IS_ZST {
-            return None;
-        }
-        if additional == 0 {
-            return None;
-        }
-        if let Some(current) = current {
-            loop {
-                let current = unsafe { current.as_ref() };
-                let prev_len = current.reserved.load_atomic(Ordering::Relaxed);
-                let capacity = current.cap;
-                if additional > capacity.wrapping_sub(prev_len) {
-                    return None;
-                }
-                match current.reserved.compare_exchange_weak(
-                    prev_len,
-                    prev_len.wrapping_add(additional),
-                    Ordering::Relaxed,
-                    Ordering::Relaxed,
-                ) {
-                    Ok(_) => break Some(prev_len..additional),
-                    Err(_) => {} // try again
-                }
-            }
-        } else {
-            None
-        }
-    }
-
+    /// Claim `additional` slots of `current`, or `None` if they don't fit.
+    ///
+    /// # Safety
+    /// NS; `current` is this vector's live allocation header.
     #[inline(always)]
     unsafe fn reserve_slots_nonsync(
         current: Option<NonNull<AllocHeader>>,
@@ -182,91 +167,6 @@ impl<T: Clone> KVec<T> {
             Some(prev_len..new_len)
         } else {
             None
-        }
-    }
-
-    fn grow_amortized_sync(&self, cap: usize, len: usize, additional: usize) -> Option<*mut u8> {
-        // This is ensured by the calling contexts.
-        debug_assert!(additional > 0);
-
-        if T::IS_ZST {
-            // Since we return a capacity of `usize::MAX` when `elem_size` is
-            // 0, getting to here necessarily means the `RawVec` is overfull.
-            return None;
-        }
-
-        // Nothing we can really do about these checks, sadly.
-        let required_cap = len.checked_add(additional)?;
-
-        // This guarantees exponential growth. The doubling cannot overflow
-        // because `cap <= isize::MAX` and the type of `cap` is `usize`.
-        let cap = cmp::max(cap * 2, required_cap);
-        let cap = cmp::max(Self::MIN_NON_ZERO_CAP, cap);
-
-        let (new_layout, _) = Self::get_layout(cap);
-
-        // `finish_grow` is non-generic over `T`.
-        let ptr = Self::allocate(cap);
-        if ptr.is_null() {
-            return None;
-        }
-        loop {
-            let old_ptr = self.ptr.load_atomic(Ordering::Relaxed);
-            if !old_ptr.is_null() {
-                let old_header = unsafe { &*old_ptr.cast::<AllocHeader>() };
-                if old_header.cap >= cap {
-                    unsafe { dealloc(old_ptr, new_layout) };
-                    break Some(old_ptr);
-                }
-                let written_len = loop {
-                    let written = old_header
-                        .written
-                        .load_atomic(Ordering::Acquire)
-                        .min(old_header.cap);
-                    let len = old_header
-                        .reserved
-                        .load_atomic(Ordering::Acquire)
-                        .min(old_header.cap);
-                    if written >= len {
-                        break len;
-                    }
-                };
-                unsafe {
-                    // copy data from old to new allocation, and update length
-                    let src_data_ptr = old_ptr.add(self.data_start).cast::<T>();
-                    let dst_data_ptr = ptr.add(self.data_start).cast::<T>();
-                    for i in 0..written_len {
-                        core::ptr::write(dst_data_ptr.add(i), (&*src_data_ptr.add(i)).clone());
-                    }
-                    let new_header = &*ptr.cast::<AllocHeader>();
-                    new_header
-                        .reserved
-                        .write_atomic(written_len, Ordering::Release);
-                    new_header
-                        .written
-                        .write_atomic(written_len, Ordering::Release);
-                }
-            }
-
-            match self
-                .ptr
-                .compare_exchange_weak(old_ptr, ptr, Ordering::Relaxed, Ordering::Relaxed)
-            {
-                Ok(old_ptr) => {
-                    self.old_allocs.lock().unwrap().push(old_ptr);
-                    break Some(ptr);
-                }
-                Err(newer_ptr) => {
-                    if newer_ptr.is_null() {
-                        continue;
-                    }
-                    let header = unsafe { &*newer_ptr.cast::<AllocHeader>() };
-                    if header.cap >= cap {
-                        unsafe { dealloc(ptr, new_layout) };
-                        break Some(newer_ptr);
-                    }
-                }
-            }
         }
     }
 
@@ -314,6 +214,11 @@ impl<T: Clone> KVec<T> {
         Some(ptr)
     }
 
+    /// Move to a larger allocation (cloning the elements). The old allocation is leaked, not
+    /// freed, so outstanding `&T`/`&[T]` stay valid (but stale).
+    ///
+    /// # Safety
+    /// NS; every reserved slot is written (`reserved == written`).
     unsafe fn grow_amortized_nonsync(
         &self,
         cap: usize,
@@ -426,33 +331,10 @@ impl<T: Clone> KVec<T> {
         (current_mem, reserved_range)
     }
 
-    unsafe fn reserve_storage_sync(&self, num_slots: usize) -> (*mut u8, Range<usize>) {
-        let mut current_mem = self.ptr.load_atomic(Ordering::Relaxed);
-        if current_mem.is_null() {
-            current_mem = self
-                .grow_amortized_sync(0, 0, num_slots)
-                .expect("alloc failed");
-        }
-        let reserved_range = loop {
-            let header = NonNull::new(current_mem.cast::<AllocHeader>());
-            if let Some(reserved_range) = Self::reserve_slots_sync(header, num_slots) {
-                break reserved_range;
-            } else {
-                let mut cap = 0;
-                let mut len = 0;
-                if let Some(header) = header {
-                    let header = unsafe { header.as_ref() };
-                    cap = header.cap;
-                    len = header.reserved.load_atomic(Ordering::Relaxed);
-                }
-                current_mem = self
-                    .grow_amortized_sync(cap, len, num_slots)
-                    .expect("alloc failed");
-            }
-        };
-        (current_mem, reserved_range)
-    }
-
+    /// # Safety
+    /// NS. The returned range must be written and then marked with
+    /// [`mark_range_written_nonsync`](Self::mark_range_written_nonsync) before anything else
+    /// touches the vector.
     unsafe fn reserve_storage_nonsync(&self, num_slots: usize) -> (*mut u8, Range<usize>) {
         let mut current_mem = self.ptr.read_nonsync();
         if current_mem.is_null() {
@@ -480,21 +362,8 @@ impl<T: Clone> KVec<T> {
         (current_mem, reserved_range)
     }
 
-    unsafe fn mark_range_written_sync(&self, storage: *mut u8, range: Range<usize>) {
-        let header = &*storage.cast::<AllocHeader>();
-        loop {
-            match header.written.compare_exchange_weak(
-                range.start,
-                range.end,
-                Ordering::Release,
-                Ordering::Relaxed,
-            ) {
-                Ok(_) => break,
-                Err(_) => {} // try again
-            }
-        }
-    }
-
+    /// # Safety
+    /// NS; `storage` is the allocation `range` was reserved in, and its slots are written.
     #[inline(always)]
     unsafe fn mark_range_written_nonsync(&self, storage: *mut u8, range: Range<usize>) {
         let header = &*storage.cast::<AllocHeader>();
@@ -520,6 +389,10 @@ impl<T: Clone> KVec<T> {
         }
     }
 
+    /// Remove and return the last element.
+    ///
+    /// # Safety
+    /// NS. No live `&T` into the last element, nor a `&[T]` (from `Deref`) spanning it.
     pub unsafe fn pop_nonsync(&self) -> Option<T> {
         if let Some((data, mut header)) = unsafe { self.current_memory_nonsync() } {
             unsafe {
@@ -566,6 +439,12 @@ impl<T: Clone> KVec<T> {
         }
     }
 
+    /// Append `value`.
+    ///
+    /// # Safety
+    /// NS. A push that grows the vector clones the elements into a new allocation and leaves the
+    /// old one allocated (it is never freed, so outstanding `&T`/`&[T]` stay valid, but they no
+    /// longer see later writes).
     pub unsafe fn push_nonsync(&self, value: T) {
         let (ptr, reserved_range) = self.reserve_storage_nonsync(1);
         unsafe {
@@ -575,18 +454,6 @@ impl<T: Clone> KVec<T> {
                 .add(reserved_range.start);
             core::ptr::write(data, value);
             self.mark_range_written_nonsync(ptr, reserved_range);
-        }
-    }
-
-    pub fn push_sync(&self, value: T) {
-        if T::IS_ZST {
-            return;
-        }
-        unsafe {
-            let (ptr, reserved_range) = self.reserve_storage_sync(1);
-            let data = ptr.add(self.data_start).cast::<T>();
-            core::ptr::write(data, value);
-            self.mark_range_written_sync(ptr, reserved_range);
         }
     }
 
@@ -620,28 +487,15 @@ impl<T: Clone> KVec<T> {
         }
     }
 
+    /// The number of written elements.
+    ///
+    /// # Safety
+    /// NS: no other thread is growing or shrinking the vector.
     pub unsafe fn len_nonsync(&self) -> usize {
         if let Some((_, header)) = self.current_memory_nonsync() {
             unsafe { header.as_ref().written.load_atomic(Ordering::Acquire) }
         } else {
             0
-        }
-    }
-
-    /// Extend the vector by `n` values, using the given value.
-    pub fn extend_with_sync(&self, n: usize, value: T) {
-        if T::IS_ZST {
-            return;
-        }
-        let (storage, range) = unsafe { self.reserve_storage_sync(n) };
-
-        unsafe {
-            let data = storage.add(self.data_start).cast::<T>();
-
-            for i in range.clone() {
-                ptr::write(data.add(i), value.clone());
-            }
-            self.mark_range_written_sync(storage, range);
         }
     }
 
@@ -663,7 +517,11 @@ impl<T: Clone> KVec<T> {
     }
 
     /// Extend the vector by `n` values, using the given value.
-    pub fn extend_with_nonsync(&self, n: usize, value: T) {
+    ///
+    /// # Safety
+    /// As [`push_nonsync`](Self::push_nonsync): NS, and a growth leaves outstanding `&T`/`&[T]`
+    /// on the old, never-freed allocation.
+    pub unsafe fn extend_with_nonsync(&self, n: usize, value: T) {
         if T::IS_ZST {
             return;
         }
@@ -767,36 +625,59 @@ impl<T: Clone> KVec<T> {
         let len = unsafe { self.len_nonsync() };
 
         if new_len > len {
-            self.extend_with_nonsync(new_len - len, value)
+            // SAFETY: we have &mut self
+            unsafe { self.extend_with_nonsync(new_len - len, value) }
         } else {
             self.truncate(new_len);
         }
     }
 
     pub fn truncate(&mut self, len: usize) {
-        unsafe {
-            if let Some((data, mut header)) = self.current_memory_nonsync() {
-                let header = header.as_mut();
-                if len > header.cap {
-                    return;
-                }
-                let old_len = header.written.read_nonsync();
-                let remaining_len = old_len - len;
-                let s = ptr::slice_from_raw_parts_mut(data.as_ptr().add(len), remaining_len);
-                header.reserved.write_nonsync(len);
-                header.written.write_nonsync(len);
-                ptr::drop_in_place(s);
+        // SAFETY: we have &mut self
+        unsafe { self.truncate_nonsync(len) }
+    }
+
+    /// Shorten the vector to `len` elements, dropping the rest. No-op if it is not longer.
+    ///
+    /// # Safety
+    /// NS. No live `&T` into the dropped elements, nor a `&[T]` (from `Deref`) spanning them.
+    pub unsafe fn truncate_nonsync(&self, len: usize) {
+        if let Some((data, header)) = self.current_memory_nonsync() {
+            // Only `&AllocHeader`: its counters are cells.
+            let header = header.as_ref();
+            let old_len = header.written.read_nonsync();
+            if len >= old_len {
+                return;
             }
+            header.reserved.write_nonsync(len);
+            header.written.write_nonsync(len);
+            let s = ptr::slice_from_raw_parts_mut(data.as_ptr().add(len), old_len - len);
+            ptr::drop_in_place(s);
         }
     }
-    pub unsafe fn set_nonsync(&self, idx: usize, value: T) {
-        if let Some((data, mut header)) = self.current_memory_nonsync() {
-            unsafe {
-                let slice =
-                    core::slice::from_raw_parts_mut(data.as_ptr(), header.as_mut().written.read());
-                slice[idx] = value;
-            }
+
+    /// Pointer to the first element, with write permission for every written element (taken
+    /// from the allocation, not from a `Deref` slice). Dangling when nothing is allocated.
+    ///
+    /// # Safety
+    /// NS. The pointer is valid until the vector next grows, shrinks or drops. Writing
+    /// through it requires that no `&T`, or `&[T]` from `Deref`, overlapping the written
+    /// elements is live.
+    pub unsafe fn as_mut_ptr_nonsync(&self) -> *mut T {
+        match self.current_memory_nonsync() {
+            Some((data, _)) => data.as_ptr(),
+            None => NonNull::dangling().as_ptr(),
         }
+    }
+
+    /// Overwrite element `idx` (dropping the old value). Panics if `idx` is out of bounds.
+    ///
+    /// # Safety
+    /// NS. No live `&T` into element `idx`, nor a `&[T]` (from `Deref`) spanning it.
+    pub unsafe fn set_nonsync(&self, idx: usize, value: T) {
+        let len = self.len_nonsync();
+        assert!(idx < len, "set_nonsync index (is {}) should be < len (is {})", idx, len);
+        *self.as_mut_ptr_nonsync().add(idx) = value;
     }
 }
 

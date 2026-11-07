@@ -6,6 +6,11 @@ use core::{
 #[repr(transparent)]
 #[derive(Default)]
 pub struct U32Cell(UnsafeCell<u32>);
+// SAFETY: the safe `&self` methods are atomic (the value is accessed as the matching atomic,
+// which has the same layout); the `*_nonsync` methods are `unsafe` with an NS contract. The
+// `Into` impl for `&Self` (where there is one) is a plain read: it is crate-internal and only
+// used under NS. Cross-thread use beyond the atomics relies on the engine's invariant that the
+// `World` is only touched from its owning thread (see the `Send` impl of `gc::GCPtr`).
 unsafe impl Sync for U32Cell {}
 unsafe impl Send for U32Cell {}
 
@@ -19,9 +24,17 @@ impl U32Cell {
     pub fn load_atomic(&self, ordering: Ordering) -> u32 {
         unsafe { (&*self.0.get().cast::<AtomicU32>()).load(ordering) }
     }
+    /// Plain (non-atomic) write.
+    ///
+    /// # Safety
+    /// NS: no other thread reads or writes this cell concurrently.
     pub unsafe fn write_nonsync(&self, val: u32) {
         self.0.get().write(val)
     }
+    /// Plain (non-atomic) read.
+    ///
+    /// # Safety
+    /// NS: no other thread writes this cell concurrently.
     pub unsafe fn read_nonsync(&self) -> u32 {
         unsafe { *self.0.get() }
     }

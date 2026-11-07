@@ -31,6 +31,22 @@
 //! assert_eq!(*world.get::<&i32>(a).unwrap(), 246);
 //! assert_eq!(*world.get::<&i32>(b).unwrap(), 42);
 //! ```
+//!
+//! # Safety terms
+//!
+//! The `# Safety` sections of the `*_nonsync` and raw-slot API use these terms:
+//!
+//! - **NS** (non-sync): no other thread touches this `World` (or `KVec`, `Entities`,
+//!   `Archetype`) during the call, and the call is not re-entered, neither from a callback it
+//!   runs nor from [`DynamicBundle::put`].
+//! - **STRUCT** (structure is stable): no spawn, despawn, insert, remove, archetype move, flush
+//!   with pending reserves, migrate or [`gc::sweep`] happens while the result is alive.
+//! - **No column borrows**: no live [`Ref`]/[`RefMut`], query, [`View`] or
+//!   [`World::get_unchecked`] result on the affected components.
+//!
+//! `GCPtr`, `CRef` and the cell types are `Send + Sync` although slot headers are not
+//! synchronized. That rests on the engine's invariant that module code, and every touch of a
+//! slot, runs on the thread that owns the `World`. See the `Send` impl of [`gc::GCPtr`].
 
 #![warn(missing_docs)]
 #![allow(
@@ -104,7 +120,7 @@ pub use query_one::QueryOne;
 pub use stable_type_id::StableTypeId;
 pub use take::TakenEntity;
 pub use world::{
-    ArchetypeHandle, ArchetypesGeneration, ReviveError, VacateKind, Vacated, SpawnColumn, SpawnRows, Component, ComponentError, Iter, QueryOneError, SpawnBatchIter,
+    ArchetypeHandle, ArchetypesGeneration, ReviveError, TakeError, VacateKind, Vacated, SpawnColumn, SpawnRows, Component, ComponentError, Iter, QueryOneError, SpawnBatchIter,
     SpawnColumnBatchIter, World,
 };
 

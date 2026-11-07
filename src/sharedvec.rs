@@ -293,6 +293,13 @@ impl<T> Chunk<T> {
 
 // unsafe REIMPLEMENT REFCELL WITH KARL CELL TECH impl<T, K: Key> Sync for SharedVec<T, K> {}
 /// A [`SharedVec`] for storing values of a single type.
+///
+/// Thread safety: there is no `unsafe impl Send/Sync`, but the type is `Send + Sync` for every
+/// `T` anyway, inherited from its `PtrCell`/`UsizeCell` fields. Its only use is the world's
+/// archetype table (`T = Archetype`, itself `Send + Sync`), and pushes happen under NS, so the
+/// unsynchronized parts of `grow` (it frees the old chunk table right after publishing the new
+/// one) never race. A use with a non-thread-safe `T`, or concurrent pushes, would need real
+/// bounds and a deferred free.
 pub struct SharedVec<T, K: Key = DefaultKey> {
     chunks: crate::gc::cells::PtrCell<*mut Chunk<T>>,
     num_chunks: crate::gc::cells::UsizeCell,

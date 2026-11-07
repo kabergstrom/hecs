@@ -17,7 +17,9 @@ pub struct TakenEntity<'a> {
 
 impl<'a> TakenEntity<'a> {
     /// # Safety
-    /// `index` must be in bounds in `archetype`
+    /// `index` must be `entity`'s occupied row in `archetype`, and every component of it
+    /// movable (no gc guard; [`World::take`](crate::World::take) checks this with
+    /// `Archetype::row_movable` first): `put` moves the values out.
     pub(crate) unsafe fn new(
         entities: &'a mut Entities,
         entity: Entity,

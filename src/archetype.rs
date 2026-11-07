@@ -56,15 +56,22 @@ pub struct Archetype {
 
 #[derive(Default)]
 struct SlotBits(UnsafeCell<Vec<u64>>);
+// SAFETY: `get` and `set` are `unsafe` with NS contracts (a `set` may reallocate); `clear` takes
+// `&mut self`. Cross-thread sharing of the owning `Archetype` relies on the engine's
+// single-thread invariant (see the `Send` impl of `gc::GCPtr`).
 unsafe impl Sync for SlotBits {}
 
 impl SlotBits {
+    /// # Safety
+    /// No concurrent [`set`](Self::set) (it may reallocate the bits).
     unsafe fn get(&self, slot: u32) -> bool {
         let bits = &*self.0.get();
         bits.get(slot as usize / 64)
             .is_some_and(|w| w & (1 << (slot % 64)) != 0)
     }
 
+    /// # Safety
+    /// NS: no concurrent `get` or `set`.
     unsafe fn set(&self, slot: u32, on: bool) {
         let bits = &mut *self.0.get();
         let word = slot as usize / 64;
@@ -231,6 +238,10 @@ impl Archetype {
     }
 
     #[inline]
+    /// Slots ever allocated (occupied, free-listed or tombstoned).
+    ///
+    /// # Safety
+    /// NS: no concurrent writer of this archetype.
     pub(crate) unsafe fn allocated_values_nonsync(&self) -> u32 {
         self.len.read_nonsync()
     }
@@ -242,6 +253,9 @@ impl Archetype {
 
     /// Whether this archetype contains no entities
     #[inline]
+    ///
+    /// # Safety
+    /// NS: no concurrent writer of this archetype.
     pub unsafe fn is_empty_nonsync(&self) -> bool {
         self.len.read_nonsync() - self.num_free.read_nonsync() == 0
     }
@@ -270,6 +284,8 @@ impl Archetype {
         self.entities[index].set(entity);
     }
     #[inline]
+    /// # Safety
+    /// NS; `index` is below the capacity; no `&EntityCell` read concurrently.
     pub(crate) unsafe fn set_entity_nonsync(&self, index: usize, entity: Entity) {
         self.entities[index].write_nonsync(entity);
     }
@@ -278,6 +294,8 @@ impl Archetype {
         self.entities[index].set_free();
     }
     #[inline]
+    /// # Safety
+    /// As [`set_entity_nonsync`](Self::set_entity_nonsync).
     pub(crate) unsafe fn set_entity_free_nonsync(&self, index: usize) {
         self.entities[index].write_free_nonsync();
     }
@@ -308,16 +326,25 @@ impl Archetype {
         self.types.iter().map(|typeinfo| typeinfo.id)
     }
 
-    /// `index` must be in-bounds or just past the end
+    /// The column storage of column `state`.
+    ///
+    /// # Safety
+    /// `state < types().len()`.
     pub unsafe fn get_data_storage(&self, state: usize) -> &Data {
         debug_assert!(state < self.types.len());
         self.data.get_unchecked(state)
     }
+    /// # Safety
+    /// `state < types().len()`.
     pub(crate) unsafe fn get_data_storage_mut(&mut self, state: usize) -> NonNull<Data> {
         debug_assert!(state < self.types.len());
         NonNull::new_unchecked(self.data.as_mut_ptr().add(state))
     }
 
+    /// The [`GCPtr`] of `ty`'s column at `index`, or `None` if this archetype lacks it.
+    ///
+    /// # Safety
+    /// As [`get_dynamic_by_id`](Self::get_dynamic_by_id).
     pub(crate) unsafe fn get_dynamic(&self, ty: &TypeInfo, index: u32) -> Option<GCPtr> {
         self.get_dynamic_by_id(ty.id(), index)
     }
@@ -330,7 +357,9 @@ impl Archetype {
     /// Get a GC pointer by pre-resolved column index and entity slot.
     ///
     /// # Safety
-    /// `col` must be a valid column index and `index` a valid entity slot.
+    /// `col < types().len()` and `index` is below the allocated slots (its chunk exists).
+    /// Dereferencing the result later needs STRUCT (or NS with no move since), a borrow of the
+    /// slot (a gc guard or a column borrow) and the column's matching type.
     pub unsafe fn get_gc_ptr_by_column(&self, col: usize, index: u32) -> GCPtr {
         unsafe { self.data.get_unchecked(col).get_gc_ptr(index) }
     }
@@ -338,7 +367,9 @@ impl Archetype {
     /// Look up a component's GC pointer by `StableTypeId` and entity index.
     ///
     /// # Safety
-    /// `index` must be a valid entity slot in this archetype.
+    /// `index` is below the allocated slots and the row is occupied (debug-checked); no
+    /// concurrent NS writer. Dereferencing the result needs what
+    /// [`get_gc_ptr_by_column`](Self::get_gc_ptr_by_column)'s result needs.
     pub unsafe fn get_dynamic_by_id(&self, id: StableTypeId, index: u32) -> Option<GCPtr> {
         debug_assert!(index < self.len.read_nonsync());
         debug_assert!(self.entities[index as usize].read_id_nonsync() != u32::MAX);
@@ -350,12 +381,33 @@ impl Archetype {
         Some(ptr)
     }
 
+    /// Whether every component of row `index`, except those whose id `skip` accepts, is
+    /// movable ([`GCPtr::is_movable`]): `Alive`, not pending dead, no gc borrow guard.
+    ///
+    /// # Safety
+    /// NS; `index` is below the allocated slots.
+    pub(crate) unsafe fn row_movable(
+        &self,
+        index: u32,
+        skip: impl Fn(StableTypeId) -> bool,
+    ) -> bool {
+        self.types
+            .iter()
+            .zip(&*self.data)
+            .all(|(ty, data)| skip(ty.id()) || data.get_gc_ptr(index).is_movable())
+    }
+
     /// Every type must be written immediately after this call
     /// This cannot be called from multiple threads concurrently
+    ///
+    /// # Safety
+    /// NS. Every column of the returned row must be written (`move_from_value`/`move_from`)
+    /// before anything reads it. A growth adds chunks and grows the entity column (outstanding
+    /// slices stay valid but stale).
     pub(crate) unsafe fn allocate_nonsync(&self, entity: Entity, world_slot: NonZeroU32) -> u32 {
         let free_ptr = self.first_free.read_nonsync();
         let new_slot =
-            if let Some(free_value) = NonNull::new(free_ptr).map(|ptr| GCPtr { value: ptr }) {
+            if let Some(free_value) = NonNull::new(free_ptr).map(|ptr| unsafe { GCPtr::from_raw(ptr) }) {
                 let gc_header = unsafe { &mut *free_value.header_ptr().as_ptr() };
                 let crate::gc::State::Free { next_free } = gc_header.state else {
                     panic!("value in free list but state is not free")
@@ -363,7 +415,7 @@ impl Archetype {
                 gc_header.state = crate::gc::State::Free { next_free: None };
                 self.first_free.write_nonsync(
                     next_free
-                        .map(|ptr| ptr.value.as_ptr())
+                        .map(|ptr| ptr.value().as_ptr())
                         .unwrap_or(null_mut()),
                 );
                 let current_num_free = self.num_free.read_nonsync();
@@ -384,6 +436,9 @@ impl Archetype {
 
     /// Make room for `additional` more slots (free-listed slots count) with
     /// at most one growth.
+    ///
+    /// # Safety
+    /// NS.
     pub(crate) unsafe fn reserve_nonsync(&self, additional: u32, world_slot: NonZeroU32) {
         let needed = additional.saturating_sub(self.num_free.read_nonsync());
         let spare = self.entities.len_nonsync() as u32 - self.len.read_nonsync();
@@ -409,34 +464,9 @@ impl Archetype {
     }
 
     /// Increase capacity by at least `min_increment`
-    fn grow_sync(&self, min_increment: u32, world_slot: NonZeroU32) {
-        let archetype_ptr = self as *const Archetype;
-        // Double capacity or increase it by `min_increment`, whichever is larger.
-        let additional = self.capacity().max(min_increment) as usize;
-        let new_cap = self.entities.len() + additional;
-        self.entities
-            .extend_with_sync(additional, EntityCell::free());
-
-        for data in &*self.data {
-            let entities_per_chunk = data.entities_per_chunk;
-            let num_chunks_required = new_cap / entities_per_chunk + 1;
-            let new_chunks = num_chunks_required.saturating_sub(data.storage.len());
-            for _ in 0..new_chunks {
-                unsafe {
-                    let mem = alloc_zeroed(data.storage_layout);
-                    assert!(!mem.is_null(), "allocation failed");
-                    mem.cast::<StorageHeader>().write(data.new_storage_header(
-                        archetype_ptr,
-                        world_slot,
-                        data.storage.len(),
-                    ));
-                    data.storage.push_sync(mem);
-                }
-            }
-        }
-    }
-
-    /// Increase capacity by at least `min_increment`
+    ///
+    /// # Safety
+    /// NS, and `world_slot` is the owning world's.
     unsafe fn grow_nonsync(&self, min_increment: u32, world_slot: NonZeroU32) {
         let archetype_ptr = self as *const Archetype;
         // Double capacity or increase it by `min_increment`, whichever is larger.
@@ -491,6 +521,10 @@ impl Archetype {
         }
     }
 
+    /// Drop (or leave pending dead) every component of row `index` and free its entity cell.
+    ///
+    /// # Safety
+    /// `index` is an occupied row whose entity was already retired; no column borrows on it.
     pub(crate) unsafe fn remove(&mut self, index: u32) {
         for (ty, data) in self.types.iter().zip(&*self.data) {
             let mut to_remove = data.get_gc_ptr(index);
@@ -498,6 +532,10 @@ impl Archetype {
         }
         self.entities[index as usize].set_free();
     }
+    /// [`remove`](Self::remove) through `&self`.
+    ///
+    /// # Safety
+    /// As [`remove`](Self::remove), plus NS.
     pub(crate) unsafe fn remove_nonsync(&self, index: u32) {
         for (ty, data) in self.types.iter().zip(&*self.data) {
             let mut to_remove = data.get_gc_ptr(index);
@@ -507,6 +545,10 @@ impl Archetype {
     }
 
     /// Returns the ID of the entity moved into `index`, if any
+    ///
+    /// # Safety
+    /// NS; `index` is an occupied row; `f` must move each slot it is given (or leave it to
+    /// the caller, who already tombstoned it), and only movable ones.
     pub(crate) unsafe fn move_to(
         &self,
         index: u32,
@@ -520,6 +562,11 @@ impl Archetype {
         None
     }
 
+    /// Move the value at `component_data` into `ty`'s column at `index`.
+    ///
+    /// # Safety
+    /// As [`GCPtr::move_from_value`]: NS, the slot is free (freshly allocated), and
+    /// `component_data` points to a valid `ty` the caller then forgets.
     pub(crate) unsafe fn put_new_dynamic_nonsync(
         &self,
         component_data: *mut u8,
@@ -530,6 +577,11 @@ impl Archetype {
         ptr.move_from_value(ty, component_data);
     }
 
+    /// Move `gc_ptr`'s value into `ty`'s column at `index`.
+    ///
+    /// # Safety
+    /// As [`GCPtr::move_from`]: NS, the target slot is free, and `gc_ptr` is movable (checked
+    /// by the caller before the operation changed anything).
     pub(crate) unsafe fn move_from_nonsync(&self, gc_ptr: GCPtr, ty: &TypeInfo, index: u32) {
         let mut ptr = self.get_dynamic(ty, index).unwrap();
         ptr.move_from(ty, gc_ptr);
@@ -578,6 +630,8 @@ impl Archetype {
         self.quarantined.get(slot)
     }
 
+    /// # Safety
+    /// NS; no `is_quarantined` read concurrently.
     pub(crate) unsafe fn set_quarantined_nonsync(&self, slot: u32, on: bool) {
         self.quarantined.set(slot, on);
         if on {
@@ -585,14 +639,23 @@ impl Archetype {
         }
     }
 
+    /// # Safety
+    /// As [`is_quarantined`](Self::is_quarantined).
     pub(crate) unsafe fn is_sweep_released(&self, slot: u32) -> bool {
         self.sweep_released.get(slot)
     }
 
+    /// # Safety
+    /// As [`set_quarantined_nonsync`](Self::set_quarantined_nonsync).
     pub(crate) unsafe fn set_sweep_released_nonsync(&self, slot: u32, on: bool) {
         self.sweep_released.set(slot, on);
     }
 
+    /// Put row `slot` on the free list (every column `Free`).
+    ///
+    /// # Safety
+    /// NS; `slot` is below the allocated slots, its entity cell is free, and every column is
+    /// `Dead` or `Moved` and unreferenced (the sweep checks this): no `GCPtr` to it is used again.
     pub(crate) unsafe fn free_slot(&self, slot: u32) {
         let current_num_free = self.num_free.read_nonsync();
         self.num_free.write_nonsync(current_num_free + 1);
@@ -609,7 +672,7 @@ impl Archetype {
             let slot_ptr = storage.get_gc_ptr(slot);
             if idx == 0 {
                 slot_ptr.header_ptr().as_mut().state = crate::gc::State::Free {
-                    next_free: NonNull::new(current_free_head).map(|ptr| GCPtr { value: ptr }),
+                    next_free: NonNull::new(current_free_head).map(|ptr| unsafe { GCPtr::from_raw(ptr) }),
                 };
                 new_free_head = Some(slot_ptr);
             } else {
@@ -618,7 +681,7 @@ impl Archetype {
         }
         self.first_free.write_nonsync(
             new_free_head
-                .map(|ptr| ptr.value.as_ptr())
+                .map(|ptr| ptr.value().as_ptr())
                 .unwrap_or(null_mut()),
         );
     }
@@ -744,7 +807,9 @@ impl Data {
     /// [`chunks`](Self::chunks).
     ///
     /// # Safety
-    /// `idx` is below the archetype's allocated slot count.
+    /// `idx` has a chunk: `idx < chunks().len() * entities_per_chunk()`, which holds for any
+    /// `idx` below the archetype's allocated slot count. Dereferencing the result needs NS or
+    /// STRUCT, and a borrow of the slot as for any [`GCPtr`].
     #[inline(always)]
     pub unsafe fn slot_ptr(&self, idx: u32) -> *mut u8 {
         let idx = idx as usize;
@@ -753,6 +818,10 @@ impl Data {
             .add(self.data_start + (idx % self.entities_per_chunk) * self.stride)
     }
 
+    /// The [`GCPtr`] of slot `idx`.
+    ///
+    /// # Safety
+    /// As [`slot_ptr`](Self::slot_ptr): `idx` is below the allocated slots.
     pub unsafe fn get_gc_ptr(&self, idx: u32) -> GCPtr {
         let idx = idx as usize;
         let entities_per_chunk = self.entities_per_chunk;
@@ -768,6 +837,10 @@ impl Data {
         )
     }
 
+    /// The value pointer of slot `idx`.
+    ///
+    /// # Safety
+    /// As [`slot_ptr`](Self::slot_ptr).
     pub(crate) unsafe fn get_value(&self, idx: u32) -> NonNull<u8> {
         let idx = idx as usize;
         let entities_per_chunk = self.entities_per_chunk;
@@ -782,6 +855,11 @@ impl Data {
         }
     }
 
+    /// The [`GCPtr`]s of slots `0..num_allocated_slots`.
+    ///
+    /// # Safety
+    /// `num_allocated_slots` is at most the archetype's allocated slot count; no chunk is added
+    /// while the iterator is alive (STRUCT).
     pub(crate) unsafe fn iter_gc_ptr<'a>(
         &'a self,
         num_allocated_slots: u32,
@@ -1002,6 +1080,9 @@ impl TypeInfo {
     ///
     /// All of the caveats of [`core::ptr::drop_in_place`] apply, with the additional requirement
     /// that this method is being called on a pointer to an object of the correct component type.
+    /// No `&` or `&mut` to the value may be live (or used afterwards), and it is never dropped
+    /// twice: a slot's value is dropped by exactly one of `drop_value_and_tombstone` or, for a
+    /// slot left pending dead under a gc guard, `gc::sweep`.
     pub unsafe fn drop_value(&self, data: *mut u8) {
         match self.drop {
             DropFn::Typed(f) => f(data),

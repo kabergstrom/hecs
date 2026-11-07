@@ -268,6 +268,8 @@ impl Entities {
             "flush() needs to be called before this operation is legal"
         );
     }
+    /// # Safety
+    /// As [`needs_flush_nonsync`](Self::needs_flush_nonsync).
     unsafe fn verify_flushed_nonsync(&self) {
         debug_assert!(
             !self.needs_flush_nonsync(),
@@ -304,6 +306,10 @@ impl Entities {
     /// Allocate an entity ID directly
     ///
     /// Location should be written immediately.
+    ///
+    /// # Safety
+    /// NS, and no reserved entities await a flush (debug-checked). A push may grow `meta`
+    /// (outstanding `&[EntityMeta]` stay valid but stale).
     pub unsafe fn alloc_nonsync(&self) -> Entity {
         self.verify_flushed_nonsync();
 
@@ -475,6 +481,10 @@ impl Entities {
     /// Destroy an entity in a nonsync context, allowing its ID to be reused.
     ///
     /// Must not be called while reserved entities are awaiting `flush()`.
+    ///
+    /// # Safety
+    /// NS. No live `&EntityMeta` into this entity's entry, no reserved entities awaiting a
+    /// flush.
     pub unsafe fn retire_nonsync(&self, entity: Entity) -> Result<Location, NoSuchEntity> {
         self.verify_flushed_nonsync();
 
@@ -508,6 +518,9 @@ impl Entities {
     /// Destroy an entity but hold its ID: the generation is kept and the ID stays off the
     /// freelist, so the same `Entity` bits can be revived ([`revive_nonsync`](Self::revive_nonsync))
     /// until [`release_held_nonsync`](Self::release_held_nonsync).
+    ///
+    /// # Safety
+    /// As [`retire_nonsync`](Self::retire_nonsync).
     pub unsafe fn hold_nonsync(&self, entity: Entity) -> Result<Location, NoSuchEntity> {
         self.verify_flushed_nonsync();
         let id = entity.id as usize;
@@ -528,6 +541,9 @@ impl Entities {
 
     /// Whether `entity`'s ID is held: destroyed by [`hold_nonsync`](Self::hold_nonsync) and not
     /// yet revived or released.
+    ///
+    /// # Safety
+    /// NS: no concurrent writer of `meta`.
     pub unsafe fn is_held_nonsync(&self, entity: Entity) -> bool {
         let id = entity.id as usize;
         id < self.meta.len_nonsync() && {
@@ -537,6 +553,10 @@ impl Entities {
     }
 
     /// Make a held `entity` live again at `location`. False when its ID is not held.
+    ///
+    /// # Safety
+    /// NS, no live `&EntityMeta` into this entity's entry, and `location` names a row that
+    /// holds `entity`.
     pub unsafe fn revive_nonsync(&self, entity: Entity, location: Location) -> bool {
         if !self.is_held_nonsync(entity) {
             return false;
@@ -554,6 +574,9 @@ impl Entities {
     }
 
     /// Return a held ID to the freelist (bumping its generation). False when it is not held.
+    ///
+    /// # Safety
+    /// As [`retire_nonsync`](Self::retire_nonsync).
     pub unsafe fn release_held_nonsync(&self, entity: Entity) -> bool {
         self.verify_flushed_nonsync();
         if !self.is_held_nonsync(entity) {
@@ -646,7 +669,9 @@ impl Entities {
     /// Panics if the given id would represent an index outside of `meta`.
     ///
     /// # Safety
-    /// Must only be called for currently allocated `id`s.
+    /// No concurrent NS writer on another thread (it reads `meta` through a shared slice that a
+    /// growth could replace). Any `id` is otherwise fine: one that is not live yields an
+    /// `Entity` that resolves to nothing (or to whatever reuses the id), never UB.
     pub unsafe fn resolve_unknown_gen(&self, id: u32) -> Entity {
         let meta_len = self.meta.len();
 
@@ -677,6 +702,8 @@ impl Entities {
         self.free_cursor.read() != self.pending.len() as isize
     }
 
+    /// # Safety
+    /// NS: no concurrent writer of the pending list.
     unsafe fn needs_flush_nonsync(&self) -> bool {
         self.free_cursor.read_nonsync() != self.pending.len() as isize
     }
@@ -721,23 +748,30 @@ impl Entities {
         self.pending.truncate(new_free_cursor);
     }
 
+    /// [`flush`](Self::flush) through `&self`.
+    ///
+    /// # Safety
+    /// NS. No live `&[EntityMeta]` (e.g. from [`World::iter`](crate::World::iter)), query or
+    /// `View` that reads `meta`, and no `&EntityMeta` or `&u32` into the pending list: this
+    /// writes the locations of flushed entities and truncates the pending list. `init` must
+    /// not touch this `Entities`.
     pub unsafe fn flush_nonsync(&self, mut init: impl FnMut(Entity, &mut Location)) {
         let free_cursor = self.free_cursor.read_nonsync();
 
         let new_free_cursor = if free_cursor >= 0 {
             free_cursor as usize
         } else {
-            let old_meta_len = self.meta.len();
+            let old_meta_len = self.meta.len_nonsync();
             self.meta
                 .extend_with_nonsync((-free_cursor) as usize, EntityMeta::EMPTY);
 
             let len = self.len.read_nonsync();
             self.len.write_nonsync(len + (-free_cursor) as u32);
-            // there can be no active references to individual locations in a !Sync context
-            let mut_ptr = self.meta.as_ptr() as *mut EntityMeta;
-            let meta_slice = core::slice::from_raw_parts_mut(mut_ptr, self.meta.len_nonsync());
-
-            for (id, meta) in meta_slice.iter_mut().enumerate().skip(old_meta_len) {
+            // Taken from the allocation (the cell), not a `Deref` slice, so it may write. The
+            // contract rules out other references to these elements.
+            let meta = self.meta.as_mut_ptr_nonsync();
+            for id in old_meta_len..self.meta.len_nonsync() {
+                let meta = &mut *meta.add(id);
                 let entity = Entity {
                     id: id as u32,
                     generation: meta.generation,
@@ -749,26 +783,25 @@ impl Entities {
             0
         };
 
+        let pending_len = self.pending.len_nonsync();
         let len = self.len.read_nonsync();
         self.len
-            .write_nonsync(len + (self.pending.len_nonsync() - new_free_cursor) as u32);
-        // there can be no active references to individual locations in a !Sync context
-        let mut_ptr = self.meta.as_ptr() as *mut EntityMeta;
-        let meta_slice = core::slice::from_raw_parts_mut(mut_ptr, self.meta.len_nonsync());
-
-        for id in &self.pending[new_free_cursor..] {
-            let meta = &mut meta_slice[*id as usize];
+            .write_nonsync(len + (pending_len - new_free_cursor) as u32);
+        let meta = self.meta.as_mut_ptr_nonsync();
+        let meta_len = self.meta.len_nonsync();
+        let pending = self.pending.as_mut_ptr_nonsync();
+        for i in new_free_cursor..pending_len {
+            let id = *pending.add(i) as usize;
+            assert!(id < meta_len, "pending entity id out of range");
+            let meta = &mut *meta.add(id);
             let entity = Entity {
-                id: *id,
+                id: id as u32,
                 generation: meta.generation,
             };
             init(entity, &mut meta.location);
         }
-        // there can be no active references to the pending list in a !Sync context
-        // (reserve_entities cannot be called)
-        let pending_ptr = core::ptr::addr_of!(self.pending) as *mut KVec<EntityMeta>;
-        let pending_mut = &mut *pending_ptr;
-        pending_mut.truncate(new_free_cursor);
+        // `reserve_entities` cannot run under NS, so nothing references the pending list.
+        self.pending.truncate_nonsync(new_free_cursor);
     }
 
     #[inline]
