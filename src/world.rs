@@ -314,6 +314,8 @@ impl World {
                 debug_assert_eq!(crate::gc::header::state(word.get()), crate::gc::header::FREE);
                 word.set(crate::gc::header::ALIVE_WORD);
             }
+            // New cells, unarmed: grey during an incremental cycle.
+            crate::gc::incr::on_new_cells(self.world_slot, arch.types()[col].id(), slots.iter().map(|&s| data.get_gc_ptr(s)));
         }
         init(&SpawnRows {
             archetype: arch,
@@ -746,7 +748,10 @@ impl World {
         let revived = self.entities.revive_nonsync(entity, Location { archetype: key, index: slot });
         debug_assert!(revived, "checked held above");
         for col in 0..arch.types().len() {
-            revive_cell(arch.get_data_storage(col), slot);
+            let data = arch.get_data_storage(col);
+            revive_cell(data, slot);
+            // Old bytes come back without a write: grey during an incremental cycle.
+            crate::gc::incr::on_new_cells(self.world_slot, arch.types()[col].id(), core::iter::once(data.get_gc_ptr(slot)));
         }
         Ok(slot)
     }
@@ -790,6 +795,7 @@ impl World {
             for &(_, slot) in rows {
                 revive_cell(data, slot);
             }
+            crate::gc::incr::on_new_cells(self.world_slot, arch.types()[col].id(), rows.iter().map(|&(_, s)| data.get_gc_ptr(s)));
         }
         Ok(())
     }
@@ -1042,7 +1048,7 @@ impl World {
                         let src = old.get_gc_ptr_by_column(col, index);
                         let mut dst = new.get_dynamic_by_id(ty.id(), target).unwrap();
                         if changed(ty.id()).is_some() {
-                            dst.migrate_from(src, |s, d| migrate(ty.id(), s, d));
+                            dst.migrate_from(ty.id(), src, |s, d| migrate(ty.id(), s, d));
                         } else {
                             dst.move_from(ty, src);
                         }
@@ -1105,6 +1111,14 @@ impl World {
     /// assert!(entities.contains(&(a, 123, true)));
     /// assert!(entities.contains(&(b, 456, false)));
     /// ```
+    ///
+    /// **No incremental-GC write barrier for `&mut T`.** A `&mut T` term borrows the whole column
+    /// and writes its slots without their borrow flags, so an armed slot is not greyed. It must
+    /// not be used on a world while an incremental GC cycle is active on it
+    /// ([`gc::incr::cycle_active`](crate::gc::incr::cycle_active)): a reference written there is
+    /// missed and its target can be freed. A debug build's assert in the column borrow is the only
+    /// check; a release build has none. Write a slot through a gc `CRef` instead
+    /// (see [`gc::incr`](crate::gc::incr)).
     pub fn query<Q: Query>(&self) -> QueryBorrow<'_, Q> {
         QueryBorrow::new(&self.entities.meta, &self.archetypes.archetypes)
     }
@@ -1114,6 +1128,14 @@ impl World {
     /// Like [`query`](Self::query), but faster because dynamic borrow checks can be skipped. Note
     /// that, unlike [`query`](Self::query), this returns an `IntoIterator` which can be passed
     /// directly to a `for` loop.
+    ///
+    /// **No incremental-GC write barrier, and no check.** A `&mut T` term writes slots without
+    /// their borrow flags, so an armed slot is not greyed, and this path skips the dynamic
+    /// column borrow, so not even a debug build's assert sees it. It must not write a slot of a
+    /// world while an incremental GC cycle is active on it
+    /// ([`gc::incr::cycle_active`](crate::gc::incr::cycle_active)): a reference written there is
+    /// missed and its target can be freed. Write a slot through a gc `CRef` instead
+    /// (see [`gc::incr`](crate::gc::incr)).
     pub fn query_mut<Q: Query>(&mut self) -> QueryMut<'_, Q> {
         QueryMut::new(&self.entities.meta, &mut self.archetypes.archetypes)
     }
@@ -1136,6 +1158,12 @@ impl World {
 
     #[inline]
     pub(crate) fn world_slot(&self) -> NonZeroU32 {
+        self.world_slot
+    }
+
+    /// This world's slot in the per-world GC tables (as [`GCPtr::world_slot`](crate::gc::GCPtr::world_slot)
+    /// of its slots).
+    pub fn gc_world_slot(&self) -> NonZeroU32 {
         self.world_slot
     }
 
@@ -1187,6 +1215,14 @@ impl World {
     /// if *flag { *number *= 2; }
     /// assert_eq!(*number, 246);
     /// ```
+    ///
+    /// **No incremental-GC write barrier for `&mut T`.** A `&mut T` term borrows the whole column
+    /// and writes its slots without their borrow flags, so an armed slot is not greyed. It must
+    /// not be used on a world while an incremental GC cycle is active on it
+    /// ([`gc::incr::cycle_active`](crate::gc::incr::cycle_active)): a reference written there is
+    /// missed and its target can be freed. A debug build's assert in the column borrow is the only
+    /// check; a release build has none. Write a slot through a gc `CRef` instead
+    /// (see [`gc::incr`](crate::gc::incr)).
     pub fn query_one<Q: Query>(&self, entity: Entity) -> Result<QueryOne<'_, Q>, NoSuchEntity> {
         let loc = self.entities.get(entity)?;
         Ok(unsafe { QueryOne::new(&self.archetypes.archetypes[loc.archetype], loc.index) })
@@ -1197,6 +1233,14 @@ impl World {
     /// Like [`query_one`](Self::query_one), but faster because dynamic borrow checks can be
     /// skipped. Note that, unlike [`query_one`](Self::query_one), on success this returns the
     /// query's results directly.
+    ///
+    /// **No incremental-GC write barrier, and no check.** A `&mut T` term writes slots without
+    /// their borrow flags, so an armed slot is not greyed, and this path skips the dynamic
+    /// column borrow, so not even a debug build's assert sees it. It must not write a slot of a
+    /// world while an incremental GC cycle is active on it
+    /// ([`gc::incr::cycle_active`](crate::gc::incr::cycle_active)): a reference written there is
+    /// missed and its target can be freed. Write a slot through a gc `CRef` instead
+    /// (see [`gc::incr`](crate::gc::incr)).
     pub fn query_one_mut<Q: Query>(
         &mut self,
         entity: Entity,
@@ -1209,6 +1253,14 @@ impl World {
     }
 
     /// Short-hand for [`entity`](Self::entity) followed by [`EntityRef::get`]
+    ///
+    /// **No incremental-GC write barrier for `&mut T`.** `get::<&mut T>` borrows the whole column
+    /// and writes its slots without their borrow flags, so an armed slot is not greyed. It must
+    /// not be used on a world while an incremental GC cycle is active on it
+    /// ([`gc::incr::cycle_active`](crate::gc::incr::cycle_active)): a reference written there is
+    /// missed and its target can be freed. A debug build's assert in the column borrow is the only
+    /// check; a release build has none. Write a slot through a gc `CRef` instead
+    /// (see [`gc::incr`](crate::gc::incr)).
     pub fn get<'a, T: ComponentRef<'a>>(
         &'a self,
         entity: Entity,
@@ -1791,6 +1843,10 @@ impl World {
     /// - STRUCT while the result is alive: it points at the component's current row, which a
     ///   move or despawn through `&self` (`*_nonsync`) would vacate.
     /// - No concurrent NS writer on another thread.
+    /// - For `&mut T`: no incremental GC cycle is active on this world
+    ///   ([`gc::incr::cycle_active`](crate::gc::incr::cycle_active)). The write takes no
+    ///   borrow flag, so it has no write barrier, and nothing checks this, not even in a debug
+    ///   build: a reference written during a cycle is missed and its target can be freed.
     pub unsafe fn get_unchecked<'a, T: ComponentRef<'a>>(
         &'a self,
         entity: Entity,

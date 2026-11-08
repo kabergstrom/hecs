@@ -219,8 +219,28 @@ impl Archetype {
         }
     }
 
+    /// The dynamic column borrow behind every checked `&mut T` fetch (`World::query`,
+    /// `query_one`, `World::get`, `EntityRef::get`).
+    ///
+    /// **No incremental-GC write barrier.** The fetch writes the column's cells without their
+    /// header words, so an armed cell is not greyed: it must not run on a world while an
+    /// incremental GC cycle is active on it ([`crate::gc::incr`]). The `debug_assert` below is
+    /// the only check, and only a debug build makes it. The unchecked paths (`query_mut`,
+    /// `query_one_mut`, `PreparedQuery::query_mut`/`view_mut`, `get_unchecked`) skip this
+    /// borrow and are not checked at all.
     pub(crate) fn borrow_mut<T: Component>(&self, state: usize) {
         assert_eq!(self.types[state].id, T::STABLE_TYPE_ID);
+        #[cfg(debug_assertions)]
+        if let Some(&chunk) = self.data[state].chunks().first() {
+            // SAFETY: chunk 0 is allocated and starts with its storage header, which names the
+            // owning world.
+            let world_slot = unsafe { (*chunk.cast::<StorageHeader>()).world_slot };
+            debug_assert!(
+                !crate::gc::incr::cycle_active(world_slot),
+                "a `&mut {}` column fetch during an incremental GC cycle (no write barrier)",
+                type_name::<T>()
+            );
+        }
 
         if !self.data[state].state.borrow_mut() {
             panic!("{} already borrowed", type_name::<T>());

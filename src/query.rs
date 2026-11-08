@@ -1241,6 +1241,14 @@ impl<Q: Query> PreparedQuery<Q> {
     /// Query a uniquely borrowed world
     ///
     /// Avoids the cost of the dynamic borrow checking performed by [`query`][Self::query].
+    ///
+    /// **No incremental-GC write barrier, and no check.** A `&mut T` term writes slots without
+    /// their borrow flags, so an armed slot is not greyed, and this path skips the dynamic
+    /// column borrow, so not even a debug build's assert sees it. It must not write a slot of a
+    /// world while an incremental GC cycle is active on it
+    /// ([`gc::incr::cycle_active`](crate::gc::incr::cycle_active)): a reference written there is
+    /// missed and its target can be freed. Write a slot through a gc `CRef` instead
+    /// (see [`gc::incr`](crate::gc::incr)).
     pub fn query_mut<'q>(&'q mut self, world: &'q mut World) -> PreparedQueryIter<'q, Q> {
         assert_borrow::<Q>();
 
@@ -1258,6 +1266,14 @@ impl<Q: Query> PreparedQuery<Q> {
     }
 
     /// Provide random access to query results for a uniquely borrow world
+    ///
+    /// **No incremental-GC write barrier, and no check.** A `&mut T` term writes slots without
+    /// their borrow flags, so an armed slot is not greyed, and this path skips the dynamic
+    /// column borrow, so not even a debug build's assert sees it. It must not write a slot of a
+    /// world while an incremental GC cycle is active on it
+    /// ([`gc::incr::cycle_active`](crate::gc::incr::cycle_active)): a reference written there is
+    /// missed and its target can be freed. Write a slot through a gc `CRef` instead
+    /// (see [`gc::incr`](crate::gc::incr)).
     pub fn view_mut<'q>(&'q mut self, world: &'q mut World) -> PreparedView<'q, Q> {
         assert_borrow::<Q>();
 

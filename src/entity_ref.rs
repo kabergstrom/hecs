@@ -67,6 +67,14 @@ impl<'a> EntityRef<'a> {
     ///
     /// Panics if `T` is a unique reference and the component is already borrowed, or if the
     /// component is already uniquely borrowed.
+    ///
+    /// **No incremental-GC write barrier for `&mut T`.** `get::<&mut T>` borrows the whole column
+    /// and writes its slots without their borrow flags, so an armed slot is not greyed. It must
+    /// not be used on a world while an incremental GC cycle is active on it
+    /// ([`gc::incr::cycle_active`](crate::gc::incr::cycle_active)): a reference written there is
+    /// missed and its target can be freed. A debug build's assert in the column borrow is the only
+    /// check; a release build has none. Write a slot through a gc `CRef` instead
+    /// (see [`gc::incr`](crate::gc::incr)).
     pub fn get<T: ComponentRef<'a>>(&self) -> Option<T::Ref> {
         T::get_component(*self)
     }

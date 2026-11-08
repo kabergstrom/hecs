@@ -1,6 +1,7 @@
 mod borrow;
 mod gc_world;
 pub mod header;
+pub mod incr;
 #[allow(missing_documentation)]
 pub mod kvec;
 
@@ -17,7 +18,8 @@ pub use gc_world::{GcWorld, GcWorldScope, ReadWorld};
 pub use header::{HeaderWord, SlotState};
 pub use query::*;
 
-use self::borrow::{BorrowRef, BorrowRefMut, Ref, RefMut};
+pub use self::borrow::{Ref, RefMut};
+use self::borrow::{BorrowRef, BorrowRefMut};
 use self::header::{
     ALIVE, ALIVE_WORD, CHUNK_BYTES, DEAD, FREE, HEADERS_OFFSET, HEADER_BYTES, MARK, MOVED,
     PENDING_DEAD, STATE_MASK,
@@ -193,13 +195,16 @@ impl GCPtr {
         header::is_movable(unsafe { self.word() }.get())
     }
 
-    /// The world's current mark parity: what a tombstone written now is unmarked under. Every
-    /// tombstone write (Dead, Moved, pending_dead) takes its mark from here: the incremental
-    /// collector's `on_tombstone` (marked while a cycle is active) is `parity ^ 1` here during
-    /// a cycle, in the same single store.
+    /// The parity a tombstone written now is unmarked under ([`header::tombstone`]). Every
+    /// tombstone write (Dead, Moved, pending_dead) takes its mark from here. Outside an
+    /// incremental cycle it is the world's [mark parity](mark_parity), so the tombstone is
+    /// written unmarked; while a cycle is active ([`incr::begin_cycle`]) it is `parity ^ 1`, so
+    /// the tombstone is written marked in this cycle (in the same single store) and this
+    /// cycle's sweep keeps it: the scan may have met a `CRef` to it while it was live, whose
+    /// mark it did not write.
     #[inline]
     fn parity(&self) -> u32 {
-        mark_parity(self.world_slot())
+        tombstone_parity(self.world_slot())
     }
 
     /// Set the cell's state to `Dead` without dropping its value; the caller has taken (or
@@ -314,6 +319,7 @@ impl GCPtr {
         assert!(header::state(word.get()) == FREE);
         word.set(ALIVE_WORD);
         core::ptr::copy_nonoverlapping(value, self.value_ptr().as_ptr(), ty.value_layout().size());
+        incr::on_new_cell(*self, || ty.id());
     }
 
     /// Move `src`'s value (a `ty`, bitwise) into this free cell; `src` becomes a `Moved`
@@ -336,6 +342,9 @@ impl GCPtr {
             ty.value_layout().size(),
         );
         poison_vacated(src.value_ptr().as_ptr(), ty.value_layout().size());
+        // A new cell (grey during a cycle: the arm stays behind with `src`, now a tombstone,
+        // marked during a cycle).
+        incr::on_new_cell(*self, || ty.id());
     }
 
     /// Like `move_from`, but `f(src_value, dst_value)` builds the destination
@@ -345,13 +354,14 @@ impl GCPtr {
     /// # Safety
     /// As [`move_from`](Self::move_from), with `f` initializing a valid value of this cell's
     /// column type from `src`'s.
-    pub(crate) unsafe fn migrate_from(&mut self, src: GCPtr, f: impl FnOnce(*mut u8, *mut u8)) {
+    pub(crate) unsafe fn migrate_from(&mut self, ty: StableTypeId, src: GCPtr, f: impl FnOnce(*mut u8, *mut u8)) {
         debug_assert!(src != *self);
         debug_assert!(header::state(self.word().get()) == FREE);
         debug_assert!(src.is_movable(), "migrating a borrowed or dead slot");
         self.word().set(ALIVE_WORD);
         src.set_moved(*self);
         f(src.value_ptr().as_ptr(), self.value_ptr().as_ptr());
+        incr::on_new_cell(*self, || ty);
     }
 
     /// Make this movable cell (or a vacant `Dead` one: a revive pointing a row its entity left
@@ -423,6 +433,15 @@ impl GCPtr {
     /// armed, clear the arm and grey it (the [`on_armed_write`] hook). One load and one masked
     /// compare when unarmed; untyped addressing (the chunk header's geometry).
     ///
+    /// **Only writes that take a cell's borrow, or call this, are seen by the incremental
+    /// collector.** A write through a raw value pointer or a native `&mut T` (hecs's
+    /// `query_mut`, `query_one_mut`, `PreparedQuery::query_mut`/`view_mut`,
+    /// `get_unchecked::<&mut T>`, and `query`/`query_one`/`get`/`EntityRef::get` with a `&mut T`
+    /// term) that skips this barrier must not store a reference into a cell of a world while an
+    /// incremental cycle is active on it ([`incr::cycle_active`]): the trace misses it and the
+    /// target can be freed. Debug builds assert it only for the column-borrowing fetches; release
+    /// builds check nothing ([`incr`] has the list).
+    ///
     /// # Safety
     /// NS.
     #[inline(always)]
@@ -439,7 +458,7 @@ impl GCPtr {
     /// # Safety
     /// As [`mark_referenced`](Self::mark_referenced).
     pub unsafe fn chain_kept(&self) -> bool {
-        let p = self.parity();
+        let p = mark_parity(self.world_slot());
         let mut ptr = *self;
         loop {
             let w = ptr.word().get();
@@ -789,16 +808,19 @@ impl<T: Component> CRef<T> {
 /// the module API's cold path (the engine routes `newgameplus_api`'s `armed_write` here through
 /// its CRef bridge).
 ///
-/// No collector arms cells yet (only [`HeaderWord::arm`] does, which nothing but tests calls),
-/// and a cell nobody armed needs no grey, so this greys nothing: the incremental collector
-/// greys `slot` here. It counts the calls per thread ([`armed_writes`]); the count costs a
+/// During a cycle on the cell's world ([`incr::begin_cycle`]) it pushes `slot` to the world's
+/// grey list ([`incr::take_grey`]), so the incremental collector traces it again before the
+/// cycle ends. It counts the calls per thread ([`armed_writes`]); the count costs a
 /// thread-local increment on this cold path only.
+///
+/// A write that takes no borrow and skips [`GCPtr::barrier`] (hecs's native `&mut T` fetches,
+/// a raw value-pointer write) never gets here: see [`incr`].
 #[cold]
 #[inline(never)]
 pub fn on_armed_write(slot: GCPtr) {
     #[cfg(feature = "std")]
     ARMED_WRITES.with(|c| c.set(c.get() + 1));
-    let _ = slot;
+    incr::grey_written(slot);
 }
 
 #[cfg(feature = "std")]
@@ -884,7 +906,7 @@ pub(crate) unsafe fn set_moved_at(sh: &StorageHeader, index: usize, target: GCPt
     let table = sh.forward_table_or_alloc();
     *table.add(index) = target.value.as_ptr();
     sh.moved.set(sh.moved.get() + 1);
-    word_at(sh, index).set(header::tombstone(MOVED, mark_parity(sh.world_slot)));
+    word_at(sh, index).set(header::tombstone(MOVED, tombstone_parity(sh.world_slot)));
 }
 
 /// [`GCPtr::clear_moved`] of cell `index` of the chunk headed by `sh`.
@@ -1143,15 +1165,25 @@ fn poison_vacated(value: *mut u8, size: usize) {
     #[cfg(not(all(debug_assertions, feature = "std")))]
     let _ = (value, size);
 }
-/// Per world slot: the parity of the current GC cycle's marks (0 or 1). A cell is marked in
-/// this cycle when its mark bit equals it ([`header`]); [`sweep`] flips it at its end.
+/// Per world slot: bit 0, the parity of the current GC cycle's marks (0 or 1): a cell is marked
+/// in this cycle when its mark bit equals it ([`header`]); [`sweep`] flips it at its end.
+/// Bit 1 ([`incr::CYCLE`]): an incremental cycle is active ([`incr::cycle_active`]).
 static MARK_PARITY: [AtomicU8; 256] = [const { AtomicU8::new(0) }; 256];
 
 /// The mark parity of the world in `slot`: what [`GCPtr::mark_referenced`] writes, and what a
 /// tombstone written now reads as unmarked under.
 #[inline]
 pub fn mark_parity(slot: NonZeroU32) -> u32 {
-    MARK_PARITY[slot.get() as usize].load(Ordering::Relaxed) as u32
+    (MARK_PARITY[slot.get() as usize].load(Ordering::Relaxed) & 1) as u32
+}
+
+/// The parity a tombstone of the world in `slot` written now is unmarked under (see
+/// [`GCPtr::parity`]): the mark parity, flipped while an incremental cycle is active, so the
+/// tombstone is written marked. One load.
+#[inline(always)]
+pub(crate) fn tombstone_parity(slot: NonZeroU32) -> u32 {
+    let b = MARK_PARITY[slot.get() as usize].load(Ordering::Relaxed);
+    ((b ^ (b >> 1)) & 1) as u32
 }
 
 fn flip_mark_parity(slot: NonZeroU32) {
