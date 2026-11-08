@@ -20,7 +20,7 @@ pub use query::*;
 use self::borrow::{BorrowFlag, BorrowRef, BorrowRefMut, Ref, RefMut};
 use crate::{
     archetype::{Archetype, StorageHeader, DATA_CHUNK_SIZE_BYTES},
-    Component, Entity, StableTypeId, TypeInfo, VacateKind, World,
+    Component, Entity, StableTypeId, TypeInfo, World,
 };
 use alloc::vec::Vec;
 
@@ -193,7 +193,7 @@ impl GCPtr {
     /// because a gc borrow guard holds a `&Cell` to the borrow flag inside `state`, which a
     /// `&mut GCHeader` would alias.
     #[inline]
-    fn state_ptr(&self) -> *mut State {
+    pub(crate) fn state_ptr(&self) -> *mut State {
         // SAFETY: the header is in bounds of the slot (from_raw's contract); `addr_of_mut!`
         // makes no reference.
         unsafe { core::ptr::addr_of_mut!((*self.header_ptr().as_ptr()).state) }
@@ -285,6 +285,7 @@ impl GCPtr {
         };
         if !borrowed {
             ty.drop_value(self.value_ptr().as_ptr());
+            poison_vacated(self.value_ptr().as_ptr(), ty.value_layout().size());
             state.write(State::Dead);
         } else {
             // Write only the flag's byte: the guard's `&Cell` covers the borrow flag next to it.
@@ -330,6 +331,7 @@ impl GCPtr {
             self.value_ptr().as_ptr(),
             ty.value_layout().size(),
         );
+        poison_vacated(src.value_ptr().as_ptr(), ty.value_layout().size());
     }
 
     /// Like `move_from`, but `f(src_value, dst_value)` builds the destination
@@ -751,11 +753,11 @@ impl<T: Component> CRef<T> {
 }
 
 /// Sweep tombstones from the world, freeing slots where all components are
-/// Dead/Moved and not marked as referenced or quarantined. Resets all `referenced` flags.
+/// Dead/Moved and not marked as referenced, counting each free in the row's
+/// [`row_generation`](crate::Archetype::row_generation). Resets all `referenced` flags.
 ///
-/// In a [quarantining](World::set_quarantine_marker) archetype such a slot is quarantined and
-/// journaled as [`VacateKind::Swept`] instead; once that entry is released, the next sweep
-/// frees it if it is still unreferenced. Journals into the world, so no concurrent access.
+/// Nothing else keeps a tombstone: copies of slot memory that may point at one (rollback
+/// history) must be traced as roots, so that it is marked.
 ///
 /// Call this after marking live slots with `GCPtr::mark_referenced()`.
 /// Returns the number of entity slots freed.
@@ -771,8 +773,7 @@ pub unsafe fn sweep(world: &World) -> u32 {
     );
     let mut freed = 0u32;
     let mut archetype_iter_set = Vec::new();
-    for (key, archetype) in world.archetypes() {
-        let quarantines = world.quarantines(key);
+    for (_, archetype) in world.archetypes() {
         let count = archetype.allocated_values_nonsync();
         archetype_iter_set.clear();
         for (idx, ty) in archetype.types().iter().enumerate() {
@@ -794,6 +795,7 @@ pub unsafe fn sweep(world: &World) -> u32 {
                     } => {
                         if borrow.get() == 0 {
                             ty.drop_value(gc_ptr.value_ptr().as_ptr());
+                            poison_vacated(gc_ptr.value_ptr().as_ptr(), ty.value_layout().size());
                             state.write(State::Dead);
                             !referenced.read()
                         } else {
@@ -808,17 +810,7 @@ pub unsafe fn sweep(world: &World) -> u32 {
                 referenced.write(false);
                 can_free &= freeable;
             }
-            if !can_free {
-                // Live memory references it again: a later sweep defers anew.
-                archetype.set_sweep_released_nonsync(slot, false);
-            } else if archetype.is_quarantined(slot) {
-            } else if quarantines && !archetype.is_sweep_released(slot) {
-                // History copies may still point here: free after the window
-                // (`VacateKind::Swept`).
-                archetype.set_quarantined_nonsync(slot, true);
-                world.journal_vacate(key, slot, Entity::DANGLING, VacateKind::Swept);
-            } else {
-                archetype.set_sweep_released_nonsync(slot, false);
+            if can_free {
                 archetype.free_slot(slot);
                 freed += 1;
             }
@@ -922,4 +914,33 @@ pub(crate) unsafe fn exit_read_only(slot: NonZeroU32) {
     if prev == 1 {
         SLOT_MODE[slot.get() as usize].store(SlotMode::GcDynamic as u8, Ordering::Relaxed);
     }
+}
+
+#[cfg(all(debug_assertions, feature = "std"))]
+std::thread_local! {
+    static POISON: Cell<Option<u8>> = const { Cell::new(None) };
+}
+
+/// Debug builds: while `Some(byte)`, every component value this thread drops or moves out of a
+/// slot is overwritten with `byte` afterwards, so a test can check that nothing reads a value
+/// after it left its slot (a revive, a restore). `None` turns it off. No effect in release
+/// builds.
+pub fn debug_poison_vacated(byte: Option<u8>) {
+    #[cfg(all(debug_assertions, feature = "std"))]
+    POISON.with(|p| p.set(byte));
+    #[cfg(not(all(debug_assertions, feature = "std")))]
+    let _ = byte;
+}
+
+/// [`debug_poison_vacated`]'s write: `size` bytes at `value`, whose value was just dropped or
+/// moved out.
+#[inline(always)]
+fn poison_vacated(value: *mut u8, size: usize) {
+    #[cfg(all(debug_assertions, feature = "std"))]
+    if let Some(byte) = POISON.with(|p| p.get()) {
+        // SAFETY: the slot's value bytes, no longer holding a value nor borrowed.
+        unsafe { core::ptr::write_bytes(value, byte, size) };
+    }
+    #[cfg(not(all(debug_assertions, feature = "std")))]
+    let _ = (value, size);
 }

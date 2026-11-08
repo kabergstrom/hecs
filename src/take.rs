@@ -11,7 +11,7 @@ pub struct TakenEntity<'a> {
     archetype: &'a mut Archetype,
     index: u32,
     drop: bool,
-    /// Hold the ID instead of freeing it (a quarantining archetype).
+    /// Hold the ID instead of freeing it (a rollback-marked archetype).
     hold: bool,
 }
 

@@ -68,13 +68,13 @@ pub struct World {
     /// Bumped whenever archetype keys stop naming the archetype their type
     /// set resolves to (`migrate_components`); stales `ArchetypeHandle`s.
     archetype_epoch: u32,
-    /// Archetypes containing this component quarantine the slots their entities vacate
-    /// ([`set_quarantine_marker`](Self::set_quarantine_marker)).
-    quarantine_marker: Option<crate::StableTypeId>,
+    /// Archetypes containing this component hold the IDs of entities despawned from them
+    /// ([`set_rollback_marker`](Self::set_rollback_marker)).
+    rollback_marker: Option<crate::StableTypeId>,
     /// Bumped when slot contents are invalidated wholesale (`migrate_components`, `clear`)
     /// ([`history_epoch`](Self::history_epoch)).
     history_epoch: u32,
-    /// Quarantined vacates, oldest first ([`vacated_nonsync`](Self::vacated_nonsync)).
+    /// Held despawns, oldest first ([`vacated_nonsync`](Self::vacated_nonsync)).
     vacated: NonSyncCell<Vec<Vacated>>,
     /// Lazily allocated chunk holding the always-dead slot ([`dead_gc_ptr`](Self::dead_gc_ptr)).
     dead_slot: core::sync::atomic::AtomicPtr<u8>,
@@ -185,7 +185,7 @@ impl World {
             world_slot: alloc_world_slot(),
             archetype_epoch: 0,
             history_epoch: 0,
-            quarantine_marker: None,
+            rollback_marker: None,
             vacated: NonSyncCell(UnsafeCell::new(Vec::new())),
             dead_slot: core::sync::atomic::AtomicPtr::new(ptr::null_mut()),
         }
@@ -357,12 +357,12 @@ impl World {
         self.spawn_inner(handle, components);
     }
 
-    /// `spawn_at` replacing a live entity of a quarantining archetype would vacate its slot
+    /// `spawn_at` replacing a live entity of a rollback-marked archetype would despawn it
     /// without a journal entry, and the ID could not be held.
     fn assert_replaceable(&self, loc: Location) {
         assert!(
-            !self.quarantines(loc.archetype),
-            "spawn_at replaces a live entity of a quarantining archetype; despawn it first"
+            !self.holds(loc.archetype),
+            "spawn_at replaces a live entity of a rollback-marked archetype; despawn it first"
         );
     }
 
@@ -561,14 +561,14 @@ impl World {
 
     /// Destroy an entity and all its components
     ///
-    /// In an archetype holding the [quarantine marker](Self::set_quarantine_marker), the slot is
-    /// quarantined and the entity's ID held instead of freed.
+    /// In an archetype holding the [rollback marker](Self::set_rollback_marker), the entity's ID
+    /// is held instead of freed, and the despawn journaled.
     ///
     /// See also [`take`](Self::take).
     pub fn despawn(&mut self, entity: Entity) -> Result<(), NoSuchEntity> {
         self.flush();
         let loc = self.entities.get(entity)?;
-        if self.quarantines(loc.archetype) {
+        if self.holds(loc.archetype) {
             // SAFETY: we have &mut self
             return unsafe { self.despawn_held_nonsync(entity) };
         }
@@ -586,7 +586,7 @@ impl World {
     pub unsafe fn despawn_nonsync(&self, entity: Entity) -> Result<(), NoSuchEntity> {
         self.flush_nonsync();
         let loc = self.entities.get(entity)?;
-        if self.quarantines(loc.archetype) {
+        if self.holds(loc.archetype) {
             return self.despawn_held_nonsync(entity);
         }
         let loc = self.entities.retire_nonsync(entity)?;
@@ -598,44 +598,41 @@ impl World {
     /// As [`despawn_nonsync`](Self::despawn_nonsync).
     unsafe fn despawn_held_nonsync(&self, entity: Entity) -> Result<(), NoSuchEntity> {
         let loc = self.entities.hold_nonsync(entity)?;
-        let arch = &self.archetypes.archetypes[loc.archetype];
-        arch.set_quarantined_nonsync(loc.index, true);
-        arch.remove_nonsync(loc.index);
-        self.journal_vacate(loc.archetype, loc.index, entity, VacateKind::Despawned);
+        self.archetypes.archetypes[loc.archetype].remove_nonsync(loc.index);
+        self.journal_vacate(loc.archetype, loc.index, entity);
         Ok(())
     }
 
     // ---------------------------------------------------------------------------------------
-    // Rollback support: slot quarantine, held IDs and in-place revive
+    // Rollback support: held IDs, revives, forwarding
     // ---------------------------------------------------------------------------------------
 
-    /// Quarantine the slots vacated by entities of archetypes containing `marker`.
+    /// Hold the IDs of entities despawned from archetypes containing `marker`.
     ///
-    /// A despawn from such an archetype drops the values and marks the slot `Dead` as usual, but
-    /// the slot stays allocated through any number of sweeps and the entity's ID is held (same
-    /// generation, off the freelist), so [`revive_nonsync`](Self::revive_nonsync) can bring the
-    /// entity back with its original bits and slot. A move out (insert/remove changing the
-    /// archetype) quarantines the old slot too, keeping its `Moved` forwarding alive. A sweep
-    /// that would free a `Dead`/`Moved` slot of such an archetype quarantines it instead
-    /// ([`VacateKind::Swept`]). Every quarantine is journaled ([`vacated_nonsync`](Self::vacated_nonsync))
-    /// and lasts until [`release_vacated_nonsync`](Self::release_vacated_nonsync).
+    /// A despawn (or [`take`](Self::take)) from such an archetype drops the values and leaves
+    /// the row a `Dead` tombstone as any despawn does, but holds the entity's ID (same
+    /// generation, off the freelist) and journals the despawn
+    /// ([`vacated_nonsync`](Self::vacated_nonsync)), so [`revive_nonsync`](Self::revive_nonsync)
+    /// can bring the entity back with its original bits until
+    /// [`release_vacated_nonsync`](Self::release_vacated_nonsync). Rows are not kept: the sweep
+    /// frees a tombstone as soon as nothing references it, and its
+    /// [`row_generation`](Archetype::row_generation) counts the free.
     ///
-    /// Vacate paths of a quarantining archetype:
-    /// - [`despawn`](Self::despawn), [`take`](Self::take): journaled, [`VacateKind::Despawned`].
-    /// - insert/remove moves: journaled, [`VacateKind::Moved`].
+    /// Paths of a marked archetype:
+    /// - [`despawn`](Self::despawn), [`take`](Self::take): held, journaled.
+    /// - insert/remove moves: as in any archetype (the old row forwards, `Moved`).
     /// - [`spawn_at`](Self::spawn_at) / [`spawn_column_batch_at`](Self::spawn_column_batch_at)
     ///   replacing a live entity, or allocating a held ID: panic.
-    /// - [`clear`](Self::clear): drops the journal and every slot, and bumps
+    /// - [`clear`](Self::clear): drops the journal and every held ID, and bumps
     ///   [`history_epoch`](Self::history_epoch).
-    /// - [`migrate_components`](Self::migrate_components): bumps the epoch only; journal entries
-    ///   and quarantine bits of the replaced archetypes stay. Release the history first
-    ///   (newgameplus `EcsRollback::invalidate`).
-    pub fn set_quarantine_marker(&mut self, marker: Option<crate::StableTypeId>) {
-        self.quarantine_marker = marker;
+    /// - [`migrate_components`](Self::migrate_components): bumps the epoch only; held IDs stay.
+    ///   Release the history first (newgameplus `EcsRollback::invalidate`).
+    pub fn set_rollback_marker(&mut self, marker: Option<crate::StableTypeId>) {
+        self.rollback_marker = marker;
     }
 
-    pub fn quarantine_marker(&self) -> Option<crate::StableTypeId> {
-        self.quarantine_marker
+    pub fn rollback_marker(&self) -> Option<crate::StableTypeId> {
+        self.rollback_marker
     }
 
     /// Changes whenever slot contents are invalidated wholesale ([`clear`](Self::clear),
@@ -645,73 +642,43 @@ impl World {
         self.history_epoch
     }
 
-    /// Release one journal entry's quarantine: for [`VacateKind::Despawned`] also the held ID,
-    /// for [`VacateKind::Swept`] the first sweep after it frees the slot (if unreferenced).
-    /// Entries of a slot since revived release nothing.
+    /// Release one journal entry: return its entity's ID to the allocator if it is still held
+    /// (not revived since). False when it was not held.
     ///
     /// # Safety
     /// No concurrent access to this world. `vacated` comes from this world's journal under the
-    /// current [`history_epoch`](Self::history_epoch), and is released once.
-    pub unsafe fn release_vacated_nonsync(&self, vacated: &Vacated) {
-        let Some(arch) = self.archetype_at(vacated.archetype as usize) else {
-            return;
-        };
-        if arch.entity(vacated.slot).id != u32::MAX {
-            // Revived: the slot is live again and the ID is not held.
-            return;
-        }
-        arch.set_quarantined_nonsync(vacated.slot, false);
-        match vacated.kind {
-            VacateKind::Moved => {}
-            VacateKind::Despawned => {
-                self.release_held_nonsync(vacated.entity);
-            }
-            VacateKind::Swept => arch.set_sweep_released_nonsync(vacated.slot, true),
-        }
+    /// current [`history_epoch`](Self::history_epoch).
+    pub unsafe fn release_vacated_nonsync(&self, vacated: &Vacated) -> bool {
+        self.release_held_nonsync(vacated.entity)
     }
 
-    pub(crate) fn quarantines(&self, archetype: sharedvec::DefaultKey) -> bool {
-        self.quarantine_marker
+    /// Whether despawns from `archetype` hold the entity's ID.
+    pub(crate) fn holds(&self, archetype: sharedvec::DefaultKey) -> bool {
+        self.rollback_marker
             .is_some_and(|m| self.archetypes.archetypes[archetype].has_dynamic(m))
     }
 
-    /// After a move out of `archetype`'s slot `index`.
-    ///
-    /// # Safety
-    /// NS; `index` is a slot of `archetype` that was just vacated by `entity`.
-    unsafe fn quarantine_vacated(&self, archetype: sharedvec::DefaultKey, index: u32, entity: Entity) {
-        if self.quarantines(archetype) {
-            self.archetypes.archetypes[archetype].set_quarantined_nonsync(index, true);
-            self.journal_vacate(archetype, index, entity, VacateKind::Moved);
-        }
-    }
-
-    /// Append to the vacate journal.
+    /// Append to the despawn journal.
     ///
     /// # Safety
     /// NS, and no slice from [`vacated_nonsync`](Self::vacated_nonsync) is alive (the push
     /// may reallocate it).
-    pub(crate) unsafe fn journal_vacate(
-        &self,
-        archetype: sharedvec::DefaultKey,
-        slot: u32,
-        entity: Entity,
-        kind: VacateKind,
-    ) {
+    pub(crate) unsafe fn journal_vacate(&self, archetype: sharedvec::DefaultKey, slot: u32, entity: Entity) {
+        let row_gen = self.archetypes.archetypes[archetype].row_generation(slot);
         (*self.vacated.0.get()).push(Vacated {
             archetype: sharedvec::Key::index(archetype) as u32,
             slot,
             entity,
-            kind,
+            row_gen,
         });
     }
 
-    /// Every quarantined vacate since the last [`drain_vacated_nonsync`](Self::drain_vacated_nonsync),
+    /// Every held despawn since the last [`drain_vacated_nonsync`](Self::drain_vacated_nonsync),
     /// oldest first. Read-only, so a capture can consume it with a cursor.
     ///
     /// # Safety
-    /// STRUCT while the slice is alive (anything that vacates a slot journals into it, which may
-    /// reallocate it), and no concurrent NS writer.
+    /// STRUCT while the slice is alive (a despawn journals into it, which may reallocate it),
+    /// and no concurrent NS writer.
     pub unsafe fn vacated_nonsync(&self) -> &[Vacated] {
         &*self.vacated.0.get()
     }
@@ -736,20 +703,19 @@ impl World {
         self.archetypes.archetypes.get(key)
     }
 
-    /// Revive held `entity` in place: slot `slot` of archetype `archetype` (an
-    /// [`archetype_at`](Self::archetype_at) index), which it vacated by a quarantined despawn
-    /// or move. Every column header becomes `Alive`, the entity cell and location point at the
-    /// slot again and its quarantine ends, so `CRef`s and `GCPtr`s to the slot resolve again.
+    /// Bring held `entity` back in archetype `archetype` (an [`archetype_at`](Self::archetype_at)
+    /// index), in row `slot`, or with `None` in a fresh row past every allocated one; returns
+    /// the row. `slot` must be vacant ([`Archetype::vacancy`]): a tombstone, whose `CRef`s and
+    /// `GCPtr`s resolve to the entity again, or a `Free` row (taken off the free list; see
+    /// [`take_free_rows_nonsync`](Self::take_free_rows_nonsync) for many). Every column header
+    /// becomes `Alive` (its `referenced` mark kept), and the entity cell and location point at
+    /// the row. A tombstone column left by a move (`Moved`) whose chain ends in a vacant `Dead`
+    /// row (the entity left that too) has that row forward back to it.
     ///
     /// # Safety
     /// No concurrent access to this world. The caller writes a valid value into every column
-    /// of the slot before anything reads it: the old values were dropped or moved out.
-    pub unsafe fn revive_nonsync(
-        &self,
-        entity: Entity,
-        archetype: usize,
-        slot: u32,
-    ) -> Result<(), ReviveError> {
+    /// of the row before anything reads it: nothing of an earlier value is left to read.
+    pub unsafe fn revive_nonsync(&self, entity: Entity, archetype: usize, slot: Option<u32>) -> Result<u32, ReviveError> {
         self.flush_nonsync();
         let key = self
             .archetypes
@@ -757,54 +723,92 @@ impl World {
             .key_from_index(archetype)
             .ok_or(ReviveError::NoSuchSlot)?;
         let arch = &self.archetypes.archetypes[key];
-        if slot >= arch.allocated_values_nonsync() {
-            return Err(ReviveError::NoSuchSlot);
-        }
-        if arch.entity(slot).id != u32::MAX {
-            return Err(ReviveError::SlotOccupied);
-        }
-        for col in 0..arch.types().len() {
-            let header = arch.get_gc_ptr_by_column(col, slot).header_ptr();
-            if !matches!(
-                header.as_ref().state,
-                crate::gc::State::Dead | crate::gc::State::Moved { .. }
-            ) {
-                return Err(ReviveError::SlotOccupied);
-            }
-        }
-        if !self.entities.revive_nonsync(
-            entity,
-            Location {
-                archetype: key,
-                index: slot,
-            },
-        ) {
+        if !self.entities.is_held_nonsync(entity) {
             return Err(ReviveError::NotHeld);
         }
+        let slot = match slot {
+            Some(slot) => {
+                if slot >= arch.allocated_values_nonsync() {
+                    return Err(ReviveError::NoSuchSlot);
+                }
+                match arch.vacancy(slot) {
+                    Some(crate::archetype::Vacancy::Tombstone) => {}
+                    Some(crate::archetype::Vacancy::Free) => {
+                        arch.take_free_rows_nonsync(&[slot]);
+                    }
+                    None => return Err(ReviveError::SlotOccupied),
+                }
+                arch.set_entity_nonsync(slot as usize, entity);
+                slot
+            }
+            None => arch.allocate_fresh_nonsync(entity, self.world_slot),
+        };
+        let revived = self.entities.revive_nonsync(entity, Location { archetype: key, index: slot });
+        debug_assert!(revived, "checked held above");
         for col in 0..arch.types().len() {
-            arch.get_gc_ptr_by_column(col, slot)
-                .header_ptr()
-                .as_ptr()
-                .write(crate::gc::GCHeader::new_alive());
+            let ptr = arch.get_gc_ptr_by_column(col, slot);
+            // A row the entity left by a move: where the move led, if the entity left that too
+            // (a vacant `Dead` row), points back here.
+            let end = ptr.resolve_moved();
+            let back = end != ptr
+                && matches!(*end.state_ptr(), crate::gc::State::Dead)
+                && (*end.archetype()).entity(end.archetype_slot()).id == u32::MAX;
+            ptr.state_ptr().write(crate::gc::State::Alive {
+                borrow: core::cell::Cell::new(0),
+                pending_dead: false,
+            });
+            if back {
+                end.state_ptr().write(crate::gc::State::Moved { new_ptr: ptr });
+            }
         }
-        arch.set_entity_nonsync(slot as usize, entity);
-        arch.set_quarantined_nonsync(slot, false);
-        Ok(())
+        Ok(slot)
     }
 
-    /// End the quarantine of slot `slot` of archetype `archetype`: the next sweep may free it
-    /// (unless referenced). Its entity's ID, if held, stays held: see
-    /// [`release_held_nonsync`](Self::release_held_nonsync).
+    /// Take the `Free` rows among `rows` of archetype `archetype` off its free list in one walk,
+    /// leaving each an unreferenced tombstone for [`revive_nonsync`](Self::revive_nonsync) (a
+    /// row no revive claims is freed again by the next sweep). Returns how many were taken.
     ///
     /// # Safety
-    /// No concurrent access to this world.
-    pub unsafe fn release_quarantine_nonsync(&self, archetype: usize, slot: u32) {
-        if let Some(arch) = self.archetype_at(archetype) {
-            arch.set_quarantined_nonsync(slot, false);
-        }
+    /// No concurrent access to this world. `rows` is sorted ascending.
+    pub unsafe fn take_free_rows_nonsync(&self, archetype: usize, rows: &[u32]) -> u32 {
+        self.archetype_at(archetype).map_or(0, |arch| arch.take_free_rows_nonsync(rows))
     }
 
-    /// Whether `entity` was despawned from a quarantining archetype and its ID is still held.
+    /// Point the columns of vacant row `slot` of archetype `archetype` at `entity`'s current
+    /// values of the same types, so `CRef`s and `GCPtr`s into the row resolve to them: a row the
+    /// entity left (an undone move reached it, it died there) before a revive brought it back
+    /// elsewhere. Per column, the end of its `Moved` chain (the column itself when `Dead`), when
+    /// `Dead` in a vacant row, becomes `Moved` to the entity's column; columns of types the
+    /// entity no longer has stay as they are. Returns how many columns forward.
+    ///
+    /// # Safety
+    /// No concurrent access to this world. The row and every row its `Moved` chains reach were
+    /// `entity`'s (the chains a move leaves), and none is its current row.
+    pub unsafe fn forward_nonsync(&self, archetype: usize, slot: u32, entity: Entity) -> Result<u32, NoSuchEntity> {
+        let loc = self.entities.get(entity)?;
+        let Some(arch) = self.archetype_at(archetype) else { return Ok(0) };
+        if slot >= arch.allocated_values_nonsync() || arch.entity(slot).id != u32::MAX {
+            return Ok(0);
+        }
+        let target = &self.archetypes.archetypes[loc.archetype];
+        let mut forwarded = 0;
+        for (col, ty) in arch.types().iter().enumerate() {
+            let Some(to) = target.get_dynamic(ty, loc.index) else { continue };
+            let end = arch.get_gc_ptr_by_column(col, slot).resolve_moved();
+            if end == to || !matches!(*end.state_ptr(), crate::gc::State::Dead) {
+                continue;
+            }
+            // A chain ends in a row the entity left: vacant (its cell free).
+            if (*end.archetype()).entity(end.archetype_slot()).id != u32::MAX {
+                continue;
+            }
+            end.state_ptr().write(crate::gc::State::Moved { new_ptr: to });
+            forwarded += 1;
+        }
+        Ok(forwarded)
+    }
+
+    /// Whether `entity` was despawned from a rollback-marked archetype and its ID is still held.
     pub fn is_held(&self, entity: Entity) -> bool {
         unsafe { self.entities.is_held_nonsync(entity) }
     }
@@ -818,17 +822,13 @@ impl World {
         self.entities.release_held_nonsync(entity)
     }
 
-    /// Despawn without quarantine: the slot is freed by the next sweep regardless of the
-    /// quarantine marker. With `hold_id` the ID is held for a revive elsewhere (an undone move),
-    /// otherwise freed.
+    /// Despawn without a journal entry, whatever the archetype: with `hold_id` the ID is held
+    /// (for a revive elsewhere: an undone move), otherwise freed. Returns the row it left, as
+    /// `(archetype_at index, slot)`, now a tombstone.
     ///
     /// # Safety
-    /// No concurrent access to this world.
-    pub unsafe fn despawn_unquarantined_nonsync(
-        &self,
-        entity: Entity,
-        hold_id: bool,
-    ) -> Result<(), NoSuchEntity> {
+    /// No concurrent access to this world, no borrow of the entity's components.
+    pub unsafe fn unspawn_nonsync(&self, entity: Entity, hold_id: bool) -> Result<(usize, u32), NoSuchEntity> {
         self.flush_nonsync();
         let loc = if hold_id {
             self.entities.hold_nonsync(entity)?
@@ -836,7 +836,7 @@ impl World {
             self.entities.retire_nonsync(entity)?
         };
         self.archetypes.archetypes[loc.archetype].remove_nonsync(loc.index);
-        Ok(())
+        Ok((sharedvec::Key::index(loc.archetype), loc.index))
     }
 
     /// A pointer to this world's canonical always-dead slot: a `CRef` or `GCPtr` to it never
@@ -1422,7 +1422,6 @@ impl World {
                 target_arch.move_from_nonsync(src, ty, target_index);
             }
             source_arch.set_entity_free_nonsync(loc.index as usize);
-            self.quarantine_vacated(loc.archetype, loc.index, entity);
         }
         Ok(())
     }
@@ -1496,7 +1495,6 @@ impl World {
             } {
                 self.entities.meta[moved as usize].location.index = old_index;
             }
-            unsafe { self.quarantine_vacated(old_archetype, old_index, entity) };
         }
 
         Ok(bundle)
@@ -1658,7 +1656,6 @@ impl World {
                 old_moved.location.index = loc.index;
                 self.entities.meta.set_nonsync(moved as usize, old_moved);
             }
-            self.quarantine_vacated(loc.archetype, loc.index, entity);
         }
     }
 
@@ -1943,8 +1940,8 @@ impl World {
     ///
     /// Useful for moving entities between worlds.
     ///
-    /// In a [quarantining](Self::set_quarantine_marker) archetype the entity's ID is held and
-    /// the slot quarantined, as for [`despawn`](Self::despawn).
+    /// In a [rollback-marked](Self::set_rollback_marker) archetype the entity's ID is held and
+    /// the despawn journaled, as for [`despawn`](Self::despawn).
     ///
     /// Fails, changing nothing, with [`TakeError::NoSuchEntity`] for a dead entity, or with
     /// [`TakeError::Borrowed`] when any component of the entity is held by a gc borrow guard
@@ -1953,17 +1950,16 @@ impl World {
     pub fn take(&mut self, entity: Entity) -> Result<TakenEntity<'_>, TakeError> {
         self.flush();
         let loc = self.entities.get(entity)?;
-        // Before anything is quarantined, journaled or moved. While the `TakenEntity` lives it
+        // Before anything is journaled or moved. While the `TakenEntity` lives it
         // holds `&mut self`, so no new guard (which needs a `GcWorld` scope) can be taken.
         // SAFETY: `loc` is the entity's occupied row; NS through `&mut self`.
         if !unsafe { self.archetypes.archetypes[loc.archetype].row_movable(loc.index, |_| false) } {
             return Err(TakeError::Borrowed);
         }
-        let hold = self.quarantines(loc.archetype);
+        let hold = self.holds(loc.archetype);
         if hold {
             unsafe {
-                self.archetypes.archetypes[loc.archetype].set_quarantined_nonsync(loc.index, true);
-                self.journal_vacate(loc.archetype, loc.index, entity, VacateKind::Despawned);
+                self.journal_vacate(loc.archetype, loc.index, entity);
             }
         }
         let archetype = &mut self.archetypes.archetypes[loc.archetype];
@@ -2904,9 +2900,9 @@ pub(crate) mod tests {
 pub enum ReviveError {
     /// The archetype index or slot is out of range.
     NoSuchSlot,
-    /// The slot holds a live entity, or one of its columns is `Free` or `Alive`.
+    /// The row holds a live entity, or is neither a tombstone nor `Free` (a column still `Alive`).
     SlotOccupied,
-    /// The entity's ID is not held: it is live, was never despawned from a quarantining
+    /// The entity's ID is not held: it is live, was never despawned from a rollback-marked
     /// archetype, or was released.
     NotHeld,
 }
@@ -2915,7 +2911,7 @@ impl fmt::Display for ReviveError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.pad(match self {
             ReviveError::NoSuchSlot => "no such slot",
-            ReviveError::SlotOccupied => "slot is not a vacated tombstone",
+            ReviveError::SlotOccupied => "row is not vacant",
             ReviveError::NotHeld => "entity id is not held",
         })
     }
@@ -2940,26 +2936,15 @@ fn dead_slot_data_start() -> usize {
     (header + align - 1) & !(align - 1)
 }
 
-/// One journal entry of [`World::vacated_nonsync`]: a slot of a quarantining archetype became
-/// quarantined. Released with [`World::release_vacated_nonsync`].
+/// One journal entry of [`World::vacated_nonsync`]: an entity was despawned from a
+/// rollback-marked archetype and its ID held. Released with [`World::release_vacated_nonsync`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Vacated {
-    /// [`World::archetype_at`] index.
+    /// [`World::archetype_at`] index of the row it left.
     pub archetype: u32,
     pub slot: u32,
-    /// The entity that left the slot; [`Entity::DANGLING`] for [`VacateKind::Swept`].
     pub entity: Entity,
-    pub kind: VacateKind,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum VacateKind {
-    /// The entity moved to another archetype; the slot keeps its `Moved` forwarding.
-    Moved,
-    /// The entity was despawned (or taken); its ID is held.
-    Despawned,
-    /// A sweep found the `Dead`/`Moved` slot unreferenced. Copies of the world's memory taken
-    /// before the sweep (rollback history) may still point at it, so freeing waits for the
-    /// release; the first sweep after the release frees it if it is still unreferenced.
-    Swept,
+    /// The row's [`row_generation`](crate::Archetype::row_generation) at the despawn: while it
+    /// is unchanged, the row is still the entity's tombstone.
+    pub row_gen: u32,
 }

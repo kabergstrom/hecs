@@ -101,7 +101,7 @@ mod stable_type_id;
 mod take;
 mod world;
 
-pub use archetype::{Archetype, Data, DATA_CHUNK_SIZE_BYTES};
+pub use archetype::{Archetype, Data, Vacancy, DATA_CHUNK_SIZE_BYTES};
 pub use batch::{BatchIncomplete, BatchWriter, ColumnBatch, ColumnBatchBuilder, ColumnBatchType};
 pub use bundle::{Bundle, DynamicBundle, DynamicBundleClone, MissingComponent};
 pub use command_buffer::CommandBuffer;
@@ -120,7 +120,7 @@ pub use query_one::QueryOne;
 pub use stable_type_id::StableTypeId;
 pub use take::TakenEntity;
 pub use world::{
-    ArchetypeHandle, ArchetypesGeneration, ReviveError, TakeError, VacateKind, Vacated, SpawnColumn, SpawnRows, Component, ComponentError, Iter, QueryOneError, SpawnBatchIter,
+    ArchetypeHandle, ArchetypesGeneration, ReviveError, TakeError, Vacated, SpawnColumn, SpawnRows, Component, ComponentError, Iter, QueryOneError, SpawnBatchIter,
     SpawnColumnBatchIter, World,
 };
 

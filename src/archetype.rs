@@ -46,51 +46,51 @@ pub struct Archetype {
     /// One allocation per type, in the same order as `types`
     data: Box<[Data]>,
     first_free: PtrCell<u8>,
-    /// One bit per slot: a vacated slot the sweep must not free until released
-    /// ([`World::set_quarantine_marker`](crate::World::set_quarantine_marker)).
-    quarantined: SlotBits,
-    /// One bit per slot: a swept slot whose deferral ended; the next sweep frees it if it is
-    /// still unreferenced ([`VacateKind::Swept`](crate::VacateKind::Swept)).
-    sweep_released: SlotBits,
+    /// Per row, how many times the sweep has freed it ([`row_generation`](Self::row_generation)).
+    row_gens: RowGens,
 }
 
+/// Per-row free counts, grown on demand (a row never freed reads 0).
 #[derive(Default)]
-struct SlotBits(UnsafeCell<Vec<u64>>);
-// SAFETY: `get` and `set` are `unsafe` with NS contracts (a `set` may reallocate); `clear` takes
-// `&mut self`. Cross-thread sharing of the owning `Archetype` relies on the engine's
+struct RowGens(UnsafeCell<Vec<u32>>);
+// SAFETY: `get` and `bump` are `unsafe` with NS contracts (a `bump` may reallocate); `clear`
+// takes `&mut self`. Cross-thread sharing of the owning `Archetype` relies on the engine's
 // single-thread invariant (see the `Send` impl of `gc::GCPtr`).
-unsafe impl Sync for SlotBits {}
+unsafe impl Sync for RowGens {}
 
-impl SlotBits {
+impl RowGens {
     /// # Safety
-    /// No concurrent [`set`](Self::set) (it may reallocate the bits).
-    unsafe fn get(&self, slot: u32) -> bool {
-        let bits = &*self.0.get();
-        bits.get(slot as usize / 64)
-            .is_some_and(|w| w & (1 << (slot % 64)) != 0)
+    /// No concurrent [`bump`](Self::bump) (it may reallocate).
+    unsafe fn get(&self, slot: u32) -> u32 {
+        (&*self.0.get()).get(slot as usize).copied().unwrap_or(0)
     }
 
+    /// Count one more free of `slot`, wrapping below `u32::MAX` (which callers may keep as a
+    /// "matches no generation" sentinel).
+    ///
     /// # Safety
-    /// NS: no concurrent `get` or `set`.
-    unsafe fn set(&self, slot: u32, on: bool) {
-        let bits = &mut *self.0.get();
-        let word = slot as usize / 64;
-        if word >= bits.len() {
-            if !on {
-                return;
-            }
-            bits.resize(word + 1, 0);
+    /// NS: no concurrent `get` or `bump`.
+    unsafe fn bump(&self, slot: u32) {
+        let gens = &mut *self.0.get();
+        if slot as usize >= gens.len() {
+            gens.resize(slot as usize + 1, 0);
         }
-        if on {
-            bits[word] |= 1 << (slot % 64);
-        } else {
-            bits[word] &= !(1 << (slot % 64));
-        }
+        let g = &mut gens[slot as usize];
+        *g = if *g >= u32::MAX - 1 { 0 } else { *g + 1 };
     }
 
     fn clear(&mut self) {
         self.0.get_mut().clear();
     }
+}
+
+/// What a row holding no entity holds ([`Archetype::vacancy`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Vacancy {
+    /// Every column `Dead` or `Moved`: a tombstone, kept until a sweep finds it unreferenced.
+    Tombstone,
+    /// Every column `Free`: on the free list; nothing references it.
+    Free,
 }
 
 impl Archetype {
@@ -154,8 +154,7 @@ impl Archetype {
                 .collect(),
             types,
             first_free: PtrCell::new(null_mut()),
-            quarantined: SlotBits::default(),
-            sweep_released: SlotBits::default(),
+            row_gens: RowGens::default(),
         }
     }
 
@@ -183,8 +182,7 @@ impl Archetype {
             }
         }
         self.entities.fill(EntityCell::free());
-        self.quarantined.clear();
-        self.sweep_released.clear();
+        self.row_gens.clear();
     }
 
     /// Whether this archetype contains `T` components
@@ -434,6 +432,21 @@ impl Archetype {
         new_slot
     }
 
+    /// [`allocate_nonsync`](Self::allocate_nonsync) past every allocated row, leaving the free
+    /// list alone: a row no copy of slot memory has seen. Its columns are `Free`.
+    ///
+    /// # Safety
+    /// As [`allocate_nonsync`](Self::allocate_nonsync).
+    pub(crate) unsafe fn allocate_fresh_nonsync(&self, entity: Entity, world_slot: NonZeroU32) -> u32 {
+        let new_slot = self.len.read_nonsync();
+        self.len.write_nonsync(new_slot + 1);
+        if new_slot as usize >= self.entities.len_nonsync() {
+            self.grow_nonsync(64, world_slot);
+        }
+        self.entities[new_slot as usize].write_nonsync(entity);
+        new_slot
+    }
+
     /// Make room for `additional` more slots (free-listed slots count) with
     /// at most one growth.
     ///
@@ -620,43 +633,91 @@ impl Archetype {
         other.len.set(0);
     }
 
-    /// Whether `slot` is quarantined: vacated (despawned or moved out) and kept from the sweep
-    /// until [`World::release_vacated_nonsync`](crate::World::release_vacated_nonsync) or a
-    /// revive.
+    /// How many times the sweep has freed row `slot` (wrapping below `u32::MAX`). While it is
+    /// unchanged, a tombstone in the row is the one its last entity left.
     ///
     /// # Safety
     /// No concurrent structural change of this archetype.
-    pub unsafe fn is_quarantined(&self, slot: u32) -> bool {
-        self.quarantined.get(slot)
+    pub unsafe fn row_generation(&self, slot: u32) -> u32 {
+        self.row_gens.get(slot)
     }
 
+    /// What row `slot` holds when no entity occupies it: `None` for an occupied row, one past
+    /// the allocated rows, or a mixed one (a column `Alive`, pending its drop).
+    ///
     /// # Safety
-    /// NS; no `is_quarantined` read concurrently.
-    pub(crate) unsafe fn set_quarantined_nonsync(&self, slot: u32, on: bool) {
-        self.quarantined.set(slot, on);
-        if on {
-            self.sweep_released.set(slot, false);
+    /// No concurrent structural change of this archetype.
+    pub unsafe fn vacancy(&self, slot: u32) -> Option<Vacancy> {
+        if slot >= self.len.read_nonsync() || self.entities[slot as usize].read_id_nonsync() != u32::MAX {
+            return None;
+        }
+        let mut free = 0;
+        for data in &*self.data {
+            match &*data.get_gc_ptr(slot).state_ptr() {
+                crate::gc::State::Free { .. } => free += 1,
+                crate::gc::State::Dead | crate::gc::State::Moved { .. } => {}
+                crate::gc::State::Alive { .. } => return None,
+            }
+        }
+        match free {
+            0 => Some(Vacancy::Tombstone),
+            n if n == self.data.len() => Some(Vacancy::Free),
+            _ => None,
         }
     }
 
+    /// Take the `Free` rows among `rows` off the free list, leaving each an unreferenced
+    /// tombstone (every column `Dead`): a revive can claim it, and if none does, the next sweep
+    /// frees it again. Rows not `Free` are skipped. Returns how many were taken. One walk of
+    /// the free list, up to the last row taken (to its end when one of `rows` is not on it).
+    ///
     /// # Safety
-    /// As [`is_quarantined`](Self::is_quarantined).
-    pub(crate) unsafe fn is_sweep_released(&self, slot: u32) -> bool {
-        self.sweep_released.get(slot)
+    /// NS; nothing else allocates in or sweeps this archetype during the call. `rows` is
+    /// sorted ascending.
+    pub(crate) unsafe fn take_free_rows_nonsync(&self, rows: &[u32]) -> u32 {
+        debug_assert!(rows.windows(2).all(|w| w[0] <= w[1]), "rows sorted");
+        if self.data.is_empty() {
+            return 0;
+        }
+        let mut taken = 0;
+        let mut prev: Option<GCPtr> = None;
+        let mut cur = NonNull::new(self.first_free.read_nonsync()).map(|p| GCPtr::from_raw(p));
+        while let Some(ptr) = cur {
+            if taken as usize == rows.len() {
+                break;
+            }
+            let crate::gc::State::Free { next_free } = *ptr.state_ptr() else {
+                panic!("value in free list but state is not free")
+            };
+            let slot = ptr.archetype_slot();
+            if rows.binary_search(&slot).is_ok() {
+                match prev {
+                    None => self
+                        .first_free
+                        .write_nonsync(next_free.map(|p| p.value().as_ptr()).unwrap_or(null_mut())),
+                    Some(p) => p.state_ptr().write(crate::gc::State::Free { next_free }),
+                }
+                for data in &*self.data {
+                    data.get_gc_ptr(slot).state_ptr().write(crate::gc::State::Dead);
+                }
+                self.num_free.write_nonsync(self.num_free.read_nonsync() - 1);
+                taken += 1;
+            } else {
+                prev = Some(ptr);
+            }
+            cur = next_free;
+        }
+        taken
     }
 
-    /// # Safety
-    /// As [`set_quarantined_nonsync`](Self::set_quarantined_nonsync).
-    pub(crate) unsafe fn set_sweep_released_nonsync(&self, slot: u32, on: bool) {
-        self.sweep_released.set(slot, on);
-    }
-
-    /// Put row `slot` on the free list (every column `Free`).
+    /// Put row `slot` on the free list (every column `Free`), counting a new
+    /// [`row_generation`](Self::row_generation).
     ///
     /// # Safety
     /// NS; `slot` is below the allocated slots, its entity cell is free, and every column is
     /// `Dead` or `Moved` and unreferenced (the sweep checks this): no `GCPtr` to it is used again.
     pub(crate) unsafe fn free_slot(&self, slot: u32) {
+        self.row_gens.bump(slot);
         let current_num_free = self.num_free.read_nonsync();
         self.num_free.write_nonsync(current_num_free + 1);
         debug_assert!(
