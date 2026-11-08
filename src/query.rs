@@ -18,7 +18,6 @@ use crate::alloc::{boxed::Box, vec::Vec};
 use crate::archetype::{Archetype, Data};
 use crate::entities::EntityMeta;
 use crate::gc::cells::EntityCell;
-use crate::gc::GC;
 use crate::{Component, Entity, StableTypeId, World};
 
 /// A collection of component types to fetch from a [`World`](crate::World)
@@ -149,7 +148,7 @@ unsafe impl<'a, T: Component> Fetch<'a> for FetchRead<T> {
                 NonNull::dangling()
             } else {
                 NonNull::new_unchecked(
-                    storage.chunks()[0].add(storage.data_start() + storage.value_start()),
+                    storage.chunks()[0].add(storage.values_start()),
                 )
             };
             assert!(storage.entities_per_chunk() > 0);
@@ -160,7 +159,7 @@ unsafe impl<'a, T: Component> Fetch<'a> for FetchRead<T> {
                     slot_range_start: 0,
                 }),
                 entities_per_chunk: storage.entities_per_chunk(),
-                chunk_start_offset: storage.data_start() + storage.value_start(),
+                chunk_start_offset: storage.values_start(),
                 stride: storage.stride(),
                 _marker: PhantomData::default(),
             }
@@ -259,7 +258,7 @@ unsafe impl<'a, T: Component> Fetch<'a> for FetchWrite<T> {
                 NonNull::dangling()
             } else {
                 NonNull::new_unchecked(
-                    storage.chunks()[0].add(storage.data_start() + storage.value_start()),
+                    storage.chunks()[0].add(storage.values_start()),
                 )
             };
             assert!(storage.entities_per_chunk() > 0);
@@ -270,7 +269,7 @@ unsafe impl<'a, T: Component> Fetch<'a> for FetchWrite<T> {
                     slot_range_start: 0,
                 }),
                 entities_per_chunk: storage.entities_per_chunk(),
-                chunk_start_offset: storage.data_start() + storage.value_start(),
+                chunk_start_offset: storage.values_start(),
                 stride: storage.stride(),
                 _marker: PhantomData::default(),
             }

@@ -10,7 +10,8 @@ use crate::alloc::boxed::Box;
 use crate::alloc::{vec, vec::Vec};
 use crate::gc::cells::{EntityCell, PtrCell, U32Cell};
 use crate::gc::kvec::KVec;
-use crate::gc::{GCHeader, GCPtr, GC};
+use crate::gc::header::{self as gch, Geometry, HeaderWord, CHUNK_BYTES, HEADERS_OFFSET, HEADER_BYTES};
+use crate::gc::GCPtr;
 use core::any::type_name;
 
 use crate::{Entity, StableTypeId};
@@ -45,7 +46,10 @@ pub struct Archetype {
     entities: KVec<EntityCell>,
     /// One allocation per type, in the same order as `types`
     data: Box<[Data]>,
-    first_free: PtrCell<u8>,
+    /// Free rows, a stack: `free_slot` pushes, `allocate_nonsync` pops (last freed, first
+    /// reused). A side structure rather than a link in the free cells, so a free cell's value
+    /// bytes stay untouched and any value size (zero-sized included) works.
+    free_rows: FreeRows,
     /// Per row, how many times the sweep has freed it ([`row_generation`](Self::row_generation)).
     row_gens: RowGens,
 }
@@ -81,6 +85,26 @@ impl RowGens {
 
     fn clear(&mut self) {
         self.0.get_mut().clear();
+    }
+}
+
+/// The archetype's free rows (see `Archetype::free_rows`).
+#[derive(Default)]
+struct FreeRows(UnsafeCell<Vec<u32>>);
+// SAFETY: as `RowGens`: every access is an NS `unsafe` method.
+unsafe impl Sync for FreeRows {}
+
+impl FreeRows {
+    /// # Safety
+    /// NS.
+    unsafe fn push(&self, row: u32) {
+        (*self.0.get()).push(row);
+    }
+
+    /// # Safety
+    /// NS.
+    unsafe fn pop(&self) -> Option<u32> {
+        (*self.0.get()).pop()
     }
 }
 
@@ -123,27 +147,14 @@ impl Archetype {
             data: types
                 .iter()
                 .map(|ty| {
-                    let header_layout = Layout::new::<StorageHeader>();
-                    let len = header_layout.size();
-                    // calculate padding needed to align the type.
-                    // code taken from Layout::padding_needed_for
-                    let len_rounded_up = len.wrapping_add(ty.gc_layout.align()).wrapping_sub(1)
-                        & !ty.gc_layout.align().wrapping_sub(1);
-                    let padding_to_align = len_rounded_up.wrapping_sub(len);
-                    let header_layout = Layout::from_size_align(
-                        header_layout.size() + padding_to_align,
-                        DATA_CHUNK_SIZE_BYTES,
-                    )
-                    .unwrap();
+                    let geometry = ty.geometry();
                     Data {
                         state: AtomicBorrow::new(),
-                        stride: ty.gc_layout().size(),
-                        value_start: ty.data_start(),
-                        entities_per_chunk: (DATA_CHUNK_SIZE_BYTES - header_layout.size())
-                            / ty.gc_layout.size(),
+                        stride: geometry.stride,
+                        values_start: geometry.values_start,
+                        entities_per_chunk: geometry.capacity,
+                        recip: geometry.recip(),
                         storage: KVec::new(),
-                        header_layout,
-                        data_start: header_layout.size(),
                         storage_layout: Layout::from_size_align(
                             DATA_CHUNK_SIZE_BYTES,
                             DATA_CHUNK_SIZE_BYTES,
@@ -153,7 +164,7 @@ impl Archetype {
                 })
                 .collect(),
             types,
-            first_free: PtrCell::new(null_mut()),
+            free_rows: FreeRows::default(),
             row_gens: RowGens::default(),
         }
     }
@@ -164,19 +175,10 @@ impl Archetype {
             // SAFETY: we have &mut self
             for index in 0..unsafe { self.len.read_nonsync() } {
                 unsafe {
-                    let mut removed = data.get_gc_ptr(index);
-                    if matches!(
-                        removed.header_ptr().as_ref().state,
-                        crate::gc::State::Alive { .. }
-                    ) {
-                        debug_assert!(
-                            removed.header_ptr().as_ref().state
-                                == crate::gc::State::Alive {
-                                    borrow: core::cell::Cell::new(0),
-                                    pending_dead: false,
-                                }
-                        );
-                        removed.drop_value_and_tombstone(ty);
+                    let w = data.header(index).get();
+                    if gch::state(w) == gch::ALIVE {
+                        debug_assert!(gch::is_movable(w), "clearing a borrowed component");
+                        data.get_gc_ptr(index).drop_value_and_tombstone(ty);
                     }
                 }
             }
@@ -403,23 +405,14 @@ impl Archetype {
     /// before anything reads it. A growth adds chunks and grows the entity column (outstanding
     /// slices stay valid but stale).
     pub(crate) unsafe fn allocate_nonsync(&self, entity: Entity, world_slot: NonZeroU32) -> u32 {
-        let free_ptr = self.first_free.read_nonsync();
-        let new_slot =
-            if let Some(free_value) = NonNull::new(free_ptr).map(|ptr| unsafe { GCPtr::from_raw(ptr) }) {
-                let gc_header = unsafe { &mut *free_value.header_ptr().as_ptr() };
-                let crate::gc::State::Free { next_free } = gc_header.state else {
-                    panic!("value in free list but state is not free")
-                };
-                gc_header.state = crate::gc::State::Free { next_free: None };
-                self.first_free.write_nonsync(
-                    next_free
-                        .map(|ptr| ptr.value().as_ptr())
-                        .unwrap_or(null_mut()),
-                );
+        let new_slot = if let Some(free_slot) = self.free_rows.pop() {
+                debug_assert!(self
+                    .data
+                    .iter()
+                    .all(|data| gch::state(data.header(free_slot).get()) == gch::FREE));
                 let current_num_free = self.num_free.read_nonsync();
                 self.num_free.write_nonsync(current_num_free - 1);
-                let new_slot = free_value.archetype_slot();
-                new_slot
+                free_slot
             } else {
                 let new_slot = self.len.read_nonsync();
                 self.len.write_nonsync(new_slot + 1);
@@ -488,19 +481,13 @@ impl Archetype {
         self.entities
             .extend_with_nonsync(additional, EntityCell::free());
 
-        for data in &*self.data {
+        for (column, data) in self.data.iter().enumerate() {
             let entities_per_chunk = data.entities_per_chunk;
             let num_chunks_required = new_cap / entities_per_chunk + 1;
             let new_chunks = num_chunks_required.saturating_sub(data.storage.len());
             for _ in 0..new_chunks {
                 unsafe {
-                    let mem = alloc_zeroed(data.storage_layout);
-                    assert!(!mem.is_null(), "allocation failed");
-                    mem.cast::<StorageHeader>().write(data.new_storage_header(
-                        archetype_ptr,
-                        world_slot,
-                        data.storage.len(),
-                    ));
+                    let mem = data.new_chunk(archetype_ptr, world_slot, data.storage.len(), column);
                     data.storage.push_nonsync(mem);
                 }
             }
@@ -515,19 +502,13 @@ impl Archetype {
         let new_cap = self.entities.len() + additional;
         self.entities.extend_with(additional, EntityCell::free());
 
-        for data in self.data.iter_mut() {
+        for (column, data) in self.data.iter_mut().enumerate() {
             let entities_per_chunk = data.entities_per_chunk;
             let num_chunks_required = new_cap / entities_per_chunk + 1;
             let new_chunks = num_chunks_required.saturating_sub(data.storage.len());
             for _ in 0..new_chunks {
                 unsafe {
-                    let mem = alloc_zeroed(data.storage_layout);
-                    assert!(!mem.is_null(), "allocation failed");
-                    mem.cast::<StorageHeader>().write(data.new_storage_header(
-                        archetype_ptr,
-                        world_slot,
-                        data.storage.len(),
-                    ));
+                    let mem = data.new_chunk(archetype_ptr, world_slot, data.storage.len(), column);
                     data.storage.push(mem);
                 }
             }
@@ -653,10 +634,10 @@ impl Archetype {
         }
         let mut free = 0;
         for data in &*self.data {
-            match &*data.get_gc_ptr(slot).state_ptr() {
-                crate::gc::State::Free { .. } => free += 1,
-                crate::gc::State::Dead | crate::gc::State::Moved { .. } => {}
-                crate::gc::State::Alive { .. } => return None,
+            match gch::state(data.header(slot).get()) {
+                gch::FREE => free += 1,
+                gch::DEAD | gch::MOVED => {}
+                _ => return None,
             }
         }
         match free {
@@ -667,46 +648,33 @@ impl Archetype {
     }
 
     /// Take the `Free` rows among `rows` off the free list, leaving each an unreferenced
-    /// tombstone (every column `Dead`): a revive can claim it, and if none does, the next sweep
-    /// frees it again. Rows not `Free` are skipped. Returns how many were taken. One walk of
-    /// the free list, up to the last row taken (to its end when one of `rows` is not on it).
+    /// tombstone (every column `Dead`, unmarked): a revive can claim it, and if none does, the
+    /// next sweep frees it again. Rows not `Free` are skipped. Returns how many were taken. One
+    /// pass over the free-row stack, a binary search of `rows` per free row.
     ///
     /// # Safety
     /// NS; nothing else allocates in or sweeps this archetype during the call. `rows` is
     /// sorted ascending.
-    pub(crate) unsafe fn take_free_rows_nonsync(&self, rows: &[u32]) -> u32 {
+    pub(crate) unsafe fn take_free_rows_nonsync(&self, rows: &[u32], world_slot: NonZeroU32) -> u32 {
         debug_assert!(rows.windows(2).all(|w| w[0] <= w[1]), "rows sorted");
-        if self.data.is_empty() {
+        if self.data.is_empty() || rows.is_empty() {
             return 0;
         }
+        let dead = gch::tombstone(gch::DEAD, crate::gc::mark_parity(world_slot));
         let mut taken = 0;
-        let mut prev: Option<GCPtr> = None;
-        let mut cur = NonNull::new(self.first_free.read_nonsync()).map(|p| GCPtr::from_raw(p));
-        while let Some(ptr) = cur {
-            if taken as usize == rows.len() {
-                break;
+        (*self.free_rows.0.get()).retain(|&slot| {
+            if rows.binary_search(&slot).is_err() {
+                return true;
             }
-            let crate::gc::State::Free { next_free } = *ptr.state_ptr() else {
-                panic!("value in free list but state is not free")
-            };
-            let slot = ptr.archetype_slot();
-            if rows.binary_search(&slot).is_ok() {
-                match prev {
-                    None => self
-                        .first_free
-                        .write_nonsync(next_free.map(|p| p.value().as_ptr()).unwrap_or(null_mut())),
-                    Some(p) => p.state_ptr().write(crate::gc::State::Free { next_free }),
-                }
-                for data in &*self.data {
-                    data.get_gc_ptr(slot).state_ptr().write(crate::gc::State::Dead);
-                }
-                self.num_free.write_nonsync(self.num_free.read_nonsync() - 1);
-                taken += 1;
-            } else {
-                prev = Some(ptr);
+            for data in &*self.data {
+                let word = data.header(slot);
+                debug_assert_eq!(gch::state(word.get()), gch::FREE, "value in free list but state is not free");
+                word.set(dead);
             }
-            cur = next_free;
-        }
+            taken += 1;
+            false
+        });
+        self.num_free.write_nonsync(self.num_free.read_nonsync() - taken);
         taken
     }
 
@@ -726,25 +694,20 @@ impl Archetype {
             self.len.read_nonsync(),
             current_num_free + 1
         );
-
-        let current_free_head = self.first_free.read_nonsync();
-        let mut new_free_head = None;
-        for (idx, storage) in self.data.iter().enumerate() {
-            let slot_ptr = storage.get_gc_ptr(slot);
-            if idx == 0 {
-                slot_ptr.header_ptr().as_mut().state = crate::gc::State::Free {
-                    next_free: NonNull::new(current_free_head).map(|ptr| unsafe { GCPtr::from_raw(ptr) }),
-                };
-                new_free_head = Some(slot_ptr);
-            } else {
-                slot_ptr.header_ptr().as_mut().state = crate::gc::State::Free { next_free: None };
+        for data in self.data.iter() {
+            let word = data.header(slot);
+            let w = word.get();
+            debug_assert!(
+                matches!(gch::state(w), gch::DEAD | gch::MOVED) && gch::is_movable(w & !gch::STATE_MASK),
+                "freeing a cell in state {}",
+                word.state_name()
+            );
+            if gch::state(w) == gch::MOVED {
+                data.get_gc_ptr(slot).clear_moved();
             }
+            word.set(gch::FREE_WORD);
         }
-        self.first_free.write_nonsync(
-            new_free_head
-                .map(|ptr| ptr.value().as_ptr())
-                .unwrap_or(null_mut()),
-        );
+        self.free_rows.push(slot);
     }
 
     // /// Raw IDs of the entities in this archetype
@@ -767,20 +730,18 @@ impl Drop for Archetype {
             let mut needs_leak = false;
             for index in 0..self.len.read() {
                 unsafe {
-                    let ptr = data.get_gc_ptr(index);
-                    let is_free = matches!(
-                        ptr.header_ptr().as_ref().state,
-                        crate::gc::State::Free { .. }
-                    );
+                    let word = data.header(index);
+                    let is_free = gch::state(word.get()) == gch::FREE;
                     #[cfg(debug_assertions)]
                     if !is_free {
                         if !std::thread::panicking() {
                             std::eprintln!(
-                                "Archetype storage dropped without freeing dead values: {:?} at id {} was state {:?}",
-                                info, index, ptr.header_ptr().as_ref().state
+                                "Archetype storage dropped without freeing dead values: {:?} at id {} was {:?}",
+                                info, index, word
                             );
                         }
                     }
+                    let _ = info;
                     needs_leak |= !is_free;
                 }
             }
@@ -788,13 +749,8 @@ impl Drop for Archetype {
                 for chunk in data.chunks() {
                     assert!(!chunk.is_null());
                     unsafe {
-                        dealloc(
-                            *chunk,
-                            Layout::from_size_align_unchecked(
-                                DATA_CHUNK_SIZE_BYTES,
-                                DATA_CHUNK_SIZE_BYTES,
-                            ),
-                        );
+                        (*chunk.cast::<StorageHeader>()).free_forward_table();
+                        dealloc(*chunk, data.storage_layout);
                     }
                 }
             }
@@ -803,181 +759,277 @@ impl Drop for Archetype {
     }
 }
 
-pub const DATA_CHUNK_SIZE_BYTES: usize = 0x10000;
+pub const DATA_CHUNK_SIZE_BYTES: usize = CHUNK_BYTES;
+
+/// The first bytes of every column chunk (see [`crate::gc::header`] for the chunk layout).
+/// `repr(C)`: newgameplus-api reads `forward`, `values_start`, `stride` and `recip` at the
+/// offsets of [`ChunkAbi`](crate::gc::header::ChunkAbi).
+#[repr(C)]
 pub(crate) struct StorageHeader {
     /// Back-pointer to the owning archetype. Stable because archetypes live in
     /// a `SharedVec<Archetype>` whose elements never relocate, and chunks are
     /// only allocated after the archetype is placed in the vec.
     pub(crate) archetype: *const Archetype,
+    /// The forwarding table of the chunk's `Moved` cells: `capacity` value pointers indexed like
+    /// the header words; null while no cell of the chunk is `Moved`.
+    pub(crate) forward: Cell<*mut *mut u8>,
     pub(crate) world_slot: NonZeroU32,
-    pub(crate) chunk_idx: usize,
-    pub(crate) data_start: usize,
-    pub(crate) stride: usize,
+    /// `Moved` cells in this chunk (the forwarding table lives while this is nonzero).
+    pub(crate) moved: Cell<u32>,
+    pub(crate) chunk_idx: u32,
+    pub(crate) capacity: u32,
+    pub(crate) values_start: u32,
+    pub(crate) stride: u32,
+    pub(crate) recip: u64,
+    /// This chunk's column in its archetype (`archetype.types()[column]`).
+    pub(crate) column: u32,
 }
+
+const _: () = {
+    use crate::gc::header::ChunkAbi;
+    assert!(core::mem::offset_of!(StorageHeader, forward) == ChunkAbi::FORWARD);
+    assert!(core::mem::offset_of!(StorageHeader, values_start) == ChunkAbi::VALUES_START);
+    assert!(core::mem::offset_of!(StorageHeader, stride) == ChunkAbi::STRIDE);
+    assert!(core::mem::offset_of!(StorageHeader, recip) == ChunkAbi::RECIP);
+    assert!(core::mem::size_of::<StorageHeader>() <= HEADERS_OFFSET);
+};
+
+impl StorageHeader {
+    fn forward_layout(&self) -> Layout {
+        Layout::array::<*mut u8>(self.capacity as usize).unwrap()
+    }
+
+    /// The forwarding table, allocated (zeroed) if the chunk has none.
+    ///
+    /// # Safety
+    /// NS.
+    pub(crate) unsafe fn forward_table_or_alloc(&self) -> *mut *mut u8 {
+        let table = self.forward.get();
+        if !table.is_null() {
+            return table;
+        }
+        let table = alloc_zeroed(self.forward_layout()).cast::<*mut u8>();
+        assert!(!table.is_null(), "allocation failed");
+        self.forward.set(table);
+        table
+    }
+
+    /// Free the forwarding table, if any.
+    ///
+    /// # Safety
+    /// NS; no cell of the chunk is `Moved`.
+    pub(crate) unsafe fn free_forward_table(&self) {
+        let table = self.forward.replace(null_mut());
+        if !table.is_null() {
+            dealloc(table.cast(), self.forward_layout());
+        }
+    }
+}
+
+/// One column of an archetype: its 64 KiB chunks and their [geometry](Geometry).
 pub struct Data {
     storage: KVec<*mut u8>,
     storage_layout: Layout,
-    header_layout: Layout,
     state: AtomicBorrow,
     stride: usize,
-    value_start: usize,
-    data_start: usize,
+    values_start: usize,
     entities_per_chunk: usize,
+    recip: u64,
 }
 
 impl Data {
-    pub(crate) fn new_storage_header(
+    /// Allocate and initialise a chunk: its storage header, and every header word `Free`.
+    ///
+    /// # Safety
+    /// `archetype` owns this column.
+    unsafe fn new_chunk(
         &self,
         archetype: *const Archetype,
         world_slot: NonZeroU32,
         chunk_idx: usize,
-    ) -> StorageHeader {
-        StorageHeader {
+        column: usize,
+    ) -> *mut u8 {
+        let mem = alloc(self.storage_layout);
+        assert!(!mem.is_null(), "allocation failed");
+        // Zero the header region and the padding up to the values; leave the values
+        // uninitialised.
+        ptr::write_bytes(mem, 0, self.values_start);
+        mem.cast::<StorageHeader>().write(StorageHeader {
             archetype,
+            forward: Cell::new(null_mut()),
             world_slot,
-            chunk_idx,
-            data_start: self.data_start,
-            stride: self.stride,
+            moved: Cell::new(0),
+            chunk_idx: chunk_idx as u32,
+            capacity: self.entities_per_chunk as u32,
+            values_start: self.values_start as u32,
+            stride: self.stride as u32,
+            recip: self.recip,
+            column: column as u32,
+        });
+        let words = mem.add(HEADERS_OFFSET).cast::<u32>();
+        for i in 0..self.entities_per_chunk {
+            words.add(i).write(gch::FREE_WORD);
         }
+        mem
     }
+
     #[inline(always)]
     pub fn chunks(&self) -> &[*mut u8] {
         &self.storage
     }
-    /// Bytes per slot (`[GCHeader | value]`, padded to the value's alignment).
+    /// Bytes per value (the size rounded up to the alignment; a zero-sized type's alignment).
     #[inline(always)]
     pub fn stride(&self) -> usize {
         self.stride
     }
-    /// Offset of the value within a slot (header size plus alignment padding).
+    /// Offset of value 0 from the start of each chunk (past the chunk header and the header
+    /// words).
     #[inline(always)]
-    pub fn value_start(&self) -> usize {
-        self.value_start
+    pub fn values_start(&self) -> usize {
+        self.values_start
     }
-    /// Offset of slot 0 from the start of each chunk (past the chunk's `StorageHeader`).
-    #[inline(always)]
-    pub fn data_start(&self) -> usize {
-        self.data_start
-    }
-    /// Slots per chunk; slot `i` lives in chunk `i / entities_per_chunk`.
+    /// Cells per chunk; cell `i` lives in chunk `i / entities_per_chunk`.
     #[inline(always)]
     pub fn entities_per_chunk(&self) -> usize {
         self.entities_per_chunk
     }
-    /// Address of slot `idx`'s first byte (its header). Chunk pointers come from
-    /// [`chunks`](Self::chunks).
+
+    /// The value pointer of cell `idx`.
     ///
     /// # Safety
     /// `idx` has a chunk: `idx < chunks().len() * entities_per_chunk()`, which holds for any
     /// `idx` below the archetype's allocated slot count. Dereferencing the result needs NS or
-    /// STRUCT, and a borrow of the slot as for any [`GCPtr`].
+    /// STRUCT, and a borrow of the cell as for any [`GCPtr`].
     #[inline(always)]
-    pub unsafe fn slot_ptr(&self, idx: u32) -> *mut u8 {
+    pub unsafe fn value_ptr(&self, idx: u32) -> NonNull<u8> {
         let idx = idx as usize;
-        self.storage
-            .get_unchecked(idx / self.entities_per_chunk)
-            .add(self.data_start + (idx % self.entities_per_chunk) * self.stride)
-    }
-
-    /// The [`GCPtr`] of slot `idx`.
-    ///
-    /// # Safety
-    /// As [`slot_ptr`](Self::slot_ptr): `idx` is below the allocated slots.
-    pub unsafe fn get_gc_ptr(&self, idx: u32) -> GCPtr {
-        let idx = idx as usize;
-        let entities_per_chunk = self.entities_per_chunk;
-        let chunk_idx = idx / entities_per_chunk;
-        let value_idx = idx % entities_per_chunk;
-        GCPtr::from_base_with_offset(
-            self.value_start,
-            NonNull::new_unchecked(
-                self.storage
-                    .get_unchecked(chunk_idx)
-                    .add(self.data_start + value_idx * self.stride),
-            ),
+        NonNull::new_unchecked(
+            self.storage
+                .get_unchecked(idx / self.entities_per_chunk)
+                .add(self.values_start + (idx % self.entities_per_chunk) * self.stride),
         )
     }
 
-    /// The value pointer of slot `idx`.
+    /// The header word of cell `idx`.
     ///
     /// # Safety
-    /// As [`slot_ptr`](Self::slot_ptr).
-    pub(crate) unsafe fn get_value(&self, idx: u32) -> NonNull<u8> {
+    /// As [`value_ptr`](Self::value_ptr); the reference must not outlive the chunk.
+    #[inline(always)]
+    pub unsafe fn header<'a>(&self, idx: u32) -> &'a HeaderWord {
         let idx = idx as usize;
-        let entities_per_chunk = self.entities_per_chunk;
-        let chunk_idx = idx / entities_per_chunk;
-        let value_idx = idx % entities_per_chunk;
-        unsafe {
-            NonNull::new_unchecked(
-                self.storage
-                    .get_unchecked(chunk_idx)
-                    .add(self.data_start + value_idx * self.stride + self.value_start),
-            )
-        }
+        &*self
+            .storage
+            .get_unchecked(idx / self.entities_per_chunk)
+            .add(HEADERS_OFFSET + (idx % self.entities_per_chunk) * HEADER_BYTES)
+            .cast::<HeaderWord>()
     }
 
-    /// The [`GCPtr`]s of slots `0..num_allocated_slots`.
+    /// The header words of chunk `chunk` (all `entities_per_chunk` of them).
     ///
     /// # Safety
-    /// `num_allocated_slots` is at most the archetype's allocated slot count; no chunk is added
-    /// while the iterator is alive (STRUCT).
-    pub(crate) unsafe fn iter_gc_ptr<'a>(
-        &'a self,
-        num_allocated_slots: u32,
-    ) -> impl IntoIterator<Item = GCPtr> + 'a {
-        DataGCPtrIterator {
-            storage: self,
-            entities_per_chunk: self.entities_per_chunk,
-            data_start: self.data_start,
-            value_start: self.value_start,
-            stride: self.stride,
-            num_allocated_slots,
-            chunk_idx: 0,
-            slot_idx: 0,
-            value_idx: 0,
-            curr_chunk: self.chunks().get(0).copied().unwrap_or(null_mut()),
-        }
+    /// `chunk < chunks().len()`; the slice must not outlive the chunk.
+    #[inline(always)]
+    pub unsafe fn chunk_headers<'a>(&self, chunk: usize) -> &'a [HeaderWord] {
+        core::slice::from_raw_parts(
+            self.storage.get_unchecked(chunk).add(HEADERS_OFFSET).cast::<HeaderWord>(),
+            self.entities_per_chunk,
+        )
     }
-}
 
-struct DataGCPtrIterator<'a> {
-    storage: &'a Data,
-    entities_per_chunk: usize,
-    data_start: usize,
-    value_start: usize,
-    stride: usize,
-    num_allocated_slots: u32,
-    // stateful variables
-    chunk_idx: usize,
-    slot_idx: u32,
-    value_idx: usize,
-    curr_chunk: *mut u8,
-}
-impl<'a> Iterator for DataGCPtrIterator<'a> {
-    type Item = GCPtr;
+    /// The [`GCPtr`] of cell `idx`.
+    ///
+    /// # Safety
+    /// As [`value_ptr`](Self::value_ptr).
+    #[inline(always)]
+    pub unsafe fn get_gc_ptr(&self, idx: u32) -> GCPtr {
+        GCPtr::from_raw(self.value_ptr(idx))
+    }
 
-    fn next(&mut self) -> Option<Self::Item> {
-        if self.slot_idx >= self.num_allocated_slots {
-            return None;
+    /// The value pointer of cell `idx`.
+    ///
+    /// # Safety
+    /// As [`value_ptr`](Self::value_ptr).
+    #[inline(always)]
+    pub(crate) unsafe fn get_value(&self, idx: u32) -> NonNull<u8> {
+        self.value_ptr(idx)
+    }
+
+    /// Disarm every armed cell in `first..end` ([`HeaderWord::disarm`] over the dense words,
+    /// in blocks: a block with no armed cell is only read). Returns the number disarmed.
+    ///
+    /// # Safety
+    /// NS; `end` is at most the archetype's allocated slots.
+    pub unsafe fn disarm_range(&self, first: u32, end: u32) -> u64 {
+        const BLOCK: usize = 16;
+        let per = self.entities_per_chunk;
+        let mut disarmed = 0u64;
+        let mut i = first as usize;
+        let end = end as usize;
+        while i < end {
+            let chunk = i / per;
+            let lo = i % per;
+            let hi = per.min(lo + (end - i));
+            let words = &self.chunk_headers(chunk)[lo..hi];
+            for block in words.chunks(BLOCK) {
+                let mut n = 0u32;
+                for w in block {
+                    n += gch::needs_disarm(w.get()) as u32;
+                }
+                if n != 0 {
+                    for w in block {
+                        let v = w.get();
+                        // Branch-free: clear ARMED where armed.
+                        w.set(v & !(gch::ARMED * gch::needs_disarm(v) as u32));
+                    }
+                    disarmed += n as u64;
+                }
+            }
+            i += hi - lo;
         }
-        assert!(!self.curr_chunk.is_null());
-        if self.value_idx >= self.entities_per_chunk {
-            self.chunk_idx += 1;
-            self.curr_chunk = self.storage.chunks()[self.chunk_idx];
-            self.value_idx = 0;
+        disarmed
+    }
+
+    /// Call `visit(cell, word)` for every cell below `count` whose header word passes
+    /// `filter`. Reads the dense header words in blocks of 16 (`filter` ORed over a block, which
+    /// the compiler vectorizes for a branch-free `filter`) and visits only blocks with a hit, so
+    /// a column with few candidates costs one pass of streaming loads over its headers.
+    /// `visit` may rewrite the word it is given.
+    ///
+    /// # Safety
+    /// NS; `count` is at most the archetype's allocated slots.
+    #[inline]
+    pub(crate) unsafe fn scan_headers(
+        &self,
+        count: u32,
+        filter: impl Fn(u32) -> bool,
+        mut visit: impl FnMut(u32, &HeaderWord),
+    ) {
+        const BLOCK: usize = 16;
+        let count = count as usize;
+        let per = self.entities_per_chunk;
+        let mut base = 0usize;
+        let mut chunk = 0usize;
+        while base < count {
+            let n = per.min(count - base);
+            let words = &self.chunk_headers(chunk)[..n];
+            let mut start = 0;
+            for block in words.chunks(BLOCK) {
+                let mut hit = false;
+                for w in block {
+                    hit |= filter(w.get());
+                }
+                if hit {
+                    for (i, w) in block.iter().enumerate() {
+                        if filter(w.get()) {
+                            visit((base + start + i) as u32, w);
+                        }
+                    }
+                }
+                start += block.len();
+            }
+            base += per;
+            chunk += 1;
         }
-        let ptr = unsafe {
-            GCPtr::from_base_with_offset(
-                self.value_start,
-                NonNull::new_unchecked(
-                    self.curr_chunk
-                        .add(self.data_start + self.stride * self.value_idx),
-                ),
-            )
-        };
-        self.value_idx += 1;
-        self.slot_idx += 1;
-        Some(ptr)
     }
 }
 
@@ -1050,9 +1102,8 @@ impl<V> OrderedTypeIdMap<V> {
 pub struct TypeInfo {
     pub(crate) id: StableTypeId,
     value_layout: Layout,
-    gc_layout: Layout,
+    geometry: Geometry,
     drop: DropFn,
-    data_start: usize,
     #[cfg(debug_assertions)]
     pub(crate) type_name: &'static str,
 }
@@ -1065,15 +1116,10 @@ impl TypeInfo {
         }
 
         let type_layout = Layout::new::<T>();
-        let (gc_layout, data_start) = Layout::new::<GCHeader>().extend(type_layout).unwrap();
-        let gc_layout = gc_layout.pad_to_align();
-        assert!(gc_layout == Layout::new::<GC<T>>());
-
         Self {
             id: T::STABLE_TYPE_ID,
-            gc_layout,
             value_layout: type_layout,
-            data_start,
+            geometry: gch::TypedGeometry::<T>::GEOMETRY,
             drop: DropFn::Typed(drop_ptr::<T>),
             #[cfg(debug_assertions)]
             type_name: core::any::type_name::<T>(),
@@ -1101,14 +1147,10 @@ impl TypeInfo {
     }
 
     fn from_parts_with(id: StableTypeId, layout: Layout, drop: DropFn) -> Self {
-        let (gc_layout, data_start) = Layout::new::<GCHeader>().extend(layout).unwrap();
-        let gc_layout = gc_layout.pad_to_align();
-
         Self {
             id,
-            gc_layout,
             value_layout: layout,
-            data_start,
+            geometry: Geometry::of(layout.size(), layout.align()),
             drop,
             #[cfg(debug_assertions)]
             type_name: "<unknown> (TypeInfo constructed from parts)",
@@ -1120,19 +1162,20 @@ impl TypeInfo {
         self.id
     }
 
-    /// Access the `Layout` of this component type as if it were wrapped with a GC<T>.
-    pub fn gc_layout(&self) -> Layout {
-        self.gc_layout
-    }
-
     /// Access the `Layout` of this component type.
     pub fn value_layout(&self) -> Layout {
         self.value_layout
     }
 
-    /// The byte offset of the gc_layout where value_layout starts.
-    pub fn data_start(&self) -> usize {
-        self.data_start
+    /// Where this type's cells sit in a column chunk (a function of its layout alone).
+    pub fn geometry(&self) -> Geometry {
+        self.geometry
+    }
+
+    /// The alignment archetypes order columns by: the value's, at least 8 (the order the
+    /// interleaved 8-aligned header gave, kept so archetype type orders are unchanged).
+    fn sort_align(&self) -> usize {
+        self.value_layout.align().max(8)
     }
 
     /// Directly call the destructor on a pointer to data of this component type.
@@ -1169,7 +1212,7 @@ pub enum DropFn {
 /// Static bundles sort their ids with it so every spawn path keys a type set in one order.
 #[doc(hidden)]
 pub fn type_sort_key<T: Component>() -> (usize, StableTypeId) {
-    (core::mem::align_of::<GC<T>>(), T::STABLE_TYPE_ID)
+    (core::mem::align_of::<T>().max(8), T::STABLE_TYPE_ID)
 }
 
 impl PartialOrd for TypeInfo {
@@ -1181,9 +1224,8 @@ impl PartialOrd for TypeInfo {
 impl Ord for TypeInfo {
     /// Order by alignment, descending. Ties broken with TypeId.
     fn cmp(&self, other: &Self) -> core::cmp::Ordering {
-        self.gc_layout
-            .align()
-            .cmp(&other.gc_layout.align())
+        self.sort_align()
+            .cmp(&other.sort_align())
             .reverse()
             .then_with(|| self.id.cmp(&other.id))
     }

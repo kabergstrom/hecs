@@ -1,60 +1,51 @@
 use core::{
-    cell::Cell,
     fmt,
     marker::PhantomData,
     ops::{Deref, DerefMut},
     ptr::NonNull,
 };
 
-// Most of this file is copied from stdlib's cell
+// Most of this file is copied from stdlib's cell. The borrow flag lives in the cell's dense
+// header word (`header.rs`: the encoding, the fast paths and their masks).
 
-pub(super) type BorrowFlag = i16;
+use super::header::{self, HeaderWord, STEP};
 
-const UNUSED: BorrowFlag = 0;
-
-#[inline(always)]
-fn is_writing(x: BorrowFlag) -> bool {
-    x < UNUSED
-}
-
-#[inline(always)]
-fn is_reading(x: BorrowFlag) -> bool {
-    x > UNUSED
-}
 pub(super) struct BorrowRef<'b> {
-    borrow: &'b Cell<BorrowFlag>,
+    borrow: &'b HeaderWord,
 }
 
 impl<'b> BorrowRef<'b> {
-    #[inline]
-    pub(super) fn new(borrow: &'b Cell<BorrowFlag>) -> Option<BorrowRef<'b>> {
-        let b = borrow.get().wrapping_add(1);
-        if !is_reading(b) {
-            None
-        } else {
-            borrow.set(b);
+    /// A shared borrow of the cell whose header word is `borrow`: Alive, not pending dead, no
+    /// writer, below the overflow guard. One load, one masked test, one branch, one store.
+    #[inline(always)]
+    pub(super) fn new(borrow: &'b HeaderWord) -> Option<BorrowRef<'b>> {
+        let w = borrow.get();
+        if header::can_read(w) {
+            borrow.set(w + STEP);
             Some(BorrowRef { borrow })
+        } else {
+            None
         }
     }
 }
 
 impl Drop for BorrowRef<'_> {
-    #[inline]
+    #[inline(always)]
     fn drop(&mut self) {
-        let borrow = self.borrow.get();
-        debug_assert!(is_reading(borrow));
-        self.borrow.set(borrow - 1);
+        let w = self.borrow.get();
+        debug_assert!(header::is_reading(w));
+        self.borrow.set(w - STEP);
     }
 }
 
 impl Clone for BorrowRef<'_> {
     #[inline]
     fn clone(&self) -> Self {
-        let borrow = self.borrow.get();
-        debug_assert!(is_reading(borrow));
+        let w = self.borrow.get();
+        debug_assert!(header::is_reading(w));
         // Prevent the borrow counter from overflowing into a writing borrow.
-        assert!(borrow != i16::MAX);
-        self.borrow.set(borrow + 1);
+        assert!(header::flag(w) <= header::FLAG_MAX - 2, "too many shared borrows");
+        self.borrow.set(w + STEP);
         BorrowRef {
             borrow: self.borrow,
         }
@@ -344,32 +335,51 @@ impl<'b, T: ?Sized> RefMut<'b, T> {
 }
 
 pub(super) struct BorrowRefMut<'b> {
-    borrow: &'b Cell<BorrowFlag>,
+    borrow: &'b HeaderWord,
 }
 
 impl Drop for BorrowRefMut<'_> {
-    #[inline]
+    #[inline(always)]
     fn drop(&mut self) {
-        let borrow = self.borrow.get();
-        debug_assert!(is_writing(borrow));
-        self.borrow.set(borrow + 1);
+        let w = self.borrow.get();
+        debug_assert!(header::is_writing(w));
+        self.borrow.set(w.wrapping_add(STEP));
     }
 }
 
 impl<'b> BorrowRefMut<'b> {
-    #[inline]
-    pub(super) fn new(borrow: &'b Cell<BorrowFlag>) -> Option<BorrowRefMut<'b>> {
+    /// The first exclusive borrow of `slot`, whose header word is `borrow`. The fast path is
+    /// "no readers, no writer, not armed" (one load, one masked test, one branch, one store);
+    /// "armed, free" takes the cold path.
+    #[inline(always)]
+    pub(super) fn new(borrow: &'b HeaderWord, slot: super::GCPtr) -> Option<BorrowRefMut<'b>> {
         // NOTE: Unlike BorrowRefMut::clone, new is called to create the initial
         // mutable reference, and so there must currently be no existing
-        // references. Thus, while clone increments the mutable refcount, here
-        // we explicitly only allow going from UNUSED to UNUSED - 1.
-        match borrow.get() {
-            UNUSED => {
-                borrow.set(UNUSED - 1);
-                Some(BorrowRefMut { borrow })
-            }
-            _ => None,
+        // references. Thus, while clone steps the mutable refcount, here
+        // we explicitly only allow going from 0 (or, cold, armed 1) to -2.
+        let w = borrow.get();
+        if header::can_write(w) {
+            borrow.set(w.wrapping_sub(STEP));
+            Some(BorrowRefMut { borrow })
+        } else {
+            Self::new_cold(borrow, slot)
         }
+    }
+
+    /// An armed slot: grey it (the incremental cycle traces it again before it ends), then
+    /// borrow; the release lands on an unarmed `0`. Anything else (readers, a writer, not
+    /// live) conflicts.
+    #[cold]
+    #[inline(never)]
+    fn new_cold(borrow: &'b HeaderWord, slot: super::GCPtr) -> Option<BorrowRefMut<'b>> {
+        if !header::can_write_armed(borrow.get()) {
+            return None;
+        }
+        super::on_armed_write(slot);
+        let w = borrow.get();
+        debug_assert!(header::can_write_armed(w) || header::can_write(w));
+        borrow.set((w & !header::ARMED).wrapping_sub(STEP));
+        Some(BorrowRefMut { borrow })
     }
 
     // Clones a `BorrowRefMut`.
@@ -379,11 +389,11 @@ impl<'b> BorrowRefMut<'b> {
     // This isn't in a Clone impl so that code doesn't call this implicitly.
     #[inline]
     fn clone(&self) -> BorrowRefMut<'b> {
-        let borrow = self.borrow.get();
-        debug_assert!(is_writing(borrow));
+        let w = self.borrow.get();
+        debug_assert!(header::is_writing(w));
         // Prevent the borrow counter from underflowing.
-        assert!(borrow != i16::MIN);
-        self.borrow.set(borrow - 1);
+        assert!(header::flag(w) >= header::FLAG_MIN + 2, "too many exclusive borrow splits");
+        self.borrow.set(w.wrapping_sub(STEP));
         BorrowRefMut {
             borrow: self.borrow,
         }

@@ -1,7 +1,7 @@
 use crate::{
     alloc::collections::BinaryHeap,
     archetype::Data,
-    gc::{GCHeader, GCPtr, GC},
+    gc::GCPtr,
 };
 use core::{fmt, marker::PhantomData, mem::MaybeUninit, ptr::NonNull, slice};
 

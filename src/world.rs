@@ -310,9 +310,9 @@ impl World {
         for col in 0..arch.types().len() {
             let data = arch.get_data_storage(col);
             for &slot in &slots {
-                let header = data.get_gc_ptr(slot).header_ptr().as_ptr();
-                debug_assert!(matches!((*header).state, crate::gc::State::Free { .. }));
-                header.write(crate::gc::GCHeader::new_alive());
+                let word = data.header(slot);
+                debug_assert_eq!(crate::gc::header::state(word.get()), crate::gc::header::FREE);
+                word.set(crate::gc::header::ALIVE_WORD);
             }
         }
         init(&SpawnRows {
@@ -708,7 +708,7 @@ impl World {
     /// the row. `slot` must be vacant ([`Archetype::vacancy`]): a tombstone, whose `CRef`s and
     /// `GCPtr`s resolve to the entity again, or a `Free` row (taken off the free list; see
     /// [`take_free_rows_nonsync`](Self::take_free_rows_nonsync) for many). Every column header
-    /// becomes `Alive` (its `referenced` mark kept), and the entity cell and location point at
+    /// becomes `Alive` (unborrowed, unarmed), and the entity cell and location point at
     /// the row. A tombstone column left by a move (`Moved`) whose chain ends in a vacant `Dead`
     /// row (the entity left that too) has that row forward back to it.
     ///
@@ -734,7 +734,7 @@ impl World {
                 match arch.vacancy(slot) {
                     Some(crate::archetype::Vacancy::Tombstone) => {}
                     Some(crate::archetype::Vacancy::Free) => {
-                        arch.take_free_rows_nonsync(&[slot]);
+                        arch.take_free_rows_nonsync(&[slot], self.world_slot);
                     }
                     None => return Err(ReviveError::SlotOccupied),
                 }
@@ -746,19 +746,27 @@ impl World {
         let revived = self.entities.revive_nonsync(entity, Location { archetype: key, index: slot });
         debug_assert!(revived, "checked held above");
         for col in 0..arch.types().len() {
-            let ptr = arch.get_gc_ptr_by_column(col, slot);
+            let data = arch.get_data_storage(col);
+            let word = data.header(slot);
+            let w = word.get();
             // A row the entity left by a move: where the move led, if the entity left that too
             // (a vacant `Dead` row), points back here.
-            let end = ptr.resolve_moved();
-            let back = end != ptr
-                && matches!(*end.state_ptr(), crate::gc::State::Dead)
-                && (*end.archetype()).entity(end.archetype_slot()).id == u32::MAX;
-            ptr.state_ptr().write(crate::gc::State::Alive {
-                borrow: core::cell::Cell::new(0),
-                pending_dead: false,
-            });
-            if back {
-                end.state_ptr().write(crate::gc::State::Moved { new_ptr: ptr });
+            let mut back = None;
+            if crate::gc::header::state(w) == crate::gc::header::MOVED {
+                let ptr = data.get_gc_ptr(slot);
+                let end = ptr.resolve_moved();
+                if crate::gc::header::state(end.word().get()) == crate::gc::header::DEAD
+                    && (*end.archetype()).entity(end.archetype_slot()).id == u32::MAX
+                {
+                    back = Some((ptr, end));
+                }
+                ptr.clear_moved();
+            }
+            // Alive, unborrowed and unarmed, like every allocation (a live cell's mark is never
+            // read: the sweep skips it, and a tombstone write sets the mark anew).
+            word.set(crate::gc::header::ALIVE_WORD);
+            if let Some((ptr, end)) = back {
+                end.set_moved(ptr);
             }
         }
         Ok(slot)
@@ -771,7 +779,7 @@ impl World {
     /// # Safety
     /// No concurrent access to this world. `rows` is sorted ascending.
     pub unsafe fn take_free_rows_nonsync(&self, archetype: usize, rows: &[u32]) -> u32 {
-        self.archetype_at(archetype).map_or(0, |arch| arch.take_free_rows_nonsync(rows))
+        self.archetype_at(archetype).map_or(0, |arch| arch.take_free_rows_nonsync(rows, self.world_slot))
     }
 
     /// Point the columns of vacant row `slot` of archetype `archetype` at `entity`'s current
@@ -795,14 +803,14 @@ impl World {
         for (col, ty) in arch.types().iter().enumerate() {
             let Some(to) = target.get_dynamic(ty, loc.index) else { continue };
             let end = arch.get_gc_ptr_by_column(col, slot).resolve_moved();
-            if end == to || !matches!(*end.state_ptr(), crate::gc::State::Dead) {
+            if end == to || crate::gc::header::state(end.word().get()) != crate::gc::header::DEAD {
                 continue;
             }
             // A chain ends in a row the entity left: vacant (its cell free).
             if (*end.archetype()).entity(end.archetype_slot()).id != u32::MAX {
                 continue;
             }
-            end.state_ptr().write(crate::gc::State::Moved { new_ptr: to });
+            end.set_moved(to);
             forwarded += 1;
         }
         Ok(forwarded)
@@ -850,23 +858,27 @@ impl World {
             let layout = dead_slot_layout();
             let fresh = unsafe { crate::alloc::alloc::alloc_zeroed(layout) };
             assert!(!fresh.is_null(), "allocation failed");
-            let data_start = dead_slot_data_start();
             unsafe {
                 fresh
                     .cast::<crate::archetype::StorageHeader>()
                     .write(crate::archetype::StorageHeader {
                         archetype: ptr::null(),
+                        forward: core::cell::Cell::new(ptr::null_mut()),
                         world_slot: self.world_slot,
+                        moved: core::cell::Cell::new(0),
                         chunk_idx: 0,
-                        data_start,
-                        stride: core::mem::size_of::<crate::gc::GCHeader>(),
+                        capacity: 1,
+                        values_start: DEAD_SLOT_VALUE as u32,
+                        stride: 1,
+                        recip: 1 << 32,
+                        column: 0,
                     });
-                let mut header = crate::gc::GCHeader::default();
-                header.set_tombstone();
-                fresh
-                    .add(data_start)
-                    .cast::<crate::gc::GCHeader>()
-                    .write(header);
+                // Every word past the storage header is `Dead`: the typed arithmetic of any `T`
+                // lands on one of them (see `gc::header`'s geometry test).
+                let words = fresh.add(crate::gc::header::HEADERS_OFFSET).cast::<u32>();
+                for i in 0..(crate::gc::header::CHUNK_BYTES - crate::gc::header::HEADERS_OFFSET) / 4 {
+                    words.add(i).write(crate::gc::header::DEAD);
+                }
             }
             chunk = match self.dead_slot.compare_exchange(
                 ptr::null_mut(),
@@ -881,9 +893,7 @@ impl World {
                 }
             };
         }
-        let value = unsafe {
-            chunk.add(dead_slot_data_start() + core::mem::size_of::<crate::gc::GCHeader>())
-        };
+        let value = unsafe { chunk.add(DEAD_SLOT_VALUE) };
         // SAFETY: the value pointer of the dead slot, in a chunk the world frees on drop.
         unsafe { crate::gc::GCPtr::from_raw(ptr::NonNull::new_unchecked(value)) }
     }
@@ -1102,6 +1112,7 @@ impl World {
         &self.archetypes.archetypes
     }
 
+    #[inline]
     pub(crate) fn world_slot(&self) -> NonZeroU32 {
         self.world_slot
     }
@@ -1122,8 +1133,7 @@ impl World {
             return None;
         }
         let resolved = ptr.resolve_moved();
-        let header = resolved.header_ptr().as_ref();
-        if !matches!(header.state, crate::gc::State::Alive { .. }) {
+        if !resolved.header_ptr().as_ref().is_alive() {
             return None;
         }
         let entity = resolved.entity();
@@ -1902,10 +1912,7 @@ impl World {
                 for i in 0..n {
                     let d = unsafe { &*data[i] };
                     ptrs[i] = unsafe {
-                        crate::gc::GCPtr::from_base_with_offset(
-                            d.value_start(),
-                            core::ptr::NonNull::new_unchecked(d.slot_ptr(slot)),
-                        )
+                        d.get_gc_ptr(slot)
                     };
                     let epc = d.entities_per_chunk() as u32;
                     run_end = run_end.min((slot / epc + 1) * epc);
@@ -2920,21 +2927,20 @@ impl fmt::Display for ReviveError {
 #[cfg(feature = "std")]
 impl Error for ReviveError {}
 
-/// The always-dead slot's chunk: a `StorageHeader`, then one `GCHeader` and an empty value.
-/// Aligned like an archetype chunk so `GCPtr`'s header masking finds the `StorageHeader`.
+/// The always-dead slot's chunk: a whole chunk (aligned like an archetype chunk so `GCPtr`'s
+/// masking finds the `StorageHeader`) whose header words are all `Dead`, with the value pointer
+/// at its last byte, [`DEAD_SLOT_VALUE`]. The untyped index is 0 (`values_start` is that
+/// offset); a `CRef<T>`'s typed index is in range for every `T`.
 fn dead_slot_layout() -> core::alloc::Layout {
     core::alloc::Layout::from_size_align(
-        dead_slot_data_start() + core::mem::size_of::<crate::gc::GCHeader>() + 64,
+        crate::archetype::DATA_CHUNK_SIZE_BYTES,
         crate::archetype::DATA_CHUNK_SIZE_BYTES,
     )
     .unwrap()
 }
 
-fn dead_slot_data_start() -> usize {
-    let header = core::mem::size_of::<crate::archetype::StorageHeader>();
-    let align = core::mem::align_of::<crate::gc::GCHeader>();
-    (header + align - 1) & !(align - 1)
-}
+/// The dead slot's value offset in its chunk.
+const DEAD_SLOT_VALUE: usize = crate::gc::header::CHUNK_BYTES - 1;
 
 /// One journal entry of [`World::vacated_nonsync`]: an entity was despawned from a
 /// rollback-marked archetype and its ID held. Released with [`World::release_vacated_nonsync`].

@@ -360,7 +360,7 @@ fn dead_slot_never_resolves() {
 #[test]
 fn data_accessors_walk_raw_slots() {
     let mut world = World::new();
-    let es: Vec<Entity> = (0..3000).map(|i| world.spawn((i as u64,))).collect();
+    let es: Vec<Entity> = (0..12000).map(|i| world.spawn((i as u64,))).collect();
     let arch = (0..world.archetype_count())
         .map(|i| world.archetype_at(i).unwrap())
         .find(|a| a.has::<u64>())
@@ -372,10 +372,16 @@ fn data_accessors_walk_raw_slots() {
         let slot = i as u32;
         let chunk = data.chunks()[i / data.entities_per_chunk()];
         let manual = unsafe {
-            chunk.add(data.data_start() + (i % data.entities_per_chunk()) * data.stride())
+            chunk.add(data.values_start() + (i % data.entities_per_chunk()) * data.stride())
         };
-        assert_eq!(manual, unsafe { data.slot_ptr(slot) });
-        let value = unsafe { manual.add(data.value_start()).cast::<u64>().read() };
+        assert_eq!(manual, unsafe { data.value_ptr(slot).as_ptr() });
+        let header = unsafe { data.header(slot) };
+        assert_eq!(
+            header as *const _ as usize,
+            chunk as usize + hecs::gc::header::HEADERS_OFFSET + 4 * (i % data.entities_per_chunk())
+        );
+        assert!(header.is_alive());
+        let value = unsafe { manual.cast::<u64>().read() };
         assert_eq!(value, i as u64);
         assert_eq!(arch.entity(slot), e);
     }

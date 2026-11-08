@@ -4,7 +4,6 @@ use core::ptr::NonNull;
 use crate::StableTypeId;
 
 use crate::archetype::Archetype;
-use crate::gc::GC;
 use crate::{Component, Entity, Fetch, MissingComponent, Query, QueryOne};
 
 /// Handle to an entity with any component types
@@ -247,16 +246,6 @@ pub trait ComponentRef<'a> {
     #[doc(hidden)]
     unsafe fn from_raw(raw: *mut Self::Component) -> Self;
 
-    /// Construct from a raw pointer to GC<T>
-    ///
-    /// # Safety
-    ///
-    /// Dereferencing `raw` for lifetime `'a` must be sound: it points to a valid
-    /// `Self::Component`, and for `'a` nothing else writes it (for `&'a T`), or nothing else
-    /// reads or writes it at all (for `&'a mut T`), including gc guards and column borrows.
-    #[doc(hidden)]
-    unsafe fn from_raw_gc(raw: *mut GC<Self::Component>) -> Self;
-
     // /// Borrow a column from an archetype
     // #[doc(hidden)]
     // fn get_column(archetype: &'a Archetype) -> Option<Self::Column>;
@@ -271,10 +260,6 @@ impl<'a, T: Component> ComponentRef<'a> for &'a T {
 
     fn get_component(entity: EntityRef<'a>) -> Option<Self::Ref> {
         Some(unsafe { Ref::new(entity.archetype, entity.index).ok()? })
-    }
-
-    unsafe fn from_raw_gc(raw: *mut GC<Self::Component>) -> Self {
-        &(*raw).value
     }
 
     unsafe fn from_raw(raw: *mut Self::Component) -> Self {
@@ -295,10 +280,6 @@ impl<'a, T: Component> ComponentRef<'a> for &'a mut T {
 
     fn get_component(entity: EntityRef<'a>) -> Option<Self::Ref> {
         Some(unsafe { RefMut::new(entity.archetype, entity.index).ok()? })
-    }
-
-    unsafe fn from_raw_gc(raw: *mut GC<Self::Component>) -> Self {
-        &mut (*raw).value
     }
 
     unsafe fn from_raw(raw: *mut Self::Component) -> Self {
