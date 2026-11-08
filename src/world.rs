@@ -746,30 +746,52 @@ impl World {
         let revived = self.entities.revive_nonsync(entity, Location { archetype: key, index: slot });
         debug_assert!(revived, "checked held above");
         for col in 0..arch.types().len() {
-            let data = arch.get_data_storage(col);
-            let word = data.header(slot);
-            let w = word.get();
-            // A row the entity left by a move: where the move led, if the entity left that too
-            // (a vacant `Dead` row), points back here.
-            let mut back = None;
-            if crate::gc::header::state(w) == crate::gc::header::MOVED {
-                let ptr = data.get_gc_ptr(slot);
-                let end = ptr.resolve_moved();
-                if crate::gc::header::state(end.word().get()) == crate::gc::header::DEAD
-                    && (*end.archetype()).entity(end.archetype_slot()).id == u32::MAX
-                {
-                    back = Some((ptr, end));
-                }
-                ptr.clear_moved();
-            }
-            // Alive, unborrowed and unarmed, like every allocation (a live cell's mark is never
-            // read: the sweep skips it, and a tombstone write sets the mark anew).
-            word.set(crate::gc::header::ALIVE_WORD);
-            if let Some((ptr, end)) = back {
-                end.set_moved(ptr);
-            }
+            revive_cell(arch.get_data_storage(col), slot);
         }
         Ok(slot)
+    }
+
+    /// [`revive_nonsync`](Self::revive_nonsync) of many held entities, each in its own
+    /// tombstone of archetype `archetype`: `rows[k] = (entity, slot)`, distinct entities and
+    /// rows, each `slot` a [`Vacancy::Tombstone`](crate::Vacancy::Tombstone). Checks every row
+    /// first: on an error (the index of the offending row and why) nothing changed. Then the
+    /// entity cells and locations, then the cells column by column: one pass per column over
+    /// the rows, so each pass walks a handful of address streams (the column's words and
+    /// forwarding table, where its chains lead) rather than every column's at once.
+    ///
+    /// # Safety
+    /// As [`revive_nonsync`](Self::revive_nonsync).
+    pub unsafe fn revive_rows_nonsync(&self, archetype: usize, rows: &[(Entity, u32)]) -> Result<(), (usize, ReviveError)> {
+        self.flush_nonsync();
+        let key = self
+            .archetypes
+            .archetypes
+            .key_from_index(archetype)
+            .ok_or((0, ReviveError::NoSuchSlot))?;
+        let arch = &self.archetypes.archetypes[key];
+        for (k, &(entity, slot)) in rows.iter().enumerate() {
+            if !self.entities.is_held_nonsync(entity) {
+                return Err((k, ReviveError::NotHeld));
+            }
+            if slot >= arch.allocated_values_nonsync() {
+                return Err((k, ReviveError::NoSuchSlot));
+            }
+            if arch.vacancy(slot) != Some(crate::archetype::Vacancy::Tombstone) {
+                return Err((k, ReviveError::SlotOccupied));
+            }
+        }
+        for &(entity, slot) in rows {
+            arch.set_entity_nonsync(slot as usize, entity);
+            let revived = self.entities.revive_nonsync(entity, Location { archetype: key, index: slot });
+            debug_assert!(revived, "checked held above (entities distinct)");
+        }
+        for col in 0..arch.types().len() {
+            let data = arch.get_data_storage(col);
+            for &(_, slot) in rows {
+                revive_cell(data, slot);
+            }
+        }
+        Ok(())
     }
 
     /// Take the `Free` rows among `rows` of archetype `archetype` off its free list in one walk,
@@ -2899,6 +2921,37 @@ pub(crate) mod tests {
             unsafe { world.remove_by_ids_nonsync(Entity::DANGLING, &[i32::STABLE_TYPE_ID]) };
         assert!(result.is_err());
         cleanup(world);
+    }
+}
+
+/// A revive's cell `slot` of column `data`: `Alive` (unborrowed, unarmed). A cell left by a
+/// move (`Moved`) whose chain ends in a vacant `Dead` row (the entity left that too) has that
+/// cell forward back here.
+///
+/// # Safety
+/// NS; the cell's row is vacant and being revived (its entity cell already points at it).
+#[inline]
+unsafe fn revive_cell(data: &crate::archetype::Data, slot: u32) {
+    use crate::gc::header::{state, ALIVE_WORD, DEAD, MOVED};
+    // The cell addressed once: its chunk header and index serve the word, the forwarding entry
+    // and the value.
+    let (sh, index) = data.cell(slot);
+    let word = crate::gc::word_at(sh, index);
+    let mut back = None;
+    if state(word.get()) == MOVED {
+        let (esh, ei) = crate::gc::forward_at(sh, index).resolve_moved().chunk_cell();
+        if state(crate::gc::word_at(esh, ei).get()) == DEAD
+            && (*esh.archetype).entity((esh.chunk_idx as usize * esh.capacity as usize + ei) as u32).id == u32::MAX
+        {
+            back = Some((esh, ei));
+        }
+        crate::gc::clear_moved_at(sh, index);
+    }
+    // Alive, unborrowed and unarmed, like every allocation (a live cell's mark is never read:
+    // the sweep skips it, and a tombstone write sets the mark anew).
+    word.set(ALIVE_WORD);
+    if let Some((esh, ei)) = back {
+        crate::gc::set_moved_at(esh, ei, crate::gc::value_at(sh, index));
     }
 }
 

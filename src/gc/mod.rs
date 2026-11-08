@@ -89,6 +89,13 @@ impl GCPtr {
         (rel.wrapping_mul(sh.recip) >> 32) as usize
     }
 
+    /// The cell's chunk header and index in the chunk, for several accesses to the cell.
+    #[inline(always)]
+    pub(crate) fn chunk_cell<'a>(&self) -> (&'a StorageHeader, usize) {
+        // SAFETY: from_raw's contract: the chunk is allocated and starts with its header.
+        (unsafe { &*self.storage_header() }, self.chunk_index())
+    }
+
     /// The cell's header word (untyped: through the chunk's storage header).
     #[inline]
     pub fn header_ptr(&self) -> NonNull<HeaderWord> {
@@ -242,22 +249,32 @@ impl GCPtr {
     ///   hop since this `GCPtr` was last known to reach a referenced cell. (Callers mark from
     ///   roots during a mark phase, before the sweep that would free unmarked hops.)
     pub unsafe fn mark_referenced(&mut self) {
-        let mut ptr = *self;
-        let p = self.parity();
-        loop {
-            let word = ptr.word();
-            let w = word.get();
-            if header::is_live(w) {
-                return;
-            }
-            if header::state(w) != ALIVE && header::is_marked(w, p) {
-                return;
-            }
-            word.set((w & !MARK) | header::mark_for(p));
-            if header::state(w) != MOVED {
-                return;
-            }
-            ptr = ptr.forward_target();
+        let (sh, index) = self.chunk_cell();
+        // A live cell (the common case) costs its word: the world's parity is read only for a
+        // tombstone.
+        if !header::is_live(word_at(sh, index).get()) {
+            mark_chain(sh, index);
+        }
+    }
+
+    /// [`mark_referenced`](Self::mark_referenced) with the cell's addressing known (its
+    /// type's: a tracer that knows a `CRef`'s target type): a live cell costs the load of its
+    /// header word alone, no chunk header read. A tombstone's chain is walked untyped (a hop
+    /// may sit in a chunk of another layout).
+    ///
+    /// # Safety
+    /// As [`mark_referenced`](Self::mark_referenced); `at` is the addressing of this cell's
+    /// chunk ([`CellAddressing::of`] its column type's geometry): debug builds check it.
+    #[inline]
+    pub unsafe fn mark_referenced_at(&mut self, at: &header::CellAddressing) {
+        debug_assert_eq!(
+            at.header(self.value.as_ptr()),
+            self.header_ptr().as_ptr().cast_const(),
+            "mark_referenced_at: addressing of another geometry than the cell's chunk"
+        );
+        if !header::is_live((*at.header(self.value.as_ptr())).get()) {
+            let (sh, index) = self.chunk_cell();
+            mark_chain(sh, index);
         }
     }
 
@@ -340,17 +357,15 @@ impl GCPtr {
     /// Make this movable cell (or a vacant `Dead` one: a revive pointing a row its entity left
     /// at it) a `Moved` tombstone forwarding to `target`: the state goes in the header word,
     /// the target in the chunk's forwarding table (allocated with the chunk's first `Moved`
-    /// cell, freed with its last). Written unmarked, like every tombstone.
+    /// cell; the sweep frees it once the chunk has none). Written unmarked, like every
+    /// tombstone.
     ///
     /// # Safety
     /// NS; the cell is movable, or `Dead` (not `Moved`: its table entry would leak a count).
+    #[inline]
     pub(crate) unsafe fn set_moved(&self, target: GCPtr) {
-        let sh = &*self.storage_header();
-        let index = self.chunk_index();
-        let table = sh.forward_table_or_alloc();
-        *table.add(index) = target.value.as_ptr();
-        sh.moved.set(sh.moved.get() + 1);
-        self.word().set(header::tombstone(MOVED, self.parity()));
+        let (sh, index) = self.chunk_cell();
+        set_moved_at(sh, index, target);
     }
 
     /// The cell this `Moved` cell forwards to.
@@ -359,39 +374,37 @@ impl GCPtr {
     /// The cell is `Moved`.
     #[inline]
     pub(crate) unsafe fn forward_target(&self) -> GCPtr {
-        let sh = &*self.storage_header();
-        let table = sh.forward.get();
-        debug_assert!(!table.is_null(), "Moved cell without a forwarding table");
-        let target = *table.add(self.chunk_index());
-        debug_assert!(!target.is_null(), "Moved cell without a forwarding entry");
-        GCPtr::from_raw(NonNull::new_unchecked(target))
+        let (sh, index) = self.chunk_cell();
+        forward_at(sh, index)
     }
 
-    /// Leave the `Moved` state's bookkeeping: forget the forwarding entry (and the table with
-    /// the chunk's last one). The caller rewrites the header word.
+    /// Leave the `Moved` state's bookkeeping: forget the forwarding entry. The table stays
+    /// (the sweep frees it once the chunk has no `Moved` cell: no free and reallocation per
+    /// revive or move). The caller rewrites the header word.
     ///
     /// # Safety
     /// NS; the cell is `Moved`.
+    #[inline]
     pub(crate) unsafe fn clear_moved(&self) {
-        let sh = &*self.storage_header();
-        let table = sh.forward.get();
-        debug_assert!(!table.is_null());
-        *table.add(self.chunk_index()) = core::ptr::null_mut();
-        let left = sh.moved.get() - 1;
-        sh.moved.set(left);
-        if left == 0 {
-            sh.free_forward_table();
-        }
+        let (sh, index) = self.chunk_cell();
+        clear_moved_at(sh, index);
     }
 
     /// Follow the `Moved` chain to the current location.
+    #[inline]
     pub fn resolve_moved(&self) -> Self {
         let mut ptr = *self;
-        // SAFETY: from_raw's contract keeps every hop's chunk allocated.
-        while header::state(unsafe { ptr.word() }.get()) == MOVED {
-            ptr = unsafe { ptr.forward_target() };
+        // SAFETY: from_raw's contract keeps every hop's chunk allocated. One index per hop:
+        // the word and the table entry share it.
+        unsafe {
+            loop {
+                let (sh, index) = ptr.chunk_cell();
+                if header::state(word_at(sh, index).get()) != MOVED {
+                    return ptr;
+                }
+                ptr = forward_at(sh, index);
+            }
         }
-        ptr
     }
 
     /// The `StableTypeId` of this cell's column, through the chunk's storage header (its
@@ -803,10 +816,99 @@ pub fn armed_writes() -> u64 {
     0
 }
 
+/// Header word `index` of the chunk headed by `sh`.
+///
+/// # Safety
+/// `index` is below the chunk's capacity; the chunk stays allocated while the reference is
+/// used.
+#[inline(always)]
+pub(crate) unsafe fn word_at<'a>(sh: &StorageHeader, index: usize) -> &'a HeaderWord {
+    &*(sh as *const StorageHeader)
+        .cast::<u8>()
+        .add(HEADERS_OFFSET + index * HEADER_BYTES)
+        .cast::<HeaderWord>()
+}
+
+/// The cell `index` of the chunk headed by `sh`.
+///
+/// # Safety
+/// `index` is below the chunk's capacity; as [`GCPtr::from_raw`].
+#[inline(always)]
+pub(crate) unsafe fn value_at(sh: &StorageHeader, index: usize) -> GCPtr {
+    GCPtr::from_raw(NonNull::new_unchecked(
+        (sh as *const StorageHeader as *mut u8).add(sh.values_start as usize + index * sh.stride as usize),
+    ))
+}
+
+/// Where `Moved` cell `index` of the chunk headed by `sh` forwards to.
+///
+/// # Safety
+/// Cell `index` of the chunk is `Moved`.
+#[inline(always)]
+pub(crate) unsafe fn forward_at(sh: &StorageHeader, index: usize) -> GCPtr {
+    let table = sh.forward.get();
+    debug_assert!(!table.is_null(), "Moved cell without a forwarding table");
+    let target = *table.add(index);
+    debug_assert!(!target.is_null(), "Moved cell without a forwarding entry");
+    GCPtr::from_raw(NonNull::new_unchecked(target))
+}
+
+/// [`GCPtr::mark_referenced`] from cell `index` of the chunk headed by `sh`, a cell that is
+/// not live: mark it and every hop of its `Moved` chain, up to a live cell or a tombstone
+/// already marked in this cycle.
+///
+/// # Safety
+/// As [`GCPtr::mark_referenced`].
+unsafe fn mark_chain(mut sh: &StorageHeader, mut index: usize) {
+    let p = mark_parity(sh.world_slot);
+    loop {
+        let word = word_at(sh, index);
+        let w = word.get();
+        if header::is_live(w) || (header::state(w) != ALIVE && header::is_marked(w, p)) {
+            return;
+        }
+        word.set((w & !MARK) | header::mark_for(p));
+        if header::state(w) != MOVED {
+            return;
+        }
+        (sh, index) = forward_at(sh, index).chunk_cell();
+    }
+}
+
+/// [`GCPtr::set_moved`] of cell `index` of the chunk headed by `sh`.
+///
+/// # Safety
+/// As [`GCPtr::set_moved`].
+#[inline(always)]
+pub(crate) unsafe fn set_moved_at(sh: &StorageHeader, index: usize, target: GCPtr) {
+    let table = sh.forward_table_or_alloc();
+    *table.add(index) = target.value.as_ptr();
+    sh.moved.set(sh.moved.get() + 1);
+    word_at(sh, index).set(header::tombstone(MOVED, mark_parity(sh.world_slot)));
+}
+
+/// [`GCPtr::clear_moved`] of cell `index` of the chunk headed by `sh`.
+///
+/// # Safety
+/// NS; cell `index` of the chunk is `Moved`.
+#[inline(always)]
+pub(crate) unsafe fn clear_moved_at(sh: &StorageHeader, index: usize) {
+    debug_assert!(!sh.forward.get().is_null());
+    // Debug builds forget the entry, so a stale read asserts; release leaves the table line
+    // clean (an entry is read only while its cell is `Moved`).
+    #[cfg(debug_assertions)]
+    {
+        *sh.forward.get().add(index) = core::ptr::null_mut();
+    }
+    let _ = index;
+    sh.moved.set(sh.moved.get() - 1);
+}
+
 /// Sweep tombstones from the world, freeing rows where all cells are `Dead`/`Moved` and not
 /// marked in this cycle, counting each free in the row's
 /// [`row_generation`](crate::Archetype::row_generation); first drops the values of
-/// `pending_dead` cells whose borrows are gone. Then flips the world's
+/// `pending_dead` cells whose borrows are gone; frees the forwarding tables of chunks left
+/// with no `Moved` cell. Then flips the world's
 /// [mark parity](mark_parity): marks set in this cycle read as unmarked in the next, so nothing
 /// resets them.
 ///
@@ -899,6 +1001,15 @@ pub unsafe fn sweep(world: &World) -> u32 {
             if ok {
                 archetype.free_slot(slot);
                 freed += 1;
+            }
+        }
+        // Forwarding tables outlive their chunk's last `Moved` cell until here.
+        for col in 0..types.len() {
+            for &chunk in archetype.get_data_storage(col).chunks() {
+                let sh = &*chunk.cast::<StorageHeader>();
+                if sh.moved.get() == 0 {
+                    sh.free_forward_table();
+                }
             }
         }
     }

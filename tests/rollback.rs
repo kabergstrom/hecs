@@ -445,3 +445,98 @@ fn clear_and_migrate_bump_the_history_epoch() {
     assert_ne!(world.history_epoch(), epoch);
     cleanup(world);
 }
+
+/// `revive_rows_nonsync` does what `revive_nonsync` in place does for each row (a chain left
+/// through a move and a death follows the revive), column by column; a refused row refuses the
+/// whole call, nothing changed.
+#[test]
+fn revive_rows_revives_many_in_their_tombstones() {
+    let mut world = marked_world();
+    let es: Vec<Entity> = (0..5).map(|i| world.spawn((Net(i), i as i32))).collect();
+    let before: Vec<CRef<i32>> = es.iter().map(|&e| world.new_cref::<i32>(e).unwrap()).collect();
+    let rows: Vec<(usize, u32)> = es.iter().map(|&e| slot_of(&world, i32_ptr(&world, e))).collect();
+    let arch = rows[0].0;
+    assert!(rows.iter().all(|r| r.0 == arch));
+    for &e in &es {
+        world.insert_one(e, true).unwrap();
+    }
+    let after: Vec<CRef<i32>> = es.iter().map(|&e| world.new_cref::<i32>(e).unwrap()).collect();
+    for &e in &es {
+        world.despawn(e).unwrap();
+    }
+    let live = world.spawn((Net(9), 9_i32));
+    let live_slot = slot_of(&world, i32_ptr(&world, live)).1;
+    unsafe {
+        for c in &before {
+            cref_ptr(c).mark_referenced();
+        }
+        hecs::gc::sweep(&world);
+        let batch: Vec<(Entity, u32)> = es.iter().zip(&rows).map(|(&e, r)| (e, r.1)).collect();
+        // An entity not held (on a live row): refused, nothing done.
+        let mut bad = batch.clone();
+        bad.push((Entity::from_bits(1 << 32 | 77).unwrap(), live_slot));
+        assert_eq!(world.revive_rows_nonsync(arch, &bad), Err((5, ReviveError::NotHeld)));
+        assert!(es.iter().all(|&e| !world.contains(e) && world.is_held(e)));
+        assert_eq!(world.revive_rows_nonsync(arch, &batch), Ok(()));
+        for (k, &e) in es.iter().enumerate() {
+            assert!(world.contains(e));
+            write_row(&world, e, k as u32, 10 + k as i32);
+        }
+    }
+    for k in 0..es.len() {
+        assert_eq!(read_cref(&mut world, &before[k]), Some(10 + k as i32));
+        assert_eq!(read_cref(&mut world, &after[k]), Some(10 + k as i32), "the row it died in forwards back");
+    }
+    cleanup(world);
+}
+
+/// `mark_referenced_at` with the column's addressing marks like `mark_referenced`: a live cell
+/// unwritten, a tombstone and its chain marked (the sweep keeps them).
+#[test]
+fn typed_marks_keep_what_untyped_marks_keep() {
+    let mut world = marked_world();
+    let at = hecs::gc::header::CellAddressing::of(&TypeInfo::of::<i32>().geometry());
+    let e = world.spawn((Net(1), 5_i32));
+    let f = world.spawn((Net(2), 6_i32));
+    let cref = world.new_cref::<i32>(e).unwrap();
+    let (arch, slot) = slot_of(&world, i32_ptr(&world, e));
+    world.insert_one(e, true).unwrap();
+    world.despawn(e).unwrap();
+    unsafe {
+        let mut live = i32_ptr(&world, f);
+        let w = live.header_ptr().as_ref().get();
+        live.mark_referenced_at(&at);
+        assert_eq!(live.header_ptr().as_ref().get(), w, "a live cell is not written");
+        cref_ptr(&cref).mark_referenced_at(&at);
+        assert!(cref_ptr(&cref).chain_kept());
+        hecs::gc::sweep(&world);
+        assert_eq!(world.archetype_at(arch).unwrap().vacancy(slot), Some(Vacancy::Tombstone));
+    }
+    cleanup(world);
+}
+
+/// A chunk's forwarding table outlives its last `Moved` cell until the sweep, which frees it;
+/// cells moved again before then reuse it.
+#[test]
+fn forwarding_tables_last_until_the_sweep() {
+    let mut world = marked_world();
+    let es: Vec<Entity> = (0..3).map(|i| world.spawn((Net(i), i as i32))).collect();
+    for &e in &es {
+        world.insert_one(e, true).unwrap();
+    }
+    for &e in &es {
+        world.remove_one::<bool>(e).unwrap();
+    }
+    for (k, &e) in es.iter().enumerate() {
+        assert_eq!(*world.get::<&i32>(e).unwrap(), k as i32);
+    }
+    unsafe { hecs::gc::sweep(&world) };
+    for &e in &es {
+        world.insert_one(e, 1_u8).unwrap();
+    }
+    for (k, &e) in es.iter().enumerate() {
+        assert_eq!(*world.get::<&i32>(e).unwrap(), k as i32);
+    }
+    unsafe { hecs::gc::sweep(&world) };
+    cleanup(world);
+}

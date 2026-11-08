@@ -695,7 +695,9 @@ impl Archetype {
             current_num_free + 1
         );
         for data in self.data.iter() {
-            let word = data.header(slot);
+            // One address computation per cell: the word and the forwarding entry share it.
+            let (sh, index) = data.cell(slot);
+            let word = crate::gc::word_at(sh, index);
             let w = word.get();
             debug_assert!(
                 matches!(gch::state(w), gch::DEAD | gch::MOVED) && gch::is_movable(w & !gch::STATE_MASK),
@@ -703,7 +705,7 @@ impl Archetype {
                 word.state_name()
             );
             if gch::state(w) == gch::MOVED {
-                data.get_gc_ptr(slot).clear_moved();
+                crate::gc::clear_moved_at(sh, index);
             }
             word.set(gch::FREE_WORD);
         }
@@ -799,16 +801,19 @@ impl StorageHeader {
         Layout::array::<*mut u8>(self.capacity as usize).unwrap()
     }
 
-    /// The forwarding table, allocated (zeroed) if the chunk has none.
+    /// The forwarding table, allocated if the chunk has none (uninitialized: an entry is read
+    /// only while its cell is `Moved`, after `set_moved` wrote it; no zeroing, so a large table
+    /// touches only the pages its `Moved` cells use).
     ///
     /// # Safety
     /// NS.
+    #[inline]
     pub(crate) unsafe fn forward_table_or_alloc(&self) -> *mut *mut u8 {
         let table = self.forward.get();
         if !table.is_null() {
             return table;
         }
-        let table = alloc_zeroed(self.forward_layout()).cast::<*mut u8>();
+        let table = alloc(self.forward_layout()).cast::<*mut u8>();
         assert!(!table.is_null(), "allocation failed");
         self.forward.set(table);
         table
@@ -922,6 +927,20 @@ impl Data {
             .get_unchecked(idx / self.entities_per_chunk)
             .add(HEADERS_OFFSET + (idx % self.entities_per_chunk) * HEADER_BYTES)
             .cast::<HeaderWord>()
+    }
+
+    /// Cell `idx`'s chunk header and index in the chunk (one 32-bit division), for several
+    /// accesses to the cell (`gc::word_at`, `gc::value_at`, the forwarding entry).
+    ///
+    /// # Safety
+    /// As [`value_ptr`](Self::value_ptr); the reference must not outlive the chunk.
+    #[inline(always)]
+    pub(crate) unsafe fn cell<'a>(&self, idx: u32) -> (&'a StorageHeader, usize) {
+        let per = self.entities_per_chunk as u32;
+        (
+            &*self.storage.get_unchecked((idx / per) as usize).cast::<StorageHeader>(),
+            (idx % per) as usize,
+        )
     }
 
     /// The header words of chunk `chunk` (all `entities_per_chunk` of them).

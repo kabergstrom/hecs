@@ -442,6 +442,35 @@ pub fn typed_header<T>(value: *mut u8) -> *const HeaderWord {
         .cast::<HeaderWord>()
 }
 
+/// A column's cell addressing as values, for a caller that knows a cell's type only at run
+/// time (a tracer that knows a `CRef`'s target type from its schema): a cell's header word from
+/// its value pointer by arithmetic, with no load from the chunk ([`typed_header`] with the
+/// constants as values; the untyped paths read the same two values from the chunk header).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct CellAddressing {
+    values_start: u32,
+    recip: u64,
+}
+
+impl CellAddressing {
+    /// The addressing of a column of geometry `g` (a type's [`TypeInfo::geometry`]).
+    ///
+    /// [`TypeInfo::geometry`]: crate::TypeInfo::geometry
+    pub const fn of(g: &Geometry) -> Self {
+        CellAddressing { values_start: g.values_start as u32, recip: g.recip() }
+    }
+
+    /// The header word address of the cell whose value is at `value`, in a chunk of this
+    /// addressing's geometry.
+    #[inline(always)]
+    pub fn header(&self, value: *mut u8) -> *const HeaderWord {
+        let off = value as usize & (CHUNK_BYTES - 1);
+        let index = ((off.wrapping_sub(self.values_start as usize) as u64).wrapping_mul(self.recip) >> 32) as usize;
+        // `wrapping_add` keeps provenance from `value`: the header lies in the same chunk.
+        value.wrapping_sub(off).wrapping_add(HEADERS_OFFSET + index * HEADER_BYTES).cast::<HeaderWord>()
+    }
+}
+
 /// The layout of the chunk header's fields the untyped paths read, as byte offsets from the
 /// chunk start. newgameplus-api reads them too, from its own copy of these constants.
 pub struct ChunkAbi;
